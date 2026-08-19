@@ -1,0 +1,40 @@
+[package]
+name = "reflex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "reflex"
+path = "src/main.rs"
+
+[dependencies]
+reflex-types.workspace = true
+reflex-canonical.workspace = true
+reflex-cas.workspace = true
+reflex-ledger.workspace = true
+reflex-meta.workspace = true
+reflex-meta-sqlite.workspace = true
+reflex-dataset.workspace = true
+reflex-knowledge.workspace = true
+reflex-domain.workspace = true
+reflex-domain-bitvec.workspace = true
+reflex-search.workspace = true
+reflex-ml-core.workspace = true
+reflex-ml-micro.workspace = true
+reflex-training.workspace = true
+reflex-eval.workspace = true
+reflex-economics.workspace = true
+reflex-scheduler.workspace = true
+reflex-report.workspace = true
+reflex-bench.workspace = true
+reflex-fly.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+smallvec.workspace = true

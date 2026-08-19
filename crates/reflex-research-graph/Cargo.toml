@@ -1,0 +1,15 @@
+[package]
+name = "reflex-research-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reflex-types.workspace = true
+reflex-canonical.workspace = true
+reflex-economics.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

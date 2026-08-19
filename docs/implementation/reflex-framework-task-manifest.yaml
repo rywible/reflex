@@ -1,0 +1,498 @@
+version: "1.0"
+tasks:
+  P0.1:
+    phase: P0
+    dependencies: []
+    deliverables: ["workspace", "xtask"]
+  P0.2:
+    phase: P0
+    dependencies: ["P0.1"]
+    deliverables: ["xtask"]
+  P0.3:
+    phase: P0
+    dependencies: ["P0.1"]
+    deliverables: ["deny.toml"]
+  P0.4:
+    phase: P0
+    dependencies: ["P0.1"]
+    deliverables: ["docs/adr", "docs/invariants.md"]
+  P0.5:
+    phase: P0
+    dependencies: ["P0.2", "P0.4"]
+    deliverables: ["docs/junior-execution-protocol.md", "docs/implementation/reflex-framework-task-manifest.yaml"]
+
+  P1.1:
+    phase: P1
+    dependencies: ["P0.2"]
+    deliverables: ["crates/reflex-bench"]
+  P1.2:
+    phase: P1
+    dependencies: ["P1.1"]
+    deliverables: ["crates/reflex-runtime"]
+  P1.3:
+    phase: P1
+    dependencies: ["P1.2"]
+    deliverables: ["crates/reflex-runtime"]
+  P1.4:
+    phase: P1
+    dependencies: ["P1.1"]
+    deliverables: ["crates/reflex-bench"]
+  P1.5:
+    phase: P1
+    dependencies: ["P1.1", "P1.3"]
+    deliverables: ["crates/reflex-bench"]
+  P1.6:
+    phase: P1
+    dependencies: ["P1.1", "P1.4", "P1.5"]
+    deliverables: ["crates/reflex-bench"]
+
+  P2.1:
+    phase: P2
+    dependencies: ["P0.2"]
+    deliverables: ["crates/reflex-types"]
+  P2.2:
+    phase: P2
+    dependencies: ["P2.1"]
+    deliverables: ["crates/reflex-canonical"]
+  P2.3:
+    phase: P2
+    dependencies: ["P2.1", "P2.2"]
+    deliverables: ["crates/reflex-cas"]
+  P2.4:
+    phase: P2
+    dependencies: ["P2.3"]
+    deliverables: ["crates/reflex-cas"]
+  P2.5:
+    phase: P2
+    dependencies: ["P2.3", "P2.4"]
+    deliverables: ["crates/reflex-cas"]
+  P2.6:
+    phase: P2
+    dependencies: ["P2.3", "P2.5", "P4.1"]
+    deliverables: ["crates/reflex-cas"]
+
+  P3.1:
+    phase: P3
+    dependencies: ["P2.2"]
+    deliverables: ["crates/reflex-ledger"]
+  P3.2:
+    phase: P3
+    dependencies: ["P3.1"]
+    deliverables: ["crates/reflex-ledger"]
+  P3.3:
+    phase: P3
+    dependencies: ["P3.2", "P1.2"]
+    deliverables: ["crates/reflex-ledger"]
+  P3.4:
+    phase: P3
+    dependencies: ["P3.2", "P3.3"]
+    deliverables: ["crates/reflex-ledger"]
+  P3.5:
+    phase: P3
+    dependencies: ["P3.1"]
+    deliverables: ["crates/reflex-protocol", "proto"]
+  P3.6:
+    phase: P3
+    dependencies: ["P3.5", "P1.2"]
+    deliverables: ["crates/reflex-protocol"]
+
+  P4.1:
+    phase: P4
+    dependencies: ["P2.2"]
+    deliverables: ["crates/reflex-meta"]
+  P4.2:
+    phase: P4
+    dependencies: ["P4.1", "P1.2"]
+    deliverables: ["crates/reflex-meta-sqlite"]
+  P4.3:
+    phase: P4
+    dependencies: ["P4.1"]
+    deliverables: ["crates/reflex-meta-postgres"]
+  P4.4:
+    phase: P4
+    dependencies: ["P4.3"]
+    deliverables: ["crates/reflex-meta-postgres"]
+  P4.5:
+    phase: P4
+    dependencies: ["P3.4", "P4.1"]
+    deliverables: ["crates/reflex-dataset"]
+  P4.6:
+    phase: P4
+    dependencies: ["P4.5"]
+    deliverables: ["crates/reflex-dataset"]
+  P4.7:
+    phase: P4
+    dependencies: ["P4.5"]
+    deliverables: ["crates/reflex-analytics"]
+
+  P5.1:
+    phase: P5
+    dependencies: ["P3.1", "P4.1"]
+    deliverables: ["crates/reflex-domain"]
+  P5.2:
+    phase: P5
+    dependencies: ["P5.1"]
+    deliverables: ["crates/reflex-domain"]
+  P5.3:
+    phase: P5
+    dependencies: ["P5.2", "P1.2", "P3.3"]
+    deliverables: ["crates/reflex-runtime"]
+  P5.4:
+    phase: P5
+    dependencies: ["P3.6", "P5.3"]
+    deliverables: ["crates/reflex-domain-host"]
+  P5.5:
+    phase: P5
+    dependencies: ["P5.1", "P5.3"]
+    deliverables: ["crates/reflex-domain"]
+  P5.6:
+    phase: P5
+    dependencies: ["P5.1", "P5.5"]
+    deliverables: ["crates/reflex-domain"]
+
+  P6.1:
+    phase: P6
+    dependencies: ["P5.3"]
+    deliverables: ["crates/reflex-search"]
+  P6.2:
+    phase: P6
+    dependencies: ["P5.2", "P1.4"]
+    deliverables: ["crates/reflex-search", "crates/reflex-ml-core"]
+  P6.3:
+    phase: P6
+    dependencies: ["P6.1", "P6.2"]
+    deliverables: ["crates/reflex-search"]
+  P6.4:
+    phase: P6
+    dependencies: ["P6.1", "P2.1"]
+    deliverables: ["crates/reflex-search"]
+  P6.5:
+    phase: P6
+    dependencies: ["P6.1", "P1.3"]
+    deliverables: ["crates/reflex-search"]
+  P6.6:
+    phase: P6
+    dependencies: ["P6.2", "P6.3"]
+    deliverables: ["crates/reflex-search"]
+  P6.7:
+    phase: P6
+    dependencies: ["P6.1", "P5.5"]
+    deliverables: ["crates/reflex-search"]
+  P6.8:
+    phase: P6
+    dependencies: ["P6.3", "P6.5", "P3.4"]
+    deliverables: ["crates/reflex-search", "crates/reflex-report"]
+
+  P7.1:
+    phase: P7
+    dependencies: ["P2.2", "P6.2"]
+    deliverables: ["crates/reflex-ml-core"]
+  P7.2:
+    phase: P7
+    dependencies: ["P7.1", "P0.3"]
+    deliverables: ["crates/reflex-ml-burn"]
+  P7.3:
+    phase: P7
+    dependencies: ["P7.1", "P1.4"]
+    deliverables: ["crates/reflex-ml-micro"]
+  P7.4:
+    phase: P7
+    dependencies: ["P7.2", "P7.3", "P1.1"]
+    deliverables: ["crates/reflex-bench"]
+  P7.5:
+    phase: P7
+    dependencies: ["P7.3", "P6.6"]
+    deliverables: ["crates/reflex-ml-core", "crates/reflex-search"]
+  P7.6:
+    phase: P7
+    dependencies: ["P7.1"]
+    deliverables: ["crates/reflex-ml-core"]
+  P7.7:
+    phase: P7
+    dependencies: ["P7.1", "P5.5"]
+    deliverables: ["crates/reflex-ml-core"]
+  P7.8:
+    phase: P7
+    dependencies: ["P7.2", "P2.3"]
+    deliverables: ["crates/reflex-ml-core"]
+  P7.9:
+    phase: P7
+    dependencies: ["P7.8", "P4.1"]
+    deliverables: ["crates/reflex-ml-core"]
+
+  P8.1:
+    phase: P8
+    dependencies: ["P6.7", "P4.5"]
+    deliverables: ["crates/reflex-dataset"]
+  P8.2:
+    phase: P8
+    dependencies: ["P8.1", "P3.4"]
+    deliverables: ["crates/reflex-dataset"]
+  P8.3:
+    phase: P8
+    dependencies: ["P8.1", "P7.2"]
+    deliverables: ["crates/reflex-training"]
+  P8.4:
+    phase: P8
+    dependencies: ["P8.2"]
+    deliverables: ["crates/reflex-training"]
+  P8.5:
+    phase: P8
+    dependencies: ["P4.6", "P8.3"]
+    deliverables: ["crates/reflex-training"]
+  P8.6:
+    phase: P8
+    dependencies: ["P7.2", "P7.8", "P8.5"]
+    deliverables: ["crates/reflex-training"]
+  P8.7:
+    phase: P8
+    dependencies: ["P7.3", "P8.5"]
+    deliverables: ["crates/reflex-ml-micro"]
+  P8.8:
+    phase: P8
+    dependencies: ["P8.2", "P7.5"]
+    deliverables: ["crates/reflex-eval"]
+  P8.9:
+    phase: P8
+    dependencies: ["P8.6", "P8.8"]
+    deliverables: ["crates/reflex-training"]
+
+  P9.1:
+    phase: P9
+    dependencies: ["P8.9", "P4.1"]
+    deliverables: ["crates/reflex-scheduler"]
+  P9.2:
+    phase: P9
+    dependencies: ["P9.1", "P2.2"]
+    deliverables: ["crates/reflex-scheduler"]
+  P9.3:
+    phase: P9
+    dependencies: ["P9.1", "P9.2"]
+    deliverables: ["crates/reflex-scheduler"]
+  P9.4:
+    phase: P9
+    dependencies: ["P8.8", "P9.1"]
+    deliverables: ["crates/reflex-scheduler"]
+  P9.5:
+    phase: P9
+    dependencies: ["P9.1", "P4.4"]
+    deliverables: ["crates/reflex-scheduler"]
+  P9.6:
+    phase: P9
+    dependencies: ["P9.3", "P9.4"]
+    deliverables: ["crates/reflex-scheduler", "crates/reflex-economics"]
+
+  P10.1:
+    phase: P10
+    dependencies: ["P5.6"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+  P10.2:
+    phase: P10
+    dependencies: ["P10.1", "P5.5"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+  P10.3:
+    phase: P10
+    dependencies: ["P10.2", "P6.6"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+  P10.4:
+    phase: P10
+    dependencies: ["P10.3", "P9.3"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+  P10.5:
+    phase: P10
+    dependencies: ["P10.4", "P8.7"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+  P10.6:
+    phase: P10
+    dependencies: ["P10.5", "P9.6"]
+    deliverables: ["domains/reflex-domain-bitvec"]
+
+  P11.1:
+    phase: P11
+    dependencies: ["P4.4", "P9.2"]
+    deliverables: ["crates/reflex-fly"]
+  P11.2:
+    phase: P11
+    dependencies: ["P11.1"]
+    deliverables: ["crates/reflex-fly"]
+  P11.3:
+    phase: P11
+    dependencies: ["P11.2", "P5.3", "P1.5"]
+    deliverables: ["bins/reflex-worker", "crates/reflex-fly"]
+  P11.4:
+    phase: P11
+    dependencies: ["P2.4", "P11.1"]
+    deliverables: ["crates/reflex-fly"]
+  P11.5:
+    phase: P11
+    dependencies: ["P4.3", "P11.1"]
+    deliverables: ["crates/reflex-meta-postgres"]
+  P11.6:
+    phase: P11
+    dependencies: ["P11.2", "P11.3", "P4.4"]
+    deliverables: ["crates/reflex-scheduler", "crates/reflex-fly"]
+  P11.7:
+    phase: P11
+    dependencies: ["P11.4", "P11.5", "P4.4"]
+    deliverables: ["bins/reflex-worker", "crates/reflex-meta-postgres"]
+  P11.8:
+    phase: P11
+    dependencies: ["P11.6"]
+    deliverables: ["crates/reflex-fly"]
+  P11.9:
+    phase: P11
+    dependencies: ["P11.3", "P11.7", "P11.8"]
+    deliverables: ["crates/reflex-scheduler"]
+
+  P12.1:
+    phase: P12
+    dependencies: ["P5.6", "P2.5"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.2:
+    phase: P12
+    dependencies: ["P12.1"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.3:
+    phase: P12
+    dependencies: ["P12.2", "P5.4"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.4:
+    phase: P12
+    dependencies: ["P12.3", "P6.6"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.5:
+    phase: P12
+    dependencies: ["P12.2", "P14.5"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.6:
+    phase: P12
+    dependencies: ["P12.4", "P8.9", "P11.9"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.7:
+    phase: P12
+    dependencies: ["P12.5", "P14.1"]
+    deliverables: ["domains/reflex-domain-wrela"]
+  P12.8:
+    phase: P12
+    dependencies: ["P12.6", "P12.7"]
+    deliverables: ["domains/reflex-domain-wrela"]
+
+  P13.1:
+    phase: P13
+    dependencies: ["P5.4", "P3.5"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.2:
+    phase: P13
+    dependencies: ["P13.1", "P11.9", "P8.9"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.3:
+    phase: P13
+    dependencies: ["P13.1", "P4.7"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.4:
+    phase: P13
+    dependencies: ["P13.3", "P6.7"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.5:
+    phase: P13
+    dependencies: ["P13.4", "P8.4"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.6:
+    phase: P13
+    dependencies: ["P13.5", "P8.9"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.7:
+    phase: P13
+    dependencies: ["P13.4", "P6.6"]
+    deliverables: ["domains/reflex-domain-lean"]
+  P13.8:
+    phase: P13
+    dependencies: ["P13.6", "P13.7", "P11.9"]
+    deliverables: ["domains/reflex-domain-lean"]
+
+  P14.1:
+    phase: P14
+    dependencies: ["P5.5", "P2.5"]
+    deliverables: ["crates/reflex-knowledge"]
+  P14.2:
+    phase: P14
+    dependencies: ["P14.1", "P6.6"]
+    deliverables: ["crates/reflex-knowledge"]
+  P14.3:
+    phase: P14
+    dependencies: ["P14.1", "P14.2", "P9.2"]
+    deliverables: ["crates/reflex-knowledge"]
+  P14.4:
+    phase: P14
+    dependencies: ["P14.2", "P3.1"]
+    deliverables: ["crates/reflex-knowledge"]
+  P14.5:
+    phase: P14
+    dependencies: ["P3.1", "P4.5"]
+    deliverables: ["crates/reflex-economics"]
+  P14.6:
+    phase: P14
+    dependencies: ["P14.4", "P14.5"]
+    deliverables: ["crates/reflex-knowledge"]
+  P14.7:
+    phase: P14
+    dependencies: ["P14.6", "P11.9"]
+    deliverables: ["crates/reflex-knowledge"]
+
+  P15.1:
+    phase: P15
+    dependencies: ["P14.1", "P14.5"]
+    deliverables: ["crates/reflex-research-graph"]
+  P15.2:
+    phase: P15
+    dependencies: ["P15.1", "P14.4"]
+    deliverables: ["crates/reflex-research-graph"]
+  P15.3:
+    phase: P15
+    dependencies: ["P15.2", "P8.2"]
+    deliverables: ["crates/reflex-dataset"]
+  P15.4:
+    phase: P15
+    dependencies: ["P15.3", "P7.6", "P8.9"]
+    deliverables: ["crates/reflex-training"]
+  P15.5:
+    phase: P15
+    dependencies: ["P15.4", "P9.6"]
+    deliverables: ["crates/reflex-scheduler"]
+  P15.6:
+    phase: P15
+    dependencies: ["P15.4", "P15.5", "P7.7"]
+    deliverables: ["crates/reflex-scheduler"]
+
+  P16.1:
+    phase: P16
+    dependencies: ["P9.6", "P4.7"]
+    deliverables: ["bins/reflex"]
+  P16.2:
+    phase: P16
+    dependencies: ["P16.1", "P4.3"]
+    deliverables: ["bins/reflexd"]
+  P16.3:
+    phase: P16
+    dependencies: ["P4.7", "P14.5"]
+    deliverables: ["crates/reflex-report"]
+  P16.4:
+    phase: P16
+    dependencies: ["P1.1", "P11.3"]
+    deliverables: ["crates/reflex-observability"]
+  P16.5:
+    phase: P16
+    dependencies: ["P11.9", "P13.8"]
+    deliverables: ["tests"]
+  P16.6:
+    phase: P16
+    dependencies: ["P5.5", "P11.4"]
+    deliverables: ["crates/reflex-runtime"]
+  P16.7:
+    phase: P16
+    dependencies: ["P16.5", "P16.6"]
+    deliverables: ["release"]
+  P16.8:
+    phase: P16
+    dependencies: ["P16.1", "P16.3", "P16.4", "P16.5", "P16.6", "P16.7", "P12.8", "P13.8", "P14.7"]
+    deliverables: ["docs", "evidence/v1"]

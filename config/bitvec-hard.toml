@@ -1,0 +1,19 @@
+[experiment]
+name = "bitvec-deep-opt-hard"
+domain = "bitvec-v1"
+generations = 2
+horizon_difficulty = "hard"
+
+[search]
+algorithm = "best-first-and-or"
+action_budget = 12
+node_budget = 100
+exploration_uniform = 0.05
+
+[training]
+model_type = "micro-mlp"
+input_dim = 8
+hidden_dim = 16
+epochs = 40
+learning_rate = 0.05
+weight_decay = 0.0001

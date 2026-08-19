@@ -1,0 +1,22 @@
+[package]
+name = "reflexd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "reflexd"
+path = "src/main.rs"
+
+[dependencies]
+reflex-types.workspace = true
+reflex-cas.workspace = true
+reflex-meta.workspace = true
+reflex-meta-sqlite.workspace = true
+reflex-observability.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
