@@ -8,8 +8,11 @@ rust-version.workspace = true
 [dependencies]
 reflex-types.workspace = true
 reflex-ml-core.workspace = true
+reflex-ml-micro.workspace = true
 reflex-domain.workspace = true
+reflex-dataset.workspace = true
 burn.workspace = true
+smallvec.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 thiserror.workspace = true
@@ -19,3 +22,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

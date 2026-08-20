@@ -12,4 +12,4 @@ Implement Reflex entirely in Rust, eliminating mandatory Python runtimes and dep
 ## Consequences
 - Single memory and thread accounting model.
 - Zero-allocation hot-path candidate scoring.
-- Streamlined deployment on Fly.io performance Machines.
+- Portable deployment without a mandatory infrastructure provider.

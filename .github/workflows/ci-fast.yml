@@ -1,0 +1,41 @@
+name: CI Fast Lane
+
+on:
+  push:
+    branches: [main, release/*]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ci-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-lane:
+    name: Fast lane (xtask check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run xtask check
+        run: cargo xtask check
+
+      - name: Upload evidence/checks artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-checks
+          path: evidence/checks/
+          if-no-files-found: ignore

@@ -1,2 +1,0 @@
-cargo test --workspace (exit: 0)
-cargo check --workspace (exit: 0)

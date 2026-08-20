@@ -1,0 +1,73 @@
+{
+  "$schema": "https://raw.githubusercontent.com/reflex-framework/governance/main/schemas/deny-exceptions.schema.json",
+  "version": 1,
+  "updated_at": "2026-08-19",
+  "entries": [
+    {
+      "id": "ndarray-2026-08-19",
+      "kind": "multiple-versions",
+      "name": "ndarray",
+      "version": "0.17.2",
+      "owner": "ml",
+      "rationale": "Burn 0.22.0-pre.2 pins ndarray 0.17 while the remainder of the graph resolves ndarray 0.16. Transitive split within the Burn lineage only; no direct dependency on 0.17. Expires with the Burn migration tracked in ADR-0006.",
+      "expiry_date": "2027-08-19",
+      "evidence": [
+        "deny.toml skip-tree entry ndarray@0.17.2",
+        "docs/adr/ADR-0006"
+      ]
+    },
+    {
+      "id": "mpl-colored-2026-08-19",
+      "kind": "license-exception",
+      "name": "colored",
+      "version": "3.1.1",
+      "owner": "ml",
+      "rationale": "MPL-2.0 (weak copyleft) transitive via burn 0.22.0-pre.2 (burn-tensor). No direct dependency; MPL-2.0 permits combination with permissive code without source disclosure of Reflex itself. Expires with the Burn migration tracked in ADR-0006.",
+      "expiry_date": "2027-08-19",
+      "evidence": [
+        "deny.toml [licenses.exceptions] entry",
+        "docs/adr/ADR-0006"
+      ]
+    },
+    {
+      "id": "mpl-option-ext-2026-08-19",
+      "kind": "license-exception",
+      "name": "option-ext",
+      "version": "0.2.0",
+      "owner": "platform",
+      "rationale": "MPL-2.0 (weak copyleft) transitive via dirs-sys. No direct dependency; MPL-2.0 permits combination with permissive code without source disclosure of Reflex itself.",
+      "expiry_date": "2027-08-19",
+      "evidence": [
+        "deny.toml [licenses.exceptions] entry"
+      ]
+    },
+    {
+      "id": "quick-xml-datafusion-2026-08-19",
+      "kind": "advisory",
+      "advisory_id": "RUSTSEC-2026-0194",
+      "name": "quick-xml",
+      "version": "0.39.4",
+      "owner": "analytics",
+      "rationale": "Transitive via object_store 0.13.2 pinned by DataFusion 54.1 (ADR-0007). Upgrade blocked until Arrow/DataFusion migration. Used for object-store XML metadata parsing in analytics paths only; direct quick-xml 0.41.0 is pinned for reflex-analytics but object_store retains 0.39.4.",
+      "expiry_date": "2027-08-19",
+      "evidence": [
+        "deny.toml [advisories] ignore entries RUSTSEC-2026-0194 and RUSTSEC-2026-0195",
+        "docs/adr/ADR-0007"
+      ]
+    },
+    {
+      "id": "paste-unmaintained-2026-08-19",
+      "kind": "advisory",
+      "advisory_id": "RUSTSEC-2024-0436",
+      "name": "paste",
+      "version": "1.0.15",
+      "owner": "ml",
+      "rationale": "Build-time proc-macro transitive via burn-dispatch 0.22.0-pre.2. Crate is archived upstream (dtolnay) and no safe upgrade exists. Compile-time only; does not ship in binaries. Expires with the Burn migration tracked in ADR-0006.",
+      "expiry_date": "2027-08-19",
+      "evidence": [
+        "deny.toml [advisories] ignore entry",
+        "docs/adr/ADR-0006"
+      ]
+    }
+  ]
+}

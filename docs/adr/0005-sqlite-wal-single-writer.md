@@ -1,7 +1,12 @@
 # ADR 0005: SQLite WAL Single Writer Actor
 
+> **Superseded for the required v1 path by
+> [ADR 0014](ADR-0014-memory-primary-runtime-and-evidence-bundles.md).**
+> Native v1 coordination is single-owner and memory-primary; SQLite is not a
+> release dependency.
+
 ## Status
-Accepted
+Superseded by ADR 0014 for v1
 
 ## Context
 SQLite WAL allows concurrent readers but only one writer, and requires all clients to share the same host filesystem.

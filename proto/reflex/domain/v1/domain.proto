@@ -1,47 +1,82 @@
-edition = "2023";
+syntax = "proto3";
 package reflex.domain.v1;
 
-message Digest {
-  string algorithm = 1;
-  bytes value = 2;
-}
-
+message Digest { string algorithm = 1; bytes value = 2; }
 message HandshakeRequest {
-  uint32 min_protocol = 1;
-  uint32 max_protocol = 2;
-  Digest framework_build = 3;
+  uint32 min_protocol = 1; uint32 max_protocol = 2; Digest framework_build = 3;
   uint32 requested_max_frame_bytes = 4;
+  repeated uint32 required_capabilities = 5 [packed = true];
+  repeated uint32 optional_capabilities = 6 [packed = true];
 }
-
 message HandshakeResponse {
-  uint32 selected_protocol = 1;
-  Digest domain = 2;
-  Digest action_schema = 3;
-  Digest feature_schema = 4;
-  Digest verifier = 5;
-  uint32 max_states_per_batch = 6;
-  uint32 max_candidates_per_batch = 7;
-  uint32 max_inline_bytes = 8;
-  bool supports_cancellation = 9;
+  uint32 selected_protocol = 1; Digest domain = 2; Digest action_schema = 3;
+  Digest feature_schema = 4; Digest verifier = 5;
+  uint32 max_states_per_batch = 6; uint32 max_candidates_per_batch = 7;
+  uint32 max_inline_bytes = 8; bool supports_cancellation = 9;
   bool supports_artifact_replay = 10;
+  repeated uint32 negotiated_capabilities = 11 [packed = true];
 }
 
+// Opaque worker-owned payloads paired with worker-supplied canonical IDs.
+message StateEnvelope { Digest state_id = 1; bytes handle = 2; }
+message CandidateEnvelope {
+  Digest candidate_id = 1; bytes handle = 2; uint32 candidate_class = 3;
+  fixed64 tie_break = 4; repeated float features = 5 [packed = true];
+}
+message ArtifactEnvelope { Digest artifact_id = 1; bytes payload = 2; }
+
+message TaskBootstrapRequest { uint64 request_id = 1; uint64 timeout_ns = 2; bytes task_payload = 3; }
+message TaskBootstrapResponse {
+  uint64 request_id = 1; Digest task_id = 2; StateEnvelope initial_state = 3; string error = 4;
+}
 message ExpandBatchRequest {
-  uint64 request_id = 1;
-  uint64 deadline_mono_ns = 2;
-  repeated bytes state_handles = 3;
+  uint64 request_id = 1; uint64 timeout_ns = 2; repeated bytes state_handles = 3;
 }
+message CandidateGroup { bytes state_handle = 1; repeated CandidateEnvelope candidates = 2; }
+message ExpandBatchResponse { uint64 request_id = 1; repeated CandidateGroup groups = 2; string error = 3; }
 
-message CandidateGroup {
-  bytes state_handle = 1;
-  repeated bytes candidate_ids = 2;
-  repeated uint32 candidate_classes = 3 [packed = true];
-  repeated fixed64 tie_breaks = 4 [packed = true];
-  bytes shared_feature_payload = 5;
-  bytes candidate_feature_payload = 6;
+message ApplyItem { bytes state_handle = 1; Digest candidate_id = 2; bytes candidate_handle = 3; }
+message ApplyBatchRequest { uint64 request_id = 1; uint64 timeout_ns = 2; repeated ApplyItem items = 3; }
+enum TransitionKind {
+  TRANSITION_KIND_UNSPECIFIED = 0; TRANSITION_KIND_CLOSED = 1;
+  TRANSITION_KIND_OBLIGATIONS = 2; TRANSITION_KIND_CONTRADICTION = 3;
+  TRANSITION_KIND_INVALID = 4; TRANSITION_KIND_UNRESOLVED = 5;
 }
+message ApplyOutcome {
+  TransitionKind kind = 1; ArtifactEnvelope artifact = 2;
+  repeated StateEnvelope children = 3; uint32 code = 4; string detail = 5;
+  fixed64 and_group_id = 6;
+}
+message ApplyBatchResponse { uint64 request_id = 1; repeated ApplyOutcome outcomes = 2; string error = 3; }
 
-message ExpandBatchResponse {
-  uint64 request_id = 1;
-  repeated CandidateGroup groups = 2;
+message SolvedEdge { bytes state_handle = 1; bytes candidate_handle = 2; repeated bytes child_handles = 3; }
+message ReconstructRequest {
+  uint64 request_id = 1; uint64 timeout_ns = 2; bytes root_state_handle = 3;
+  repeated SolvedEdge solved_edges = 4;
 }
+message ReconstructResponse { uint64 request_id = 1; ArtifactEnvelope artifact = 2; string error = 3; }
+message VerifyRequest {
+  uint64 request_id = 1; uint64 timeout_ns = 2; ArtifactEnvelope artifact = 3;
+  uint64 max_cpu_ns = 4; uint64 max_wall_ns = 5; uint64 max_memory_bytes = 6;
+}
+message VerifyResponse {
+  uint64 request_id = 1; bytes verification_payload = 2; string error = 3;
+  bool timeout = 4; bool budget_exhausted = 5;
+}
+message UtilityContext {
+  uint64 cell_cpu_ns = 1; uint64 model_inference_cpu_ns = 2;
+  uint64 retrieval_cpu_ns = 3; uint32 verified_actions_count = 4;
+  bytes subject = 5; bytes population = 6; bytes observed_at_generation = 7;
+  bytes accepted_verification = 8; repeated bytes accepted_evidence = 9;
+}
+message UtilityRequest {
+  uint64 request_id = 1; uint64 timeout_ns = 2; ArtifactEnvelope artifact = 3;
+  bytes verification_payload = 4; UtilityContext context = 5;
+}
+message UtilityResponse {
+  uint64 request_id = 1;
+  // JSON Vec<UtilityObservation>; validated against the SDK type by the host.
+  bytes observations_payload = 2; string error = 3;
+}
+message CancelRequest { repeated uint64 request_ids = 1 [packed = true]; }
+message Shutdown {}

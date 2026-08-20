@@ -9,12 +9,17 @@ rust-version.workspace = true
 reflex-types.workspace = true
 reflex-canonical.workspace = true
 reflex-ledger.workspace = true
+reflex-cas.workspace = true
 crc32c.workspace = true
 bytes.workspace = true
 smallvec.workspace = true
 memmap2.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+hex.workspace = true
+blake3.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,3 +27,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

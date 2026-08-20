@@ -17,3 +17,16 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 smallvec.workspace = true
+
+[features]
+default = []
+counting-allocator = []
+
+[target.'cfg(reflex_loom)'.dependencies]
+loom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

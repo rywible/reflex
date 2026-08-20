@@ -122,6 +122,11 @@ impl FromStr for Digest {
                 hex_str.len()
             )));
         }
+        if hex_str.bytes().any(|byte| matches!(byte, b'A'..=b'F')) {
+            return Err(TypeError::InvalidHex(
+                "uppercase hexadecimal is not canonical".to_string(),
+            ));
+        }
         let decoded = hex::decode(hex_str).map_err(|e| TypeError::InvalidHex(e.to_string()))?;
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&decoded);
@@ -146,24 +151,6 @@ impl<'de> Deserialize<'de> for Digest {
         let s = String::deserialize(deserializer)?;
         Digest::from_str(&s).map_err(serde::de::Error::custom)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Canonical encoding trait (§7.2)
-// ---------------------------------------------------------------------------
-
-pub trait CanonicalEncode {
-    fn encode_canonical(&self, out: &mut CanonicalWriter) -> Result<(), CanonicalError>;
-}
-
-pub struct CanonicalWriter;
-
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum CanonicalError {
-    #[error("io error: {0}")]
-    Io(String),
-    #[error("unsupported type: {0}")]
-    Unsupported(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -214,14 +201,7 @@ macro_rules! typed_id {
             type Err = $crate::TypeError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                let trimmed = s.trim();
-                let inner =
-                    if let Some(stripped) = trimmed.strip_prefix(concat!(stringify!($name), "(")) {
-                        stripped.strip_suffix(')').unwrap_or(stripped)
-                    } else {
-                        trimmed
-                    };
-                let digest = $crate::Digest::from_str(inner)?;
+                let digest = $crate::Digest::from_str(s)?;
                 Ok(Self(digest))
             }
         }
@@ -285,26 +265,346 @@ typed_id!(BuildIdentity);
 // Arena handles (§10.1)
 // ---------------------------------------------------------------------------
 
+/// Stable typed handle into an [`EpisodeArena`] slot.
+///
+/// A state handle carries the arena generation it was issued in. The arena
+/// stamps every handle with its current generation, and bumps the generation
+/// whenever it is reset (`clear`). A handle whose generation no longer matches
+/// the arena's current generation is stale: it must be rejected by every arena
+/// accessor (P5.2 AC "stale handles are detected by arena generation").
+///
+/// The first tuple element is the slot index (kept as `.0` for compatibility),
+/// the second is the issuing generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StateHandle(pub u32);
+pub struct StateHandle(pub u32, pub u64);
 
+impl StateHandle {
+    /// Builds a handle for slot `index` issued in generation `generation`.
+    pub const fn new(index: u32, generation: u64) -> Self {
+        Self(index, generation)
+    }
+
+    /// Slot index inside the arena.
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+
+    /// Arena generation this handle was issued in.
+    #[inline]
+    pub const fn generation(self) -> u64 {
+        self.1
+    }
+}
+
+/// A handle issued by an arena in generation 0.
+///
+/// Only valid while the arena has never been reset; resetting an arena
+/// invalidates every previously issued handle.
+impl From<u32> for StateHandle {
+    fn from(index: u32) -> Self {
+        Self(index, 0)
+    }
+}
+
+/// Batch-local payload cursor for a candidate inside a [`CandidateBatch`].
+///
+/// Candidate handles address a candidate within a single enumeration batch
+/// (row in the structure-of-arrays columns); they are not arena-resident and
+/// carry no generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CandidateHandle(pub u32);
 
+/// Selection index into a [`CandidateBatch`] (row position).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CandidateIndex(pub u32);
+pub struct CandidateIndex(pub usize);
 
 // ---------------------------------------------------------------------------
-// Transition types (§10.3)
+// Transition contract (§10.3)
 // ---------------------------------------------------------------------------
 
+/// Semantic/legality result code for a rejected candidate (§10.3).
+///
+/// `Invalid` is a *semantic* verdict about the candidate itself: the candidate
+/// violates the domain's legality rules. It is not a resource-exhaustion
+/// result (that is [`UnresolvedCode`]) and it does not by itself make the
+/// candidate a training negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InvalidCandidateCode {
+    /// The candidate violates the domain's declared legality rules.
+    Illegal,
+    /// The candidate class is not declared in the domain's action schema.
+    UnknownClass,
+    /// The candidate id is reused for different semantics within one
+    /// enumeration (P5.6 AC: "a domain that reuses a candidate ID for
+    /// different semantics fails").
+    DuplicateId,
+    /// The candidate is legal in general but not applicable to this state.
+    Unsupported,
+    /// A domain-internal invariant failed while checking legality.
+    Internal,
+    /// Domain-specific code, kept for migration from bare `u32` codes.
+    Other(u32),
+}
+
+impl InvalidCandidateCode {
+    /// Stable discriminator for compact outcome summaries.
+    pub fn index(&self) -> u32 {
+        match self {
+            InvalidCandidateCode::Illegal => 0,
+            InvalidCandidateCode::UnknownClass => 1,
+            InvalidCandidateCode::DuplicateId => 2,
+            InvalidCandidateCode::Unsupported => 3,
+            InvalidCandidateCode::Internal => 4,
+            InvalidCandidateCode::Other(code) => 100 + code,
+        }
+    }
+}
+
+/// Reason a domain could not determine an outcome within declared limits
+/// (§10.3, §10.2).
+///
+/// `Unresolved` is censored: the outcome is unknown, never falsity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UnresolvedCode {
+    /// The domain exhausted its registered generation/verification budget.
+    BudgetExhausted,
+    /// The domain hit a wall-clock deadline.
+    Timeout,
+    /// The verifier was unavailable (failed closed).
+    VerifierUnavailable,
+    /// Candidate enumeration was explicitly capped by its registered
+    /// generation budget (§10.2).
+    CandidateCountCapped,
+    /// Domain-specific code, kept for migration from bare `u32` codes.
+    Other(u32),
+}
+
+impl UnresolvedCode {
+    /// Stable discriminator for compact outcome summaries.
+    pub fn index(&self) -> u32 {
+        match self {
+            UnresolvedCode::BudgetExhausted => 0,
+            UnresolvedCode::Timeout => 1,
+            UnresolvedCode::VerifierUnavailable => 2,
+            UnresolvedCode::CandidateCountCapped => 3,
+            UnresolvedCode::Other(code) => 100 + code,
+        }
+    }
+}
+
+/// Reference to the durable evidence that closed a state (§10.3).
+///
+/// A witness names the artifact (by content id) that closed the state and,
+/// once verification has accepted it, the digest of the accepted
+/// [`VerificationReceipt`]. The reference travels in the in-process outcome;
+/// the objects it names live in CAS by digest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DomainWitnessRef {
+    /// Content id of the artifact that closed the state.
+    pub artifact: ArtifactId,
+    /// Digest of the accepted verification receipt, once verification exists.
+    pub verification: Option<Digest>,
+}
+
+/// Reference to an AND group of child obligations (§10.3, §11.1).
+///
+/// AND semantics: every child in `children` must close for the group to close.
+/// Search succeeds when *any* OR alternative produces a completely solved
+/// artifact; it never succeeds when only one child of an AND group closes
+/// (§11.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AndGroupRef {
+    /// Group id, unique within the producing episode.
+    pub group_id: u64,
+    /// Child states that must ALL close.
+    pub children: Vec<StateHandle>,
+}
+
+/// Result of applying one candidate to one state (§10.3).
+///
+/// `Invalid` is a semantic/legality verdict about the candidate; `Unresolved`
+/// means the domain could not decide within declared limits. Neither
+/// automatically makes the candidate a training negative.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TransitionOutcome {
-    Closed,
-    Obligations { group_id: u64 },
-    Contradiction,
-    Invalid { code: u32 },
-    Unresolved { code: u32 },
+    /// The state is closed; `witness` names the closing artifact.
+    Closed { witness: DomainWitnessRef },
+    /// The candidate opened an AND group of child obligations.
+    Obligations { group: AndGroupRef },
+    /// The candidate is certified dead; `certificate` names the counter-
+    /// evidence when one exists.
+    Contradiction {
+        certificate: Option<DomainWitnessRef>,
+    },
+    /// The candidate is semantically invalid for this state.
+    Invalid { code: InvalidCandidateCode },
+    /// The domain could not determine the outcome within declared limits.
+    Unresolved { code: UnresolvedCode },
+}
+
+impl TransitionOutcome {
+    /// `Closed` referencing the artifact (by content id) that closes the state.
+    pub fn closed(artifact: ArtifactId) -> Self {
+        Self::Closed {
+            witness: DomainWitnessRef {
+                artifact,
+                verification: None,
+            },
+        }
+    }
+
+    /// `Closed` with a fully formed witness.
+    pub fn closed_with(witness: DomainWitnessRef) -> Self {
+        Self::Closed { witness }
+    }
+
+    /// `Obligations` over an AND group (all children must close).
+    pub fn obligations(group_id: u64, children: Vec<StateHandle>) -> Self {
+        Self::Obligations {
+            group: AndGroupRef { group_id, children },
+        }
+    }
+
+    /// `Contradiction` without a certificate reference.
+    pub fn contradiction() -> Self {
+        Self::Contradiction { certificate: None }
+    }
+
+    /// `Contradiction` naming its counter-evidence.
+    pub fn contradiction_with(certificate: DomainWitnessRef) -> Self {
+        Self::Contradiction {
+            certificate: Some(certificate),
+        }
+    }
+
+    /// `Invalid` with a semantic legality code.
+    pub fn invalid(code: InvalidCandidateCode) -> Self {
+        Self::Invalid { code }
+    }
+
+    /// `Unresolved` with a censored reason.
+    pub fn unresolved(code: UnresolvedCode) -> Self {
+        Self::Unresolved { code }
+    }
+
+    /// Whether this outcome closed the state.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, TransitionOutcome::Closed { .. })
+    }
+
+    /// Whether this outcome is censored (domain could not decide).
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self, TransitionOutcome::Unresolved { .. })
+    }
+
+    /// The AND group of child obligations, if this outcome opened one.
+    pub fn as_obligations(&self) -> Option<&AndGroupRef> {
+        match self {
+            TransitionOutcome::Obligations { group } => Some(group),
+            _ => None,
+        }
+    }
+
+    /// Group id of the AND group, if this outcome opened one.
+    pub fn group_id(&self) -> Option<u64> {
+        self.as_obligations().map(|g| g.group_id)
+    }
+
+    /// The closing artifact reference, if this outcome closed the state.
+    pub fn as_witness(&self) -> Option<&DomainWitnessRef> {
+        match self {
+            TransitionOutcome::Closed { witness } => Some(witness),
+            _ => None,
+        }
+    }
+
+    /// The counter-evidence certificate, if this outcome is a contradiction.
+    pub fn certificate(&self) -> Option<&DomainWitnessRef> {
+        match self {
+            TransitionOutcome::Contradiction { certificate } => certificate.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structure-of-arrays columns (§12.1)
+// ---------------------------------------------------------------------------
+
+/// Contiguous column container for candidate/feature batches (§12.1).
+///
+/// The plan calls for cache-line-aligned storage for the hot structure-of-
+/// arrays columns. True aligned allocation requires `allocator_api` or
+/// `unsafe`; this workspace forbids `unsafe` (`#![forbid(unsafe_code)]`), so
+/// `AlignedVec` currently wraps `Vec` with natural element alignment and is
+/// the designated replacement point once an aligned-allocator ADR exists.
+///
+/// The vector is opaque to layout so the allocation strategy can change
+/// without touching callers; the element API is identical to `Vec`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct AlignedVec<T>(Vec<T>);
+
+impl<T> AlignedVec<T> {
+    /// Empty vector.
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Wraps an existing allocation.
+    pub fn from_vec(vec: Vec<T>) -> Self {
+        Self(vec)
+    }
+
+    /// Unwraps to the backing `Vec`.
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+
+    /// Number of elements.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the column is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Contiguous element slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// Contiguous mutable element slice.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
+impl<T> std::ops::Deref for AlignedVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for AlignedVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> From<Vec<T>> for AlignedVec<T> {
+    fn from(vec: Vec<T>) -> Self {
+        Self(vec)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +772,15 @@ mod tests {
         assert_eq!(cell_id, parsed);
 
         let debug_str = format!("{cell_id:?}");
-        let parsed_debug: CellId = debug_str.parse().unwrap();
-        assert_eq!(cell_id, parsed_debug);
+        assert!(debug_str.parse::<CellId>().is_err());
+    }
+
+    #[test]
+    fn digest_parser_rejects_noncanonical_uppercase() {
+        let canonical = Digest::hash_blake3(b"uppercase").to_hex();
+        let (algorithm, hex) = canonical.split_once(':').unwrap();
+        let text = format!("{algorithm}:{}", hex.to_uppercase());
+        assert!(Digest::from_str(&text).is_err());
     }
 
     #[test]
@@ -484,18 +791,78 @@ mod tests {
 
     #[test]
     fn test_transition_outcome_roundtrip() {
+        let states = vec![StateHandle::new(0, 1), StateHandle::new(1, 1)];
         let outcomes = vec![
-            TransitionOutcome::Closed,
-            TransitionOutcome::Obligations { group_id: 42 },
-            TransitionOutcome::Contradiction,
-            TransitionOutcome::Invalid { code: 100 },
-            TransitionOutcome::Unresolved { code: 200 },
+            TransitionOutcome::closed(ArtifactId::from_digest(Digest::hash_blake3(b"a"))),
+            TransitionOutcome::obligations(7, states.clone()),
+            TransitionOutcome::contradiction(),
+            TransitionOutcome::invalid(InvalidCandidateCode::Illegal),
+            TransitionOutcome::invalid(InvalidCandidateCode::DuplicateId),
+            TransitionOutcome::invalid(InvalidCandidateCode::Other(17)),
+            TransitionOutcome::unresolved(UnresolvedCode::BudgetExhausted),
+            TransitionOutcome::unresolved(UnresolvedCode::Timeout),
+            TransitionOutcome::unresolved(UnresolvedCode::VerifierUnavailable),
+            TransitionOutcome::unresolved(UnresolvedCode::Other(3)),
         ];
         for outcome in &outcomes {
             let json = serde_json::to_string(outcome).unwrap();
             let decoded: TransitionOutcome = serde_json::from_str(&json).unwrap();
             assert_eq!(*outcome, decoded);
         }
+    }
+
+    #[test]
+    fn test_transition_outcome_and_group_semantics() {
+        let group = AndGroupRef {
+            group_id: 1,
+            children: vec![StateHandle::new(2, 0)],
+        };
+        // AND semantics: the group is only closed when every child closes.
+        assert!(!group.children.is_empty());
+        let outcome = TransitionOutcome::Obligations { group };
+        assert!(matches!(
+            &outcome,
+            TransitionOutcome::Obligations { group: g } if g.group_id == 1
+        ));
+        assert_eq!(outcome.group_id().expect("obligations carry a group"), 1);
+    }
+
+    #[test]
+    fn test_state_handle_generation() {
+        let h = StateHandle::new(3, 42);
+        assert_eq!(h.index(), 3);
+        assert_eq!(h.generation(), 42);
+        assert_eq!(h.0, 3);
+        assert_eq!(h.1, 42);
+        assert_ne!(h, StateHandle::new(3, 43));
+        assert_eq!(StateHandle::from(0), StateHandle::new(0, 0));
+
+        let json = serde_json::to_string(&h).unwrap();
+        let decoded: StateHandle = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, decoded);
+    }
+
+    #[test]
+    fn test_aligned_vec_wraps_vec() {
+        let mut v: AlignedVec<u32> = AlignedVec::from_vec(vec![1, 2, 3]);
+        v.push(4);
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(v[0], 1);
+        v.as_mut_slice()[0] = 9;
+        assert_eq!(v[0], 9);
+        assert_eq!(v.into_vec(), vec![9, 2, 3, 4]);
+
+        let empty: AlignedVec<u16> = AlignedVec::new();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_aligned_vec_serde_roundtrip() {
+        let v: AlignedVec<u64> = vec![1, 2, 3].into();
+        let json = serde_json::to_string(&v).unwrap();
+        let decoded: AlignedVec<u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, decoded);
     }
 
     #[test]

@@ -10,10 +10,13 @@ reflex-types.workspace = true
 reflex-canonical.workspace = true
 reflex-cas.workspace = true
 reflex-ledger.workspace = true
+reflex-runtime.workspace = true
 reflex-domain.workspace = true
 reflex-domain-bitvec.workspace = true
 reflex-search.workspace = true
 reflex-ml-micro.workspace = true
+reflex-ml-core.workspace = true
+reflex-ml-burn.workspace = true
 criterion.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
@@ -30,3 +33,10 @@ harness = false
 name = "search_bench"
 path = "../../benches/search_bench.rs"
 harness = false
+
+[features]
+default = []
+counting-allocator = ["reflex-runtime/counting-allocator"]
+
+[lints]
+workspace = true

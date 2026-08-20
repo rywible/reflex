@@ -1,25 +1,150 @@
+# cargo-deny configuration for the Reflex workspace (P0.3).
+#
+# Policy:
+# - crates.io releases only by default; Git sources are rejected unless an
+#   accepted ADR lists them (`allow-git` below stays empty).
+# - Unknown licenses and copyleft licenses are denied. The allow-list covers
+#   the permissive licenses actually present in the locked graph. Dual
+#   "MIT OR Apache-2.0" expressions are satisfied by the individual MIT and
+#   Apache-2.0 entries (SPDX OR semantics).
+# - Multiple semver-major versions of security-sensitive crates are denied;
+#   transitive splits in non-sensitive crates surface as warnings.
+# - Dependency exceptions are recorded in `deny-exceptions.json` (the
+#   source of truth, per P0.3 AC: owner, rationale, expiry date, evidence).
+#   Every `[licenses.exceptions]` and `[bans]` override below must have a
+#   matching registry entry.
+#
+# Workflow: see docs/security/dependency-policy.md.
+
+[graph]
+# Platforms Reflex develops and ships on. Target-specific dependencies for
+# other platforms (e.g. UEFI-only `r-efi`) are outside the policy surface.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# cargo-deny >= 0.16 denies vulnerability, unmaintained, unsound, and
+# notice advisories by default (deprecated keys removed in 0.16.0, PR#611).
+# `unmaintained`/`unsound` select the scope of crates checked.
+unmaintained = "all"
+unsound = "all"
+# Yanked versions are rejected because the lockfile must not depend on
+# retracted releases.
+yanked = "deny"
+# Ignore list stays empty unless an advisory is genuinely accepted with a
+# documented exception in deny-exceptions.json (name + rationale + expiry).
+ignore = [
+    # RUSTSEC-2024-0436: `paste` 1.0.15 is unmaintained (no safe upgrade;
+    # the crate is archived upstream). Build-time proc-macro transitive via
+    # burn-dispatch 0.22.0-pre.2; expires with the Burn migration tracked
+    # in ADR-0006 (registry: paste-unmaintained-2026-08-19).
+    { id = "RUSTSEC-2024-0436", reason = "burn transitive proc-macro; no replacement available; see ADR-0006 and deny-exceptions.json" },
+    # RUSTSEC-2026-0194/0195: object_store 0.13.2 (DataFusion 54.1, ADR-0007)
+    # pins quick-xml 0.39.4; no compatible upgrade until the Arrow/DataFusion
+    # migration. Analytics-only XML parsing; not exposed on untrusted hot paths.
+    { id = "RUSTSEC-2026-0194", reason = "object_store 0.13 transitive via DataFusion ADR-0007; see deny-exceptions.json" },
+    { id = "RUSTSEC-2026-0195", reason = "object_store 0.13 transitive via DataFusion ADR-0007; see deny-exceptions.json" },
+]
+
+[bans]
+# Sensitive crates where a second semver-major line is a supply-chain
+# event that requires a registry exception and an ADR. The global level is
+# `warn` so non-sensitive transitive splits surface without blocking.
+multiple-versions = "warn"
+# `wildcards` is `warn` (not `deny`) because cargo-deny reports internal
+# `<crate>.workspace = true` path dependencies as `*` wildcards: the
+# workspace crates are unpublished but do not yet set `publish = false`,
+# so cargo-deny treats them as public and the `allow-wildcard-paths` pass
+# below does not apply. Path dependencies cannot resolve to arbitrary
+# versions (they are the local manifests), so this lint is informational
+# until member crates set `publish = false`; registry requirements remain
+# pinned via Cargo.toml and are covered by `[bans] deny` + `skip-tree`.
+wildcards = "warn"
+highlight = "all"
+# Workspace crates declare internal dependencies via
+# `<crate>.workspace = true`; cargo metadata reports these as `*`
+# requirements. Path dependencies cannot be published to crates.io, so
+# allowing wildcards for path deps is safe (P0.3 AC keeps registry
+# requirements pinned). Note: the pass applies to *private* crates
+# (`publish = false`); see the `wildcards = "warn"` comment above.
+allow-wildcard-paths = true
+deny = [
+    # Ban entries: exact-pin enforcement happens in Cargo.toml; these
+    # entries reject a second semver-major line if it ever appears.
+    { name = "tokio", deny-multiple-versions = true },
+    { name = "hyper", deny-multiple-versions = true },
+    { name = "openssl", deny-multiple-versions = true },
+    { name = "serde", deny-multiple-versions = true },
+    { name = "reqwest", deny-multiple-versions = true },
+    { name = "blake3", deny-multiple-versions = true },
+    { name = "datafusion", deny-multiple-versions = true },
+    { name = "arrow", deny-multiple-versions = true },
+    { name = "parquet", deny-multiple-versions = true },
+    { name = "burn", deny-multiple-versions = true },
+    { name = "axum", deny-multiple-versions = true },
+    { name = "prost", deny-multiple-versions = true },
+    { name = "object_store", deny-multiple-versions = true },
+    { name = "crc32c", deny-multiple-versions = true },
+    { name = "safetensors", deny-multiple-versions = true },
+]
+# Justified transitive splits. Each entry requires a deny-exceptions.json
+# registry entry. No entry is added without one.
+skip-tree = [
+    # Burn 0.22.0-pre.2 pins ndarray 0.17 while the rest of the graph
+    # resolves ndarray 0.16 (ADR-0006; registry: ndarray-2026-08-19).
+    "ndarray@0.17.2",
+]
+skip = []
+
 [licenses]
-unlicensed = false
+# cargo-deny >= 0.16 denies every license that is not explicitly allowed
+# via `allow` or `exceptions` (the deprecated `unlicensed`/`copyleft`/`deny`
+# keys were removed in 0.16.0, PR#611). The allow-list below is therefore
+# the full license policy: only permissive licenses are allowed, and any
+# copyleft license (MPL-2.0, GPL, LGPL, AGPL, …) fails the check unless it
+# has an exception entry here and in deny-exceptions.json.
 allow = [
     "MIT",
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
-    "Unicode-3.0",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "0BSD",
     "CC0-1.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "MIT-0",
+    "Apache-2.0 WITH LLVM-exception",
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
+# Copyleft exceptions, one per registry entry in deny-exceptions.json.
+[[licenses.exceptions]]
+name = "colored"
+version = "3.1.1"
+allow = ["MPL-2.0"]
+# MPL-2.0 weak copyleft, transitive via burn 0.22.0-pre.2 (ADR-0006;
+# registry: mpl-colored-2026-08-19).
 
-[bans]
-multiple-versions = "warn"
-wildcards = "deny"
-highlight = "all"
-
-[advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
+[[licenses.exceptions]]
+name = "option-ext"
+version = "0.2.0"
+allow = ["MPL-2.0"]
+# MPL-2.0 weak copyleft, transitive via dirs-sys (registry:
+# mpl-option-ext-2026-08-19).
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Git sources are rejected by default; an accepted ADR is required before
+# any entry is added here (P0.3 AC: unapproved Git source rejected).
+allow-git = []

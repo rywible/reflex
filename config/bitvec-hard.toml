@@ -3,16 +3,17 @@ name = "bitvec-deep-opt-hard"
 domain = "bitvec-v1"
 generations = 2
 horizon_difficulty = "hard"
+seeds = [42]
 
 [search]
-algorithm = "best-first-and-or"
+algorithm = "best-first-and-or-v1"
 action_budget = 12
 node_budget = 100
 exploration_uniform = 0.05
 
 [training]
 model_type = "micro-mlp"
-input_dim = 8
+input_dim = 24
 hidden_dim = 16
 epochs = 40
 learning_rate = 0.05

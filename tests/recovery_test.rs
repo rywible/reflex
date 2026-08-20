@@ -1,4 +1,8 @@
-use reflex_ledger::{BufferPool, CellLifecycleEvent, Event, EventEncoder, SegmentHeader, recover_segment};
+#![forbid(unsafe_code)]
+
+use reflex_ledger::{
+    BufferPool, CellLifecycleEvent, Event, EventEncoder, SegmentHeader, recover_segment,
+};
 use reflex_types::{CellId, Digest, ExperimentId, GenerationId};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -8,14 +12,7 @@ fn test_ledger_torn_tail_recovery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("crash.segment");
 
-    let header = SegmentHeader::new(
-        1,
-        1,
-        1,
-        1,
-        0,
-        Digest::hash_blake3(b"compat"),
-    );
+    let header = SegmentHeader::new(1, 1, 1, 1, 0, Digest::hash_blake3(b"compat"));
 
     let mut file = File::create(&path).unwrap();
     file.write_all(&header.encode()).unwrap();

@@ -24,3 +24,6 @@ smallvec.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,264 @@
+{
+  "adrs": [
+    {
+      "file": "0001-all-rust-architecture.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "0002-burn-and-micro-tiers.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "0003-fenced-distributed-leases.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "0004-datafusion-dependency-isolation.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "0005-sqlite-wal-single-writer.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0006-burn-0.22.0-pre.2.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0007-arrow-parquet-datafusion.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0008-tokio-rusqlite-pins.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0009-schema-compat-range.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0010-supply-chain-policy.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0012-local-first-core-and-scientific-evidence.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0013-arrow-parquet-58.4-resolution.md",
+      "indexed": true,
+      "sections_ok": true
+    },
+    {
+      "file": "ADR-0014-memory-primary-runtime-and-evidence-bundles.md",
+      "indexed": true,
+      "sections_ok": true
+    }
+  ],
+  "checks": [
+    {
+      "check": "invariant-test-coverage",
+      "detail": "24 invariants each map to an executable test",
+      "ok": true
+    },
+    {
+      "check": "adr-front-matter-and-index",
+      "detail": "13 ADRs have required sections and are indexed",
+      "ok": true
+    },
+    {
+      "check": "adr-schema-references",
+      "detail": "all schema files referenced by ADRs exist",
+      "ok": true
+    },
+    {
+      "check": "schema-drift",
+      "detail": "schema fingerprints match committed baseline",
+      "ok": true
+    }
+  ],
+  "commit": "f5247928b15d6c029015b0b6a29d7ef3d3782464",
+  "invariants": [
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_1_verifier_authority",
+      "id": "INV-RFX-1",
+      "test": "test_inv_1_verifier_authority",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_2_immutable_inputs",
+      "id": "INV-RFX-2",
+      "test": "test_inv_2_immutable_inputs",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_3_no_mutable_model_inside_cell",
+      "id": "INV-RFX-3",
+      "test": "test_inv_3_no_mutable_model_inside_cell",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_4_no_mutable_knowledge_inside_cell",
+      "id": "INV-RFX-4",
+      "test": "test_inv_4_no_mutable_knowledge_inside_cell",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_5_censored_means_unknown",
+      "id": "INV-RFX-5",
+      "test": "test_inv_5_censored_means_unknown",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_6_multiple_valid_routes_survive",
+      "id": "INV-RFX-6",
+      "test": "test_inv_6_multiple_valid_routes_survive",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_7_raw_utility_immutable",
+      "id": "INV-RFX-7",
+      "test": "test_inv_7_raw_utility_immutable",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_8_search_cost_includes_ml",
+      "id": "INV-RFX-8",
+      "test": "test_inv_8_search_cost_includes_ml",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_9_no_partial_artifact_publication",
+      "id": "INV-RFX-9",
+      "test": "test_inv_9_no_partial_artifact_publication",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_10_one_accepted_attempt",
+      "id": "INV-RFX-10",
+      "test": "test_inv_10_one_accepted_attempt",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_11_replayable_claims",
+      "id": "INV-RFX-11",
+      "test": "test_inv_11_replayable_claims",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_12_no_shared_sqlite",
+      "id": "INV-RFX-12",
+      "test": "test_inv_12_no_shared_sqlite",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_13_bulk_data_in_cas",
+      "id": "INV-RFX-13",
+      "test": "test_inv_13_bulk_data_in_cas",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_14_no_per_candidate_ipc",
+      "id": "INV-RFX-14",
+      "test": "test_inv_14_no_per_candidate_ipc",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_15_bounded_memory",
+      "id": "INV-RFX-15",
+      "test": "test_inv_15_bounded_memory",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_16_one_cpu_budget",
+      "id": "INV-RFX-16",
+      "test": "test_inv_16_one_cpu_budget",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_17_deterministic_registered_mode",
+      "id": "INV-RFX-17",
+      "test": "test_inv_17_deterministic_registered_mode",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_18_exploratory_mode_labeled",
+      "id": "INV-RFX-18",
+      "test": "test_inv_18_exploratory_mode_labeled",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_19_knowledge_is_explicit",
+      "id": "INV-RFX-19",
+      "test": "test_inv_19_knowledge_is_explicit",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_20_proposal_taste_gate",
+      "id": "INV-RFX-20",
+      "test": "test_inv_20_proposal_taste_gate",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_21_no_silent_fallback",
+      "id": "INV-RFX-21",
+      "test": "test_inv_21_no_silent_fallback",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_22_performance_budget_gate",
+      "id": "INV-RFX-22",
+      "test": "test_inv_22_performance_budget_gate",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_23_cleanup_on_completion",
+      "id": "INV-RFX-23",
+      "test": "test_inv_23_cleanup_on_completion",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    },
+    {
+      "evidence_path": "tests/invariants_test.rs#test_inv_24_historical_science_immutable",
+      "id": "INV-RFX-24",
+      "test": "test_inv_24_historical_science_immutable",
+      "test_found": true,
+      "test_path": "tests/invariants_test.rs"
+    }
+  ],
+  "overall": "passed",
+  "timestamp": "2026-08-20T20:51:35Z"
+}

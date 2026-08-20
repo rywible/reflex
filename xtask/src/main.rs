@@ -1,295 +1,320 @@
 use clap::{Parser, Subcommand};
-use reflex_bench::HostCalibration;
-use serde_json::json;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::ExitCode;
+
+mod acceptance;
+mod bench;
+mod check;
+mod dependency_policy;
+mod docs;
+mod sbom;
+mod schema;
+mod util;
+mod waivers;
 
 #[derive(Parser)]
-#[command(name = "xtask")]
+#[command(
+    name = "xtask",
+    about = "Reflex framework verification, benchmarking, and supply-chain tooling"
+)]
 struct XtaskCli {
     #[command(subcommand)]
-    command: XtaskCommands,
+    command: XtaskCommand,
 }
 
 #[derive(Subcommand)]
-enum XtaskCommands {
-    Check,
+enum XtaskCommand {
+    /// Evaluate every v1 release gate without manufacturing missing evidence.
+    Acceptance {
+        /// Persist the evaluator result under evidence/v1/acceptance.json.
+        #[arg(long)]
+        write: bool,
+        /// Override the acceptance report output path (requires --write).
+        #[arg(long, requires = "write")]
+        output: Option<String>,
+    },
+    /// Fast verification lane: fmt, clippy, tests, docs, SBOM, policy.
+    Check {
+        /// Print the commands the fast lane runs, without executing them.
+        #[arg(long)]
+        list_commands: bool,
+        /// Hermetic self-test of the reporter, normalizer, and bench gates.
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Deep verification lane: fast lane + loom/turmoil/fuzz/recovery + timing baseline.
     CheckDeep,
-    DocsValidate,
-    Task {
+    /// Validate invariants, ADRs, and schema references.
+    DocsValidate {
+        /// Hermetic self-test against synthetic fixture trees.
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Regenerate or verify the CycloneDX software bill of materials.
+    Sbom {
+        /// Print the SBOM to stdout instead of (or in addition to) a file.
+        #[arg(long)]
+        stdout: bool,
+        /// Write the SBOM to this path (default: evidence/sbom/cyclonedx.json).
+        #[arg(long)]
+        output: Option<String>,
+        /// Regenerate and byte-compare against the stored SBOM.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Benchmark-gate waivers and deny exception registry.
+    Waivers {
         #[command(subcommand)]
-        action: TaskAction,
+        action: Option<WaiverAction>,
+        /// Validate deny-exceptions.json fields and registry coverage.
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Supply-chain policy checks against deny.toml.
+    DependencyPolicy {
+        /// Hermetic self-test with injected policy violations.
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Regenerate or verify committed schema fingerprints (sql/, proto/).
+    SchemaFingerprint {
+        /// Write evidence/schema/fingerprint.json from the live tree.
+        #[arg(long)]
+        write: bool,
     },
 }
 
 #[derive(Subcommand)]
-enum TaskAction {
-    Verify { id: String },
-    VerifyAll,
-    Benchmark { id: String },
-    EvidenceCheck { id: String },
-    EvidenceCheckAll,
+enum WaiverAction {
+    /// List benchmark waivers with validity.
+    List,
 }
 
-const ALL_TASKS: &[&str] = &[
-    "P0.1", "P0.2", "P0.3", "P0.4", "P0.5", "P1.1", "P1.2", "P1.3", "P1.4", "P1.5", "P1.6", "P2.1",
-    "P2.2", "P2.3", "P2.4", "P2.5", "P2.6", "P3.1", "P3.2", "P3.3", "P3.4", "P3.5", "P3.6", "P4.1",
-    "P4.2", "P4.3", "P4.4", "P4.5", "P4.6", "P4.7", "P5.1", "P5.2", "P5.3", "P5.4", "P5.5", "P5.6",
-    "P6.1", "P6.2", "P6.3", "P6.4", "P6.5", "P6.6", "P6.7", "P6.8", "P7.1", "P7.2", "P7.3", "P7.4",
-    "P7.5", "P7.6", "P7.7", "P7.8", "P7.9", "P8.1", "P8.2", "P8.3", "P8.4", "P8.5", "P8.6", "P8.7",
-    "P8.8", "P8.9", "P9.1", "P9.2", "P9.3", "P9.4", "P9.5", "P9.6", "P10.1", "P10.2", "P10.3",
-    "P10.4", "P10.5", "P10.6", "P11.1", "P11.2", "P11.3", "P11.4", "P11.5", "P11.6", "P11.7",
-    "P11.8", "P11.9", "P12.1", "P12.2", "P12.3", "P12.4", "P12.5", "P12.6", "P12.7", "P12.8",
-    "P13.1", "P13.2", "P13.3", "P13.4", "P13.5", "P13.6", "P13.7", "P13.8", "P14.1", "P14.2",
-    "P14.3", "P14.4", "P14.5", "P14.6", "P14.7", "P15.1", "P15.2", "P15.3", "P15.4", "P15.5",
-    "P15.6", "P16.1", "P16.2", "P16.3", "P16.4", "P16.5", "P16.6", "P16.7", "P16.8",
-];
-
-fn verify_task(id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let evidence_dir = PathBuf::from("evidence/tasks").join(id);
-    fs::create_dir_all(&evidence_dir)?;
-
-    let test_output = Command::new("cargo")
-        .args(["test", "--workspace"])
-        .output()?;
-
-    let test_stdout = String::from_utf8_lossy(&test_output.stdout);
-    let test_stderr = String::from_utf8_lossy(&test_output.stderr);
-    let tests_text = format!("{}\n{}", test_stdout, test_stderr);
-
-    fs::write(evidence_dir.join("tests.txt"), &tests_text)?;
-    fs::write(
-        evidence_dir.join("commands.txt"),
-        format!(
-            "cargo test --workspace (exit: {})\ncargo check --workspace (exit: 0)\n",
-            test_output.status.code().unwrap_or(0)
-        ),
-    )?;
-
-    let cal = HostCalibration::calibrate_current_host();
-    let bench_json = json!({
-        "task_id": id,
-        "host_calibration": cal,
-        "status": "passed",
-        "benchmarks": [
-            {
-                "name": format!("{id}_conformance"),
-                "decision": "passed",
-                "evidence": "all unit and integration tests passed"
-            }
-        ]
-    });
-    fs::write(
-        evidence_dir.join("benchmarks.json"),
-        serde_json::to_string_pretty(&bench_json)?,
-    )?;
-
-    let result_json = json!({
-        "task_id": id,
-        "status": if test_output.status.success() { "passed" } else { "failed" },
-        "commit": "9e02f26",
-        "dependencies": {},
-        "deliverables": [],
-        "acceptance": [
-            {
-                "criterion": format!("Full AC for {id}"),
-                "status": if test_output.status.success() { "passed" } else { "failed" },
-                "evidence": "tests.txt"
-            }
-        ],
-        "performance": [
-            {
-                "benchmark": format!("{id}_perf"),
-                "decision": "passed",
-                "evidence": "benchmarks.json"
-            }
-        ],
-        "notes": []
-    });
-    fs::write(
-        evidence_dir.join("result.json"),
-        serde_json::to_string_pretty(&result_json)?,
-    )?;
-
-    if !test_output.status.success() {
-        eprintln!("Verification failed for task {id}");
-        std::process::exit(1);
-    }
-    println!("==> Task {id} verified.");
-    Ok(())
-}
-
-fn check_evidence(id: &str) -> bool {
-    let evidence_dir = PathBuf::from("evidence/tasks").join(id);
-    let r_exists = evidence_dir.join("result.json").exists();
-    let c_exists = evidence_dir.join("commands.txt").exists();
-    let t_exists = evidence_dir.join("tests.txt").exists();
-    let b_exists = evidence_dir.join("benchmarks.json").exists();
-    r_exists && c_exists && t_exists && b_exists
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     let cli = XtaskCli::parse();
+    match dispatch(cli.command) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    match cli.command {
-        XtaskCommands::Check => {
-            println!("==> Running xtask check (fast lane)...");
-            run_cmd("cargo", &["fmt", "--check"])?;
-            run_cmd("cargo", &["clippy", "--workspace", "--", "-D", "warnings"])?;
-            run_cmd("cargo", &["test", "--workspace"])?;
-            validate_docs()?;
-            println!("==> Fast lane check passed successfully!");
-        }
-        XtaskCommands::CheckDeep => {
-            println!("==> Running xtask check-deep...");
-            run_cmd("cargo", &["fmt", "--check"])?;
-            run_cmd("cargo", &["clippy", "--workspace", "--", "-D", "warnings"])?;
-            run_cmd("cargo", &["test", "--workspace"])?;
-            validate_docs()?;
-            println!("==> Deep check lane passed successfully!");
-        }
-        XtaskCommands::DocsValidate => {
-            validate_docs()?;
-            println!("==> Docs validation passed!");
-        }
-        XtaskCommands::Task { action } => match action {
-            TaskAction::Verify { id } => {
-                println!("==> Verifying task {id}...");
-                verify_task(&id)?;
+fn dispatch(command: XtaskCommand) -> Result<ExitCode, util::XtaskError> {
+    match command {
+        XtaskCommand::Acceptance { write, output } => {
+            let report = acceptance::evaluate()?;
+            if write {
+                acceptance::write(&report, output.map(PathBuf::from))?;
             }
-            TaskAction::VerifyAll => {
-                println!("==> Verifying all tasks...");
-                let test_output = Command::new("cargo")
-                    .args(["test", "--workspace"])
-                    .output()?;
-                let test_stdout = String::from_utf8_lossy(&test_output.stdout);
-                let test_stderr = String::from_utf8_lossy(&test_output.stderr);
-                let tests_text = format!("{}\n{}", test_stdout, test_stderr);
-                let cal = HostCalibration::calibrate_current_host();
-
-                for &task in ALL_TASKS {
-                    let evidence_dir = PathBuf::from("evidence/tasks").join(task);
-                    fs::create_dir_all(&evidence_dir)?;
-
-                    fs::write(evidence_dir.join("tests.txt"), &tests_text)?;
-                    fs::write(
-                        evidence_dir.join("commands.txt"),
-                        format!(
-                            "cargo test --workspace (exit: {})\ncargo check --workspace (exit: 0)\n",
-                            test_output.status.code().unwrap_or(0)
-                        ),
-                    )?;
-
-                    let bench_json = json!({
-                        "task_id": task,
-                        "host_calibration": cal,
-                        "status": "passed",
-                        "benchmarks": [
-                            {
-                                "name": format!("{task}_conformance"),
-                                "decision": "passed",
-                                "evidence": "all unit and integration tests passed"
-                            }
-                        ]
-                    });
-                    fs::write(
-                        evidence_dir.join("benchmarks.json"),
-                        serde_json::to_string_pretty(&bench_json)?,
-                    )?;
-
-                    let result_json = json!({
-                        "task_id": task,
-                        "status": if test_output.status.success() { "passed" } else { "failed" },
-                        "commit": "9e02f26",
-                        "dependencies": {},
-                        "deliverables": [],
-                        "acceptance": [
-                            {
-                                "criterion": format!("Full AC for {task}"),
-                                "status": if test_output.status.success() { "passed" } else { "failed" },
-                                "evidence": "tests.txt"
-                            }
-                        ],
-                        "performance": [
-                            {
-                                "benchmark": format!("{task}_perf"),
-                                "decision": "passed",
-                                "evidence": "benchmarks.json"
-                            }
-                        ],
-                        "notes": []
-                    });
-                    fs::write(
-                        evidence_dir.join("result.json"),
-                        serde_json::to_string_pretty(&result_json)?,
-                    )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(if report.release_ready {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        XtaskCommand::Check {
+            list_commands,
+            self_test,
+        } => {
+            if list_commands {
+                for c in check::list_commands(false) {
+                    println!("{c}");
                 }
-                println!("==> All tasks verified successfully!");
+                return Ok(ExitCode::SUCCESS);
             }
-            TaskAction::Benchmark { id } => {
-                println!("==> Benchmarking task {id}...");
-                let cal = HostCalibration::calibrate_current_host();
+            if self_test {
+                let mut results = check::self_test()?;
+                results.extend(bench::self_test());
+                return report_selftest(results);
+            }
+            let steps = check::fast_lane()?;
+            check::write_reports(&steps, false)?;
+            let ok = steps.iter().all(|s| s.ok);
+            for s in &steps {
                 println!(
-                    "Host calibration score: {:.2} MOPS",
-                    cal.single_core_score_mops
+                    "  [{:>4}] {} ({} ms) {}",
+                    if s.ok { "ok" } else { "FAIL" },
+                    s.name,
+                    s.duration_ms,
+                    if s.ok { "" } else { &s.detail }
                 );
             }
-            TaskAction::EvidenceCheck { id } => {
-                if check_evidence(&id) {
-                    println!(
-                        "==> Evidence check for {id}: Complete (all 4 required artifacts exist)"
-                    );
-                } else {
-                    eprintln!("==> Evidence check for {id}: Incomplete artifacts");
-                    std::process::exit(1);
-                }
+            println!("==> check lane {}", if ok { "PASSED" } else { "FAILED" });
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        XtaskCommand::CheckDeep => {
+            let steps = check::deep_lane()?;
+            check::write_reports(&steps, true)?;
+            let ok = steps.iter().all(|s| s.ok);
+            for s in &steps {
+                println!(
+                    "  [{:>4}] {} ({} ms) {}",
+                    if s.ok { "ok" } else { "FAIL" },
+                    s.name,
+                    s.duration_ms,
+                    if s.ok { "" } else { &s.detail }
+                );
             }
-            TaskAction::EvidenceCheckAll => {
-                println!("==> Checking evidence for all tasks...");
-                let mut missing = 0;
-                for task in ALL_TASKS {
-                    if !check_evidence(task) {
-                        eprintln!("Missing evidence for {task}");
-                        missing += 1;
+            println!(
+                "==> check-deep lane {}",
+                if ok { "PASSED" } else { "FAILED" }
+            );
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        XtaskCommand::DocsValidate { self_test } => {
+            if self_test {
+                return report_selftest(docs::self_test()?);
+            }
+            let report = docs::validate_docs(
+                Path::new(docs::INVARIANTS_PATH),
+                Path::new(docs::ADR_DIR),
+                Path::new("tests"),
+            )?;
+            docs::write_report(&report)?;
+            println!(
+                "==> docs-validate: {} ({} invariants, {} ADRs, report: {})",
+                if report.ok { "PASSED" } else { "FAILED" },
+                report.invariants.len(),
+                report.adrs.len(),
+                docs::REPORT_PATH
+            );
+            for item in &report.items {
+                let name = item.get("check").and_then(|c| c.as_str()).unwrap_or("");
+                let ok = item.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                let detail = item.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+                println!(
+                    "  [{:>4}] {} {}",
+                    if ok { "ok" } else { "FAIL" },
+                    name,
+                    if ok { "" } else { detail }
+                );
+            }
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        XtaskCommand::Sbom {
+            stdout,
+            output,
+            verify,
+        } => {
+            if verify {
+                let ok = sbom::verify_sbom(Path::new("Cargo.lock"))?;
+                Ok(if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                })
+            } else {
+                let out = output
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(sbom::SBOM_PATH));
+                sbom::write_sbom(Path::new("Cargo.lock"), &out, stdout)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+        XtaskCommand::Waivers { action, self_test } => {
+            if self_test {
+                let mut results = waivers::self_test()?;
+                for item in bench::waivers::self_test() {
+                    results.push(item);
+                }
+                return report_selftest(results);
+            }
+            match action.unwrap_or(WaiverAction::List) {
+                WaiverAction::List => {
+                    let listed = bench::waivers::list();
+                    if listed.is_empty() {
+                        println!("no waivers under waivers/");
                     }
-                }
-                if missing == 0 {
-                    println!("==> All task evidence complete!");
-                } else {
-                    eprintln!("==> {missing} tasks missing evidence");
-                    std::process::exit(1);
+                    for (path, w, valid) in listed {
+                        println!(
+                            "  {} benchmark={} scope={} owner={} expiry={} {}",
+                            path,
+                            w.benchmark,
+                            w.scope,
+                            w.owner,
+                            w.expiry_date,
+                            if valid { "VALID" } else { "EXPIRED/INVALID" }
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
                 }
             }
-        },
-    }
-
-    Ok(())
-}
-
-fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new(program).args(args).status()?;
-    if !status.success() {
-        return Err(format!(
-            "command '{program} {}' failed with status {status}",
-            args.join(" ")
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn validate_docs() -> Result<(), Box<dyn std::error::Error>> {
-    let invariants_path = Path::new("docs/invariants.md");
-    if !invariants_path.exists() {
-        return Err("docs/invariants.md is missing".into());
-    }
-    let content = fs::read_to_string(invariants_path)?;
-    for i in 1..=24 {
-        let tag = format!("INV-RFX-{i}");
-        if !content.contains(&tag) {
-            return Err(format!("docs/invariants.md missing invariant {tag}").into());
+        }
+        XtaskCommand::SchemaFingerprint { write } => {
+            let root = Path::new(".");
+            let out = Path::new(schema::FINGERPRINT_PATH);
+            if write {
+                schema::write_fingerprint(root, out)?;
+                println!("==> schema-fingerprint: wrote {}", out.display());
+                Ok(ExitCode::SUCCESS)
+            } else {
+                let ok = schema::verify_fingerprint(root)?;
+                Ok(if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                })
+            }
+        }
+        XtaskCommand::DependencyPolicy { self_test } => {
+            if self_test {
+                return report_selftest(dependency_policy::self_test()?);
+            }
+            let ok = dependency_policy::parse_policy();
+            let denied = util::run_cmd("cargo", &["deny", "check"]);
+            if !denied.success {
+                println!("  cargo deny check: FAILED");
+            }
+            let ok = ok && denied.success;
+            println!(
+                "==> dependency-policy: {}",
+                if ok { "PASSED" } else { "FAILED" }
+            );
+            Ok(if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
     }
-    Ok(())
+}
+
+fn report_selftest<S: Into<String>>(
+    results: Vec<(S, bool, String)>,
+) -> Result<ExitCode, util::XtaskError> {
+    let mut failed = 0;
+    for (name, ok, detail) in results {
+        let name = name.into();
+        if !ok {
+            failed += 1;
+        }
+        println!(
+            "  [{}] {} {}",
+            if ok { "ok" } else { "FAIL" },
+            name,
+            if ok { "" } else { &detail }
+        );
+    }
+    if failed == 0 {
+        println!("==> self-test: PASSED");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("==> self-test: FAILED ({failed} fixture(s))");
+        Ok(ExitCode::FAILURE)
+    }
 }

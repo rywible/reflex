@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use bytes::BytesMut;
 use reflex_protocol::{HandshakeRequest, LengthDelimitedFrameCodec, PROTOCOL_VERSION};
 use reflex_types::Digest;
@@ -13,6 +15,8 @@ fn test_protocol_frame_roundtrip() {
         max_protocol: PROTOCOL_VERSION,
         framework_build: Digest::hash_blake3(b"build-1"),
         requested_max_frame_bytes: 4096,
+        required_capabilities: Vec::new(),
+        optional_capabilities: Vec::new(),
     };
     let json_bytes = serde_json::to_vec(&req).unwrap();
     codec

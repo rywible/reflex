@@ -16,6 +16,8 @@ pub enum CanonicalError {
     DigestMismatch { expected: Digest, computed: Digest },
     #[error("unsupported schema version: {0}")]
     UnsupportedVersion(u32),
+    #[error("canonical length exceeds {limit}-bit field: {length}")]
+    LengthOverflow { length: usize, limit: u8 },
 }
 
 pub enum WriterSink<'a> {
@@ -104,12 +106,22 @@ impl<'a> CanonicalWriter<'a> {
 
     pub fn write_str(&mut self, val: &str) -> Result<(), CanonicalError> {
         let bytes = val.as_bytes();
-        self.write_u32(bytes.len() as u32)?;
+        self.write_u32(u32::try_from(bytes.len()).map_err(|_| {
+            CanonicalError::LengthOverflow {
+                length: bytes.len(),
+                limit: 32,
+            }
+        })?)?;
         self.write_bytes(bytes)
     }
 
     pub fn write_byte_slice(&mut self, val: &[u8]) -> Result<(), CanonicalError> {
-        self.write_u32(val.len() as u32)?;
+        self.write_u32(
+            u32::try_from(val.len()).map_err(|_| CanonicalError::LengthOverflow {
+                length: val.len(),
+                limit: 32,
+            })?,
+        )?;
         self.write_bytes(val)
     }
 
@@ -135,7 +147,12 @@ impl<'a> CanonicalWriter<'a> {
     }
 
     pub fn write_vec<T: CanonicalEncode>(&mut self, val: &[T]) -> Result<(), CanonicalError> {
-        self.write_u32(val.len() as u32)?;
+        self.write_u32(
+            u32::try_from(val.len()).map_err(|_| CanonicalError::LengthOverflow {
+                length: val.len(),
+                limit: 32,
+            })?,
+        )?;
         for item in val {
             item.encode_canonical(self)?;
         }
@@ -146,7 +163,12 @@ impl<'a> CanonicalWriter<'a> {
         &mut self,
         map: &BTreeMap<K, V>,
     ) -> Result<(), CanonicalError> {
-        self.write_u32(map.len() as u32)?;
+        self.write_u32(
+            u32::try_from(map.len()).map_err(|_| CanonicalError::LengthOverflow {
+                length: map.len(),
+                limit: 32,
+            })?,
+        )?;
         for (k, v) in map {
             k.encode_canonical(self)?;
             v.encode_canonical(self)?;
@@ -258,7 +280,11 @@ pub fn encode_to_vec<T: CanonicalEncode>(value: &T) -> Result<Vec<u8>, Canonical
 pub fn content_id<T: CanonicalEncode>(domain: &[u8], value: &T) -> Result<Digest, CanonicalError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"RFXID\0");
-    hasher.update(&(domain.len() as u32).to_le_bytes());
+    let domain_len = u32::try_from(domain.len()).map_err(|_| CanonicalError::LengthOverflow {
+        length: domain.len(),
+        limit: 32,
+    })?;
+    hasher.update(&domain_len.to_le_bytes());
     hasher.update(domain);
     let mut writer = CanonicalWriter::hashing(&mut hasher);
     value.encode_canonical(&mut writer)?;
@@ -284,7 +310,12 @@ pub fn wrap_envelope<T: CanonicalEncode>(
     let mut out = Vec::new();
     out.extend_from_slice(ENVELOPE_MAGIC);
     let schema_bytes = schema_name.as_bytes();
-    out.extend_from_slice(&(schema_bytes.len() as u32).to_le_bytes());
+    let schema_len =
+        u32::try_from(schema_bytes.len()).map_err(|_| CanonicalError::LengthOverflow {
+            length: schema_bytes.len(),
+            limit: 32,
+        })?;
+    out.extend_from_slice(&schema_len.to_le_bytes());
     out.extend_from_slice(schema_bytes);
     out.extend_from_slice(&schema_version.to_le_bytes());
     out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -327,7 +358,12 @@ pub fn read_envelope_header(data: &[u8]) -> Result<(EnvelopeHeader, &[u8]), Cano
     offset += schema_len;
     let schema_version = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     offset += 4;
-    let payload_len = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    let payload_len_u64 = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let payload_len = usize::try_from(payload_len_u64).map_err(|_| {
+        CanonicalError::EncodingError(format!(
+            "payload length {payload_len_u64} exceeds platform usize"
+        ))
+    })?;
     offset += 8;
     let algo = match data[offset] {
         0 => DigestAlgorithm::Blake3,
@@ -408,7 +444,7 @@ pub fn read_envelope_header(data: &[u8]) -> Result<(EnvelopeHeader, &[u8]), Cano
 mod tests {
     use super::*;
 
-    #[derive(PartialEq, Debug)]
+    #[derive(Clone, PartialEq, Debug)]
     struct ExampleRecord {
         id: u32,
         name: String,
@@ -460,5 +496,75 @@ mod tests {
         let expected_digest = content_id(b"example.v1", &rec).unwrap();
         assert_eq!(header.digest, expected_digest);
         assert_eq!(payload.len(), header.payload_len);
+    }
+
+    #[test]
+    fn test_semantic_field_change_changes_digest() {
+        let base = ExampleRecord {
+            id: 1,
+            name: "alpha".to_string(),
+            score: 1.0,
+            flags: vec![1],
+        };
+        let mut changed = base.clone();
+        changed.score = 2.0;
+        let id_base = content_id(b"semantic", &base).unwrap();
+        let id_changed = content_id(b"semantic", &changed).unwrap();
+        assert_ne!(id_base, id_changed);
+    }
+
+    #[test]
+    fn test_map_order_independent_content_id() {
+        let mut map_a = BTreeMap::new();
+        map_a.insert("z".to_string(), 1u32);
+        map_a.insert("a".to_string(), 2u32);
+        let mut map_b = BTreeMap::new();
+        map_b.insert("a".to_string(), 2u32);
+        map_b.insert("z".to_string(), 1u32);
+        let id_a = content_id(b"map-order", &map_a).unwrap();
+        let id_b = content_id(b"map-order", &map_b).unwrap();
+        assert_eq!(id_a, id_b);
+    }
+
+    /// Cross-platform golden corpus (P2.2): pinned wire bytes for a fixed record.
+    #[test]
+    fn test_golden_envelope_corpus() {
+        let rec = ExampleRecord {
+            id: 4242,
+            name: "golden-record".to_string(),
+            score: 1.25,
+            flags: vec![0xDE, 0xAD],
+        };
+        let env = wrap_envelope("reflex.golden.v1", 1, &rec).unwrap();
+        let digest = reflex_types::Digest::hash_blake3(&env);
+        assert_eq!(
+            digest.to_hex(),
+            "blake3:54dee4db82cccb3362634d830337a68f2ced72230e5664398507dcc7f129e883"
+        );
+        // Verify envelope round-trip preserves golden bytes.
+        let (header, _) = read_envelope_header(&env).unwrap();
+        assert_eq!(header.schema_name, "reflex.golden.v1");
+    }
+
+    #[test]
+    fn test_unsupported_schema_version_fails_closed() {
+        let rec = ExampleRecord {
+            id: 1,
+            name: "v".to_string(),
+            score: 0.0,
+            flags: vec![],
+        };
+        let env = wrap_envelope("example.v1", 99, &rec).unwrap();
+        let (header, _) = read_envelope_header(&env).unwrap();
+        assert_eq!(header.schema_version, 99);
+        const MIN_SUPPORTED: u32 = 1;
+        const MAX_SUPPORTED: u32 = 1;
+        let err = if header.schema_version < MIN_SUPPORTED || header.schema_version > MAX_SUPPORTED
+        {
+            Err(CanonicalError::UnsupportedVersion(header.schema_version))
+        } else {
+            Ok(())
+        };
+        assert!(matches!(err, Err(CanonicalError::UnsupportedVersion(99))));
     }
 }

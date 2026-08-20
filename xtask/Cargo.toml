@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
-reflex-types.workspace = true
-reflex-canonical.workspace = true
-reflex-bench.workspace = true
+reflex-bench = { path = "../crates/reflex-bench" }
+reflex-types = { path = "../crates/reflex-types" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
+[lints]
+workspace = true

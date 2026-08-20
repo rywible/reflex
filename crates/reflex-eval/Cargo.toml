@@ -20,3 +20,6 @@ tracing.workspace = true
 [dev-dependencies]
 reflex-ml-micro.workspace = true
 smallvec.workspace = true
+
+[lints]
+workspace = true

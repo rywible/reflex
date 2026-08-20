@@ -9,6 +9,10 @@ members = [
     "fuzz",
 ]
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(reflex_loom)", "cfg(turmoil)"] }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -23,8 +27,6 @@ reflex-canonical = { path = "crates/reflex-canonical" }
 reflex-cas = { path = "crates/reflex-cas" }
 reflex-ledger = { path = "crates/reflex-ledger" }
 reflex-meta = { path = "crates/reflex-meta" }
-reflex-meta-sqlite = { path = "crates/reflex-meta-sqlite" }
-reflex-meta-postgres = { path = "crates/reflex-meta-postgres" }
 reflex-dataset = { path = "crates/reflex-dataset" }
 reflex-domain = { path = "crates/reflex-domain" }
 reflex-protocol = { path = "crates/reflex-protocol" }
@@ -38,9 +40,9 @@ reflex-training = { path = "crates/reflex-training" }
 reflex-eval = { path = "crates/reflex-eval" }
 reflex-knowledge = { path = "crates/reflex-knowledge" }
 reflex-economics = { path = "crates/reflex-economics" }
+reflex-engine = { path = "crates/reflex-engine" }
 reflex-research-graph = { path = "crates/reflex-research-graph" }
 reflex-scheduler = { path = "crates/reflex-scheduler" }
-reflex-fly = { path = "crates/reflex-fly" }
 reflex-analytics = { path = "crates/reflex-analytics" }
 reflex-report = { path = "crates/reflex-report" }
 reflex-observability = { path = "crates/reflex-observability" }
@@ -52,7 +54,7 @@ reflex-domain-wrela = { path = "domains/reflex-domain-wrela" }
 reflex-domain-lean = { path = "domains/reflex-domain-lean" }
 
 # External crates
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "~1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 axum = { version = "0.8.9" }
 prost = { version = "0.14.4" }
@@ -60,8 +62,6 @@ prost-types = { version = "0.14.4" }
 blake3 = { version = "1.5", features = ["serde"] }
 sha2 = { version = "0.10" }
 hex = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.40.2", features = ["bundled", "backup", "blob"] }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 toml = { version = "0.8" }
@@ -80,17 +80,25 @@ rand_chacha = { version = "0.3" }
 thiserror = { version = "2.0" }
 tempfile = { version = "3.16" }
 proptest = { version = "1.6" }
+loom = { version = "=0.7.2" }
+turmoil = { version = "=0.7.2" }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 memmap2 = { version = "0.9" }
-reqwest = { version = "0.12", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 
 # ML & Analytics
-burn = { version = "0.22.0-pre.2", default-features = false, features = ["std", "train", "autodiff", "ndarray", "safetensors"] }
-burn-hip = { version = "0.22.0-pre.2" }
-arrow = { version = "59.2.0", features = ["ffi"] }
-parquet = { version = "59.2.0" }
-datafusion = { version = "55.0.0", features = ["parquet"] }
-object_store = { version = "0.14.1", features = ["aws", "gcp", "azure"] }
+# Burn pinned to 0.22.0-pre.2 per ADR-0006 (deviation from plan 0.21.x line).
+burn = { version = "=0.22.0-pre.2", default-features = false, features = ["std", "train", "autodiff", "flex", "safetensors"] }
+burn-hip = { version = "=0.22.0-pre.2" }
+# Exact analytics line per ADR-0013; changes require another ADR.
+arrow = { version = "=58.4.0", features = ["ffi"] }
+parquet = { version = "=58.4.0" }
+datafusion = { version = "=54.1.0", features = ["parquet"] }
 safetensors = { version = "0.5" }
+
+# Observability & profiling (wired into reflex-observability in a later wave; ADR-0010).
+pprof = { version = "0.15", default-features = false }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false }
+quick-xml = "0.41.0"

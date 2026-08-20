@@ -7,13 +7,34 @@
 **Supersedes:** `reflex-framework-master-plan.md` and `reflex-framework-task-manifest.yaml`  
 **Proposed repository:** `reflex`  
 **License:** `MIT OR Apache-2.0`  
-**Primary deployment:** local single-machine use and Fly.io fleets of `performance-4x` Machines  
+**Primary deployment:** one local, single-process, memory-primary runtime on a 64 GiB workstation
 **Default implementation language:** Rust only  
 **Optional interoperability:** post-v1 adapters; never required by the native path
 
-This document is written so an engineer or coding agent with no prior context can implement Reflex from an empty repository. It defines the product, architecture, algorithms, schemas, toolchain, repository layout, performance budgets, task dependency graph, acceptance criteria, and evidence required to call work complete.
+This document defines the product, architecture, algorithms, schemas, toolchain,
+repository layout, performance budgets, and acceptance criteria. Evidence is
+scientific output, not task-completion bookkeeping: only reconstructable
+experiment artifacts and canonical release checks count.
 
 A later accepted architecture decision record may replace an individual technical choice. It may not silently weaken a constitutional invariant, verifier boundary, scientific identity, or performance gate.
+
+### 0.5 Governing v1 architecture amendment
+
+[ADR 0014](adr/ADR-0014-memory-primary-runtime-and-evidence-bundles.md)
+is the governing authority wherever this plan still describes SQLite,
+PostgreSQL, remote/S3 object storage, wall-clock worker leases, fleets, or a
+portable multi-process topology. Those requirements are superseded, including
+the conflicting portions of §§3–5, §7.3–7.4, §9, §18, §24.2–24.3 and task cards
+P2.4, P4.2, P4.3, P11, and P16.
+
+The required v1 path is one process with a single-owner in-memory coordinator,
+a bounded content-addressed `ArtifactArena`, monotonic attempt-epoch fencing,
+and atomic local evidence bundles. Content identity, verifier authority,
+immutable cell inputs, replay, stale-attempt rejection, snapshot verification,
+and zero-resource cleanup remain release-blocking. The native schema line is
+`arena:1 bundle:1 ledger:1 proto:1`. Legacy adapters may remain as
+non-default compatibility code, but registered v1 experiments and release
+acceptance may not select or depend on them.
 
 ---
 
@@ -84,13 +105,20 @@ All-Rust is not assumed to beat PyTorch on every tensor workload. Reflex chooses
 
 ### 0.3 M2A changes the framework requirements
 
-The M2A compositional-headroom experiment completed as a strong negative result:
+The historical M2A record describes a strong negative result with the following
+reported values:
 
 - at 4× search budget, uniform solved 75.0% overall;
 - the 2,607-parameter MLP solved 60.5%;
 - the 99,902-parameter MLP solved 37.1%;
 - all twenty neural lineage/budget registered comparisons failed;
 - the larger network often consumed less CPU only because it failed earlier.
+
+These numbers are design inputs, not accepted Reflex evidence. They remain
+unverified until P13 imports the authoritative manifests, incidents, replay
+objects, and lineage registrations and reconstructs them under the release
+commit. Missing inputs keep the M2A gate open; implementations and tests must
+not synthesize substitutes.
 
 This result does **not** say that compositional search lacked headroom. It says the M1.5 learner failed to exploit it. The framework therefore treats these as first-class requirements:
 
@@ -112,7 +140,9 @@ Version 1 is accepted only after the same core completes four vertical slices:
 1. a tiny exhaustively verified bit-vector optimizer;
 2. an economically grounded Wrela optimization loop;
 3. Lean M1.5 and M2A scientific reconstruction plus M2B follow-up;
-4. a 20-worker Fly.io fault canary with strict evidence reconstruction.
+4. a hermetic single-process fault matrix covering cancellation, stale attempt
+   epochs, snapshot interruption, external verifier failure, strict evidence
+   reconstruction, and zero leaked cell-owned resources.
 
 The release is not blocked on learned taste or proposal generation. Those are later capabilities built on the grounded core.
 
@@ -136,7 +166,7 @@ A domain author provides:
 
 Reflex provides:
 
-- local and distributed execution;
+- allocation-accounted single-process execution on the local host;
 - deterministic AND-OR search;
 - complete process and logical accounting;
 - high-rate append-only evidence;
@@ -147,7 +177,8 @@ Reflex provides:
 - immutable knowledge editions and retrieval;
 - economic and delayed-utility accounting;
 - strict reports and replay;
-- Fly Machine lifecycle and cleanup.
+- attempt-epoch-fenced execution, atomic local snapshots, and owned-resource
+  cleanup.
 
 ### 1.2 Primary persisted object: research experience
 
@@ -232,6 +263,9 @@ Reflex v1 does not provide:
 - a generic autograd implementation;
 - arbitrary Python model execution in the native hot path;
 - cross-machine shared SQLite;
+- SQL or remote object storage in the native v1 execution path;
+- recovery of an unfinished, unsnapshotted in-memory run;
+- cross-machine worker fleets or live migration;
 - event-by-event database persistence;
 - unconstrained learned theorem or program generation;
 - verifier replacement by statistical confidence;
@@ -266,11 +300,17 @@ These are release-blocking. Each receives an `INV-RFX-*` ID in the implementatio
 6. **Multiple valid routes survive.** Dataset compilation may not label every unchosen candidate negative.
 7. **Raw utility is immutable.** Reward scalarization is derived and versioned; measured facts keep units and provenance.
 8. **Search cost includes ML.** Feature extraction, retrieval, inference, batching, and framework CPU count in economics.
-9. **No partial artifact publication.** Metadata may reference only complete, verified CAS objects.
-10. **One accepted attempt.** Retries remain immutable; fencing determines the accepted attempt.
+9. **No partial evidence publication.** Only a completely written, re-opened,
+   digest-verified, atomically renamed evidence bundle is published.
+10. **One accepted attempt.** Retries remain immutable; a monotonic attempt
+   epoch determines the accepted attempt and rejects delayed work.
 11. **Replayable claims.** Scientific and economic reports reconstruct from immutable evidence, not trusted summaries.
-12. **No shared SQLite.** SQLite is local same-host metadata only; distributed coordination uses PostgreSQL.
-13. **Bulk data stays out of metadata databases.** Proofs, ledgers, datasets, checkpoints, and traces live in CAS.
+12. **Single-process coordination authority.** One in-memory state machine owns
+   cell transitions; registered native runs cannot delegate authority to SQL or
+   a remote coordinator.
+13. **Bounded artifact arena.** Proofs, datasets, checkpoints, traces, and other
+   immutable bulk bytes occupy a capacity-accounted content-addressed arena;
+   exhaustion fails closed and pinned data is never silently evicted or spilled.
 14. **No per-candidate process boundary.** Native scoring is in-process; external domain calls are batched.
 15. **Bounded memory and queues.** Every channel, frontier, cache, batch, upload, and process pool has a declared capacity or budget.
 16. **One CPU budget.** Tokio, search, verification, training, and analytics cannot oversubscribe hidden pools.
@@ -280,7 +320,7 @@ These are release-blocking. Each receives an `INV-RFX-*` ID in the implementatio
 20. **No learned proposal before taste gate.** Learned generation receives significant compute only after fixed-pool critic evaluation.
 21. **No silent fallback.** Backend, verifier, model, knowledge, or resource substitutions require manifest authority.
 22. **Performance is correctness for the framework.** A hot-path regression beyond the accepted budget blocks promotion/release.
-23. **Cleanup is part of completion.** Distributed experiments are incomplete until worker inventory and temporary resources reconcile.
+23. **Cleanup is part of completion.** A cell is incomplete until its child processes, permits, buffers, scratch resources, and in-flight requests reconcile.
 24. **Historical science remains historical.** The new framework does not rewrite accepted Project Reflex artifacts or claims.
 
 ## 3. Performance constitution
@@ -289,21 +329,32 @@ Performance is a design input, not a late optimization phase.
 
 ### 3.1 Reference hardware classes
 
-**Local reference:** the developer machine; useful for iteration, never pooled with scientific performance data without calibration.
+**Canonical local reference:** the 64 GiB workstation running one Reflex
+process. Every performance record names the exact CPU, core count, memory,
+kernel, build profile, power policy, and calibration digest. Measurements from
+other machines remain valid within their own registered host class and are
+never pooled without calibration.
 
-**Canonical dogfood worker:** Fly.io `performance-4x`, 8 GiB RAM, no volume, one experiment cell using all four vCPUs.
-
-**Promoted memory classes:** 16 or 32 GiB only after measured peak RSS exceeds the ordinary class’s safe threshold. CPU count stays explicit.
+The default `ArtifactArena` cap is 48 GiB, leaving at least 16 GiB for code,
+stacks, external verifiers, page cache, snapshot staging, and the operating
+system. A registered manifest may choose a lower cap. Raising it requires a
+measured whole-process RSS budget and must still leave explicit headroom; no
+subsystem infers spare memory dynamically.
 
 ### 3.2 Hot-path rules
 
 - No heap allocation per candidate after warmup.
-- No string construction, JSON, serde, Protobuf, SQL, logging, or CAS operation per candidate.
+- No string construction, JSON, serde, Protobuf, SQL, logging, artifact hashing,
+  or bundle I/O per candidate.
 - Candidate metadata and features use structure-of-arrays buffers.
 - Search owns reusable arenas and buffer pools.
 - Tiny-model inference consumes caller-owned contiguous slices.
 - External processes receive state/candidate batches.
 - Event producers append to thread-local/preallocated buffers.
+- Artifact insertion deduplicates by digest and uses caller-owned or pooled
+  buffers; immutable bytes are shared rather than copied between stages.
+- Evidence-bundle I/O occurs only at declared snapshot barriers and uses
+  bounded staging buffers.
 - I/O uses bounded asynchronous queues; CPU work uses bounded dedicated pools.
 - Every cache declares size, eviction, and accounting.
 - Every background task has a shutdown and evidence-flush contract.
@@ -325,12 +376,14 @@ The implementation may replace a threshold only through an ADR backed by measure
 | Ledger recovery | ≥ 1 GiB/s on local NVMe |
 | Dataset compaction | ≥ 500,000 candidate rows/s/core |
 | Training batch delivery | loader CPU ≤ 10% of one core |
-| 3K MLP, 1M rows, one epoch | ≤ 60 s on performance-4x |
-| Ordinary worker peak RSS | < 6 GiB on 8 GiB class |
-| Worker fleet utilization | ≥ 85%, excluding launch/calibration |
-| Coordinator overhead | < 2% of fleet summed CPU |
-| PostgreSQL claim latency | p95 < 20 ms at 100 claimers |
-| Local CLI metadata commands | p95 < 50 ms startup |
+| 3K MLP, 1M rows, one epoch | ≤ 60 s on the registered canonical local host |
+| ArtifactArena insertion | ≥ 1 GiB/s/core including BLAKE3 identity |
+| ArtifactArena resident bytes | ≤ manifest cap; default 48 GiB |
+| Whole-process peak RSS | < 60 GiB on the 64 GiB canonical local host |
+| Local all-core utilization | ≥ 85%, excluding verifier waits and snapshot barriers |
+| In-memory coordination overhead | < 2% of cell CPU; claim/finalize p95 ≤ 10 µs |
+| Atomic bundle snapshot | ≥ 500 MiB/s for a ≥ 1 GiB bundle before the final fsync barrier |
+| Local CLI startup | p95 < 50 ms |
 
 ### 3.4 Regression policy
 
@@ -384,10 +437,9 @@ No subsystem creates Rayon’s global pool, hidden Burn threads, or unmanaged wo
 | Canonical CPU ML backend | Burn Flex | Low-overhead eager CPU path for small models |
 | Accelerated ML candidate | Burn CubeCL CPU | Benchmark-selected for larger batches/models |
 | Tiny-model ceiling | `reflex-ml-micro` | Specialized allocation-free linear/MLP path, only if benchmark-qualified |
-| Local metadata | rusqlite 0.40.1 + bundled SQLite | Zero-service local UX |
-| Distributed metadata | PostgreSQL 18 + tokio-postgres 0.7.x | Lease/fencing and queue concurrency |
-| Object storage | Apache `object_store` 0.14.x | Local/S3 abstraction with atomic object semantics |
-| Distributed CAS | Tigris S3 API | Native Fly integration and stateless workers |
+| Runtime coordination | `reflex-meta::MemoryMetaStore` | Single-owner state transitions and attempt epochs without serialization |
+| Runtime artifacts | bounded `ArtifactArena` | Content identity, immutable sharing, and explicit resident-memory ownership |
+| Durable evidence | atomic local evidence bundle | One verified replay root with crash-safe publication |
 | Durable analytical data | Arrow/Parquet 58.3.x | Columnar portable datasets |
 | Rust analytics | DataFusion 54.1.x | Vectorized, streaming, multithreaded Rust query engine |
 | Internal hashing | BLAKE3 | Fast content IDs |
@@ -397,7 +449,10 @@ No subsystem creates Rayon’s global pool, hidden Burn threads, or unmanaged wo
 | Tests | cargo-nextest, proptest, cargo-fuzz, Loom, Turmoil | Fast suites plus concurrency/fault models |
 | Profiling | pprof-rs and Linux perf where available | CPU/heap evidence |
 
-Exact versions live in `Cargo.lock`. The plan records version families because patch releases may land before implementation. Changing Burn, persisted-format crates, SQLite, Arrow/Parquet, or PostgreSQL compatibility requires an ADR and full parity/performance gates.
+Exact versions live in `Cargo.lock`. The plan records version families because
+patch releases may land before implementation. Changing Burn, a persisted
+format, the arena/bundle contract, or Arrow/Parquet compatibility requires an
+ADR and full parity/performance gates.
 
 ### 4.2 Burn policy
 
@@ -415,23 +470,29 @@ Do not implement general autograd. `reflex-ml-micro` supports only explicitly re
 
 ### 4.3 DataFusion dependency isolation
 
-DataFusion 54.1 uses Arrow/Parquet 58.3 and an older `object_store` line than the latest CAS crate. `reflex-analytics` is therefore a separate binary/crate boundary. It exchanges URIs, digests, schemas, and Arrow/Parquet data—not Rust `object_store` types—with hot worker crates.
+DataFusion remains a separate crate boundary and never enters hot runtime
+crates. It reads local bundle materializations and exchanges paths, digests,
+schemas, and Arrow/Parquet data with the native pipeline. Any transitive
+`object_store` dependency is an analytics implementation detail and does not
+create a remote-storage capability or native runtime contract.
 
-### 4.4 SQLite policy
+### 4.4 Memory-primary coordination policy
 
-SQLite WAL allows concurrent readers but one writer, and WAL clients must share a host. Reflex uses:
+One coordinator owns the mutable experiment state. Read-heavy views use
+immutable snapshots; writes are typed commands and never SQL. Each claim
+increments the cell's attempt number and nonzero epoch with checked arithmetic.
+Every publication and finalization compares the complete attempt identity.
+Cancellation or retry first advances the epoch, making outstanding handles
+stale before their resources are drained.
 
-- one bounded writer actor;
-- a small read pool;
-- WAL and foreign keys;
-- bundled SQLite with a version that includes the WAL-reset corruption fix;
-- local same-host use only.
+### 4.5 Artifact and durability policy
 
-No distributed deployment may mount or replicate one SQLite file for workers.
-
-### 4.5 PostgreSQL policy
-
-The distributed scheduler claims work with `FOR UPDATE SKIP LOCKED` and fencing tokens. PostgreSQL stores coordination and small indexes—not evidence events or model tensors.
+The `ArtifactArena` holds immutable, digest-addressed runtime bytes below its
+manifest cap. Evidence durability is explicit: a snapshot barrier writes the
+reachable root set, ledger, receipts, and canonical manifest into one local
+bundle and publishes it atomically. An unsnapshotted run is never reported as
+durable. SQL databases, filesystem CAS trees, and remote object stores are not
+fallbacks for arena pressure.
 
 ### 4.6 Tools deliberately not foundational
 
@@ -443,54 +504,31 @@ The distributed scheduler claims work with `FOR UPDATE SKIP LOCKED` and fencing 
 | tch-rs/libtorch | Benchmark/reference backend only |
 | Ray/RLlib/Reverb | Not used; semantics and evidence are domain-specific |
 | DuckDB | Replaced by DataFusion for all-Rust analytics |
-| Shared SQLite replication | Rejected for distributed coordination |
+| SQLite/PostgreSQL | Removed from the native workspace |
+| Remote object storage | Rejected in the native path |
 | gRPC/tonic | Not mandatory; length-framed Prost is enough locally |
 | Generic ORM | Rejected; storage APIs expose Reflex concepts and explicit SQL |
 
 ## 5. High-level architecture
 
 ```text
-                              ┌────────────────────┐
-                              │      reflex CLI     │
-                              └──────────┬─────────┘
-                                         │
-                              ┌──────────▼─────────┐
-                              │ coordinator/reflexd │
-                              │ manifests, leases,  │
-                              │ promotion, fleet    │
-                              └──────┬───────┬─────┘
-                                     │       │
-                           metadata  │       │ immutable bytes
-                                     │       │
-                        ┌────────────▼─┐   ┌─▼────────────────┐
-                        │ SQLite/local │   │ FS CAS / Tigris  │
-                        │ Postgres/fly │   │ evidence/models  │
-                        └──────────────┘   └──────────────────┘
-                                     │
-                        ┌────────────▼─────────────────────┐
-                        │            workers               │
-                        │  cell runtime + search + ML      │
-                        ├────────────┬──────────────────────┤
-                        │ native Rust│ external domain host │
-                        │ domains    │ Lean / Wrela process │
-                        └─────┬──────┴───────────┬──────────┘
-                              │                  │
-                         candidate/search   verifier authority
-                              │                  │
-                              └────────┬─────────┘
-                                       ▼
-                             immutable experience
-                                       │
-                           ┌───────────▼───────────┐
-                           │ dataset/analytics jobs │
-                           │ Parquet + DataFusion   │
-                           └───────────┬───────────┘
-                                       ▼
-                           Rust training/evaluation
-                                       │
-                              candidate checkpoint
-                                       │
-                              promotion or rejection
+┌──────────────────── one Rust process / one ThreadBudget ────────────────────┐
+│ reflex CLI                                                                  │
+│      │                                                                      │
+│      ▼                                                                      │
+│ single-owner coordinator ── attempt epochs ── cell runtime/search/ML       │
+│      │                                              │                       │
+│      │ typed state                                   ├─ native domains       │
+│      ▼                                              └─ batched external     │
+│ immutable views + bounded ArtifactArena                verifier processes   │
+│      │                         │                                            │
+│      ├─ dataset/analytics ─────┼─ Rust training/evaluation/promotion         │
+│      │                         │                                            │
+│      └──────── snapshot barrier: frozen roots + ledger + receipts           │
+└────────────────────────────────┬─────────────────────────────────────────────┘
+                                 ▼
+                     atomic local evidence bundle
+                     (the durable replay boundary)
 ```
 
 ### 5.1 Local topology
@@ -499,31 +537,31 @@ A local user gets:
 
 ```text
 .reflex/
-  reflex.db                 SQLite metadata
-  objects/                  local content-addressed objects
-  scratch/                  bounded disposable work
+  evidence/                 digest-named atomic evidence bundles
+  staging/                  bounded, ignored until atomic rename
   config.toml
 ```
 
-`reflex run` may execute coordinator and worker roles in one process, but their interfaces remain the same as distributed mode.
+`reflex run` owns the coordinator, arena, runtime, training, and snapshot
+barrier in one process. External verifier/domain processes are semantic
+authorities, not Reflex workers; their protocol is batched and their process
+trees remain cell-owned.
 
-### 5.2 Distributed topology
+### 5.2 Post-v1 topology boundary
 
-The Fly dogfood deployment uses:
-
-- one coordinator/API role;
-- PostgreSQL coordination;
-- Tigris immutable object storage;
-- up to twenty stateless `performance-4x` workers;
-- no worker volumes;
-- one ordinary cell using all four vCPUs per worker;
-- explicit cleanup and budget guardrails.
+Fleet coordination, SQL persistence, remote object storage, and portable Reflex
+workers are outside v1. A future adapter must consume and produce the same
+immutable manifests and evidence bundles, but cannot add backend dispatch or
+network checks to the native hot path. It requires a separate ADR and
+qualification suite.
 
 ### 5.3 Native versus external domains
 
 **Native Rust domain:** best throughput, in-process candidate generation/application, direct feature buffers.
 
-**External-process domain:** existing engine retains semantic ownership; batched Protobuf over UDS; immutable bulk bytes through CAS.
+**External-process domain:** existing engine retains semantic ownership;
+batched Protobuf over UDS; immutable bulk bytes use negotiated bounded frames or
+arena digest references.
 
 The framework must fit both without `if domain == lean` branches.
 
@@ -553,8 +591,7 @@ reflex/
 │   ├── reflex-cas/
 │   ├── reflex-ledger/
 │   ├── reflex-meta/
-│   ├── reflex-meta-sqlite/
-│   ├── reflex-meta-postgres/
+│   ├── reflex-engine/
 │   ├── reflex-dataset/
 │   ├── reflex-domain/
 │   ├── reflex-protocol/
@@ -570,7 +607,6 @@ reflex/
 │   ├── reflex-economics/
 │   ├── reflex-research-graph/
 │   ├── reflex-scheduler/
-│   ├── reflex-fly/
 │   ├── reflex-analytics/
 │   ├── reflex-report/
 │   ├── reflex-observability/
@@ -578,19 +614,12 @@ reflex/
 │   └── xtask/
 ├── bins/
 │   ├── reflex/
-│   ├── reflexd/
-│   ├── reflex-worker/
 │   └── reflex-analytics/
 ├── domains/
 │   ├── reflex-domain-bitvec/
 │   ├── reflex-domain-wrela/
 │   └── reflex-domain-lean/
-├── deploy/
-│   └── fly/
-├── sql/
-│   ├── sqlite/
-│   ├── postgres/
-│   └── reports/
+├── sql/reports/
 ├── benches/
 ├── fuzz/
 ├── tests/
@@ -687,60 +716,53 @@ pub fn content_id<T: CanonicalEncode>(domain: &'static [u8], value: &T) -> Resul
 }
 ```
 
-### 7.3 ArtifactStore contract
+### 7.3 ArtifactArena and evidence-bundle contract
 
 ```rust
-#[async_trait::async_trait]
-pub trait ArtifactStore: Send + Sync {
-    async fn put_stream(
-        &self,
-        expected: Option<Digest>,
-        stream: Pin<Box<dyn Stream<Item = Result<Bytes, StoreError>> + Send>>,
-    ) -> Result<StoredObject, StoreError>;
-
-    async fn head(&self, digest: Digest) -> Result<Option<ObjectMeta>, StoreError>;
-
-    async fn get_range(
-        &self,
-        digest: Digest,
-        range: Range<u64>,
-        verification: ReadVerification,
-    ) -> Result<Bytes, StoreError>;
-
-    async fn delete_ephemeral(&self, digest: Digest, token: GcToken) -> Result<(), StoreError>;
+pub trait ArtifactArena: Send + Sync {
+    fn insert(&self, bytes: PooledBytes, expected: Option<Digest>)
+        -> Result<ArtifactHandle, ArenaError>;
+    fn get(&self, digest: Digest) -> Result<ArtifactHandle, ArenaError>;
+    fn pin(&self, digest: Digest, owner: OwnerId) -> Result<ArtifactPin, ArenaError>;
+    fn usage(&self) -> ArenaUsage;
 }
 ```
 
-Local publication algorithm:
+Insertion hashes and counts bytes before publication, rejects a supplied digest
+mismatch, deduplicates an existing immutable object, and charges unique resident
+bytes to the arena. The arena rejects capacity overflow before making an object
+visible. Handles never expose mutable backing storage. Pinned objects cannot be
+evicted; registered mode neither spills nor switches storage implementations.
 
-1. create a random temp file in the target filesystem;
-2. stream bytes while hashing and counting;
-3. flush and `fsync` the temp file;
-4. compare expected digest when supplied;
-5. create parent fanout directories;
-6. atomically rename to the digest path;
-7. `fsync` the parent directory;
-8. if destination already exists, verify size/digest and discard temp.
-
-Distributed publication uses S3 atomic object semantics and create-only/precondition behavior when available. Large objects use fixed 64 MiB chunks and a canonical manifest.
+Durable publication freezes the accepted-attempt view and reachable artifact
+roots, drains ledger barriers, and writes a canonical bundle to a sibling
+temporary path. The writer verifies the manifest, member lengths, and member
+digests, fsyncs the staged tree, renames it atomically to the digest-derived
+final path, fsyncs the parent, then reopens and verifies the result. Temporary,
+incomplete, extra, duplicate, or corrupt members are never evidence.
 
 ### 7.4 Object classes
 
 | Class | Examples | Retention |
 |---|---|---|
-| Evidence permanent | accepted ledgers, receipts, reports, registrations | never automatic delete |
-| Release | promoted models, knowledge editions, binaries | retained while supported/pinned |
-| Active | current experiment inputs/outputs | retained while reachable |
-| Cache | regenerated indexes, local mirrors | evictable |
-| Ephemeral | failed upload parts, scratch bundles | grace-period GC |
+| Evidence root | accepted ledgers, receipts, reports, registrations | pinned until a verified bundle succeeds |
+| Release | promoted models and knowledge editions | pinned while active or snapshotted |
+| Active | current cell inputs and outputs | pinned for the owning cell |
+| Cache | regenerated indexes and derived views | evictable when unpinned |
+| Ephemeral | failed attempts and scratch buffers | reclaimed after owner reconciliation |
 
-Garbage collection is metadata-reachability based and two phase. It never scans user filenames or guesses importance.
+Reclamation is arena-root reachability plus explicit ownership. It never scans
+filenames or guesses importance, never reclaims a pin, and must reconcile to
+the manifest budget at cell and experiment completion.
 
 ## 8. Evidence ledger
 
 ### 8.1 Why not database rows or NDJSON
 
-Reflex can emit millions of candidate-level observations. Per-event SQL and textual JSON would dominate CPU, allocation, storage, and fsync behavior. The hot path writes compact binary blocks to append-only segments. Databases store only segment references and summaries.
+Reflex can emit millions of candidate-level observations. Per-event SQL and
+textual JSON would dominate CPU and allocation. The hot path writes compact
+binary blocks into bounded reusable buffers; a snapshot barrier serializes
+complete segments into the evidence bundle.
 
 ### 8.2 Segment layout
 
@@ -831,7 +853,7 @@ A report is authoritative only if it can be regenerated from:
 ```text
 immutable cell manifest
 + ledger segments
-+ referenced CAS artifacts
++ referenced arena artifacts
 + versioned report queries/code
 ```
 
@@ -839,7 +861,9 @@ Summary files are caches. Deleting them must not destroy the claim.
 
 ## 9. Storage architecture
 
-Reflex does not expose a generic “database” abstraction. It exposes three semantic stores.
+Reflex exposes three semantic stores: memory-primary coordination, the bounded
+artifact arena, and immutable dataset manifests. Durability is the evidence
+bundle boundary, not a mutable database.
 
 ### 9.1 MetaStore
 
@@ -848,72 +872,40 @@ Reflex does not expose a generic “database” abstraction. It exposes three se
 pub trait MetaStore: Send + Sync {
     async fn create_experiment(&self, record: NewExperiment) -> Result<ExperimentId, MetaError>;
     async fn enqueue_cells(&self, cells: &[NewCell]) -> Result<(), MetaError>;
-    async fn claim_cell(&self, request: ClaimRequest) -> Result<Option<CellLease>, MetaError>;
-    async fn heartbeat(&self, lease: &CellLease) -> Result<LeaseStatus, MetaError>;
+    async fn claim_cell(&self, request: ClaimRequest) -> Result<Option<AttemptHandle>, MetaError>;
+    async fn cancel_attempt(&self, attempt: &AttemptHandle) -> Result<(), MetaError>;
     async fn publish_attempt_artifacts(
         &self,
-        lease: &CellLease,
+        attempt: &AttemptHandle,
         artifacts: &[ArtifactRef],
     ) -> Result<(), MetaError>;
     async fn finalize_attempt(
         &self,
-        lease: &CellLease,
+        attempt: &AttemptHandle,
         result: FinalAttempt,
     ) -> Result<FinalizeResult, MetaError>;
     async fn compare_and_promote(&self, request: PromotionRequest) -> Result<PromotionResult, MetaError>;
 }
 ```
 
-### 9.2 Local SQLite
+### 9.2 Single-owner in-memory coordination
 
-One writer actor owns the connection. Commands are typed and batched.
+`MemoryMetaStore` is the native implementation. It uses bounded indexed
+collections behind one mutation authority and publishes immutable read views.
+Claim increments `attempt_no` and a nonzero monotonic epoch with checked
+arithmetic. Every artifact reference and finalization presents the exact
+`(cell_id, attempt_no, epoch)` handle; mismatch is a terminal stale-attempt
+result, not a retry. Advancing the epoch precedes cancellation and resource
+drain, so delayed tasks cannot race back into acceptance.
 
-```rust
-pub enum SqliteWrite {
-    EnqueueCells(Vec<NewCell>, oneshot::Sender<Result<(), MetaError>>),
-    FinalizeAttempt(FinalizeCommand, oneshot::Sender<Result<FinalizeResult, MetaError>>),
-    Promote(PromotionRequest, oneshot::Sender<Result<PromotionResult, MetaError>>),
-    Checkpoint(oneshot::Sender<Result<(), MetaError>>),
-}
+### 9.3 Atomic experiment snapshot
 
-fn configure(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(Duration::from_secs(5))?;
-    Ok(())
-}
-```
-
-Do not call rusqlite from arbitrary async tasks. The writer uses a blocking dedicated thread. Reads use short-lived or pooled read-only connections.
-
-### 9.3 Distributed PostgreSQL lease query
-
-```sql
-WITH next AS (
-    SELECT c.id
-    FROM cells AS c
-    WHERE c.state = 'ready'
-      AND c.available_at <= now()
-      AND c.resource_class = $1
-      AND c.image_digest = $2
-    ORDER BY c.priority DESC, c.created_at, c.id
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-UPDATE cells AS c
-SET state = 'running',
-    worker_id = $3,
-    attempt_no = c.attempt_no + 1,
-    fencing_token = c.fencing_token + 1,
-    lease_expires_at = now() + $4::interval,
-    updated_at = now()
-FROM next
-WHERE c.id = next.id
-RETURNING c.id, c.attempt_no, c.fencing_token, c.lease_expires_at, c.manifest_digest;
-```
-
-Every heartbeat, artifact reference write, and finalization includes `cell_id`, `attempt_no`, and `fencing_token`. A stale worker cannot commit after lease replacement.
+The snapshot barrier captures the coordination view, reachable arena digests,
+ledger cut, verifier receipts, model/knowledge identities, query plans, and
+compatibility line in one manifest. The final bundle digest covers the
+canonical manifest and an exhaustive, sorted member inventory. Publication
+follows §7.3 and is the only transition from ephemeral runtime state to durable
+evidence.
 
 ### 9.4 DatasetStore
 
@@ -936,7 +928,9 @@ pub struct DatasetManifest {
 
 ### 9.5 Analytics
 
-DataFusion reads Parquet directly from local or S3 storage. Canonical SQL files live in `sql/reports`. Every report records query digests and DataFusion/Arrow versions.
+DataFusion reads local Parquet materialized from the active arena or a verified
+evidence bundle. Canonical SQL files live in `sql/reports`. Every report records
+query digests and DataFusion/Arrow versions.
 
 The analytics binary is not linked into workers. Large queries receive memory/spill budgets from configuration.
 
@@ -1858,158 +1852,85 @@ Learned generation enters only after:
 3. critic-guided closed-loop exploration produces a better verified library under equal compute;
 4. verifier and proposal queues remain bounded under invalid bursts.
 
-## 18. Fly.io distributed design
+## 18. Local single-process execution
 
-### 18.1 Components
+The coordinator, scheduler, search, learning pipeline, metadata state, and
+artifact arena run in one process. Native cells are tasks under that ownership
+tree. External domain/verifier processes remain allowed because they retain
+semantic authority, but they are bounded cell-owned children rather than
+portable Reflex workers.
 
-```text
-reflexd coordinator/API
-PostgreSQL metadata and leases
-Tigris CAS
-20 × reflex-worker performance-4x/8GiB
-optional release-holder/migration job
-```
-
-Workers are stateless and volume-free. A cell uploads all required evidence before finalization. Local scratch is disposable.
-
-### 18.2 Resource classes
-
-```toml
-[resources.performance_4x_8gb]
-provider = "fly"
-cpu_kind = "performance"
-cpus = 4
-memory_mb = 8192
-max_search_threads = 4
-max_verifier_workers = 4
-max_training_threads = 4
-safe_rss_mb = 6144
-
-[resources.performance_4x_16gb]
-provider = "fly"
-cpu_kind = "performance"
-cpus = 4
-memory_mb = 16384
-safe_rss_mb = 13312
-```
-
-A job requests the smallest class satisfying its registered peak-memory profile. The scheduler does not silently upgrade scientific cells after seeing outcomes.
-
-### 18.3 Machine creation
-
-A simplified request model:
-
-```rust
-#[derive(Serialize)]
-struct CreateMachineRequest {
-    name: String,
-    region: String,
-    config: MachineConfig,
-}
-
-#[derive(Serialize)]
-struct MachineConfig {
-    image: String, // immutable digest, never mutable tag
-    guest: GuestConfig,
-    env: BTreeMap<String, String>,
-    metadata: BTreeMap<String, String>,
-    auto_destroy: bool,
-    restart: RestartPolicy,
-}
-
-#[derive(Serialize)]
-struct GuestConfig {
-    cpu_kind: &'static str,
-    cpus: u8,
-    memory_mb: u32,
-}
-```
-
-Controller rules:
-
-- use app-scoped deploy tokens;
-- use the internal API endpoint from Fly private networking;
-- attach experiment/fleet identity as metadata;
-- wait for explicit Machine state;
-- retry only idempotent operations;
-- stop and destroy idle workers;
-- inventory active Machines before declaring completion.
-
-### 18.4 Worker bootstrap
+### 18.1 Worker contract
 
 ```text
-verify image/build identity
-load config and secrets
-create tmpfs/ephemeral scratch
-connect Postgres/Tigris
+verify build and schema compatibility
+load an immutable cell manifest
+verify every referenced digest
 run host calibration
-warm CAS/model/domain workers
-register worker session
-claim work
+reserve bounded arena/model/domain resources
+claim work with a monotonic attempt epoch
+drain evidence and owned resources on every exit
 ```
 
-Calibration checks that performance CPUs receive full quota and attaches CPU/kernel/cgroup information to the session.
+Each cell declares CPU, arena, scratch, verifier-process, and queue limits. The
+scheduler never changes a registered cell's resource class after observing its
+outcome.
 
-### 18.5 Tigris
+### 18.2 Resource ownership and cleanup
 
-Use:
+The process owns one `ThreadBudget`, bounded buffer and request pools, external
+domain child processes, and disposable scratch. Completion requires:
+
+1. the ledger finalization barrier has frozen all prior scientific events for
+   the next snapshot;
+2. all required arena objects verify by digest and every pin is accounted;
+3. no compute permit or buffer remains checked out;
+4. external children are drained or terminated as a process group;
+5. in-flight requests have explicit terminal outcomes;
+6. scratch and abandoned bundle staging paths are removed or the failure is
+   recorded.
+
+`CellContext::check_clean_shutdown` and
+`DomainWorkerSupervisor::shutdown_and_drain` enforce the in-process and
+external-process portions of this contract (INV-RFX-23).
+
+### 18.3 Publication protocol
 
 ```text
-endpoint: https://t3.storage.dev
-region: auto
+cell completes search/verifier
+  ↓
+advance/freeze the accepted attempt view
+  ↓
+drain ledger buffers and freeze reachable arena roots
+  ↓
+write and verify a sibling temporary evidence bundle
+  ↓
+fsync staged members and directory
+  ↓
+atomically rename bundle and fsync parent
+  ↓
+reopen/verify bundle and record publication success
 ```
 
-Object-store credentials are role scoped. Workers can write experiment prefixes and read declared inputs; release/audit roles handle permanent edition publication where feasible.
+Delayed work presenting a prior attempt epoch cannot add a root, finalize the
+cell, or enter the published bundle.
 
-### 18.6 Scheduling
+### 18.4 Hermetic fault matrix
 
-The default is one cell per Machine using all four CPUs. This matches Project Reflex evidence that competing cells created avoidable protocol/startup contention.
+The release suite injects these failures into the in-memory state machine,
+snapshot writer, and external verifier process boundary:
 
-The fleet controller:
-
-1. counts ready cells by image, domain, resource class, and region;
-2. subtracts compatible idle/starting workers;
-3. launches up to configured fleet and budget caps;
-4. lets workers claim through PostgreSQL;
-5. drains and destroys idle workers;
-6. verifies zero remaining worker Machines/volumes at experiment close.
-
-### 18.7 Publication protocol
-
-```text
-worker completes search/verifier
-  ↓
-finish and fsync local ledger segments
-  ↓
-upload every required CAS object
-  ↓
-HEAD/verify objects
-  ↓
-write artifact references with current fence
-  ↓
-publish canonical completion manifest last
-  ↓
-finalize accepted attempt transaction
-```
-
-A stale worker may upload duplicate immutable bytes, but cannot finalize metadata with an expired fencing token.
-
-### 18.8 Dogfood fault matrix
-
-The first 20-worker canary injects:
-
-- death before claim;
-- death after claim before first event;
-- death mid-search;
-- death during segment upload;
-- death after upload before metadata publication;
-- death after publication before finalization;
-- coordinator restart;
-- transient Postgres loss;
-- transient Tigris failure;
+- cancellation before claim;
+- cancellation after claim before first event;
+- cancellation mid-search;
+- arena exhaustion and digest mismatch;
+- interruption before, during, and after staged-bundle fsync;
+- interruption before and after atomic rename;
+- external verifier crash, timeout, and malformed reply;
 - duplicate/late finalization attempt.
 
-Strict reconstruction must select exactly one accepted attempt or report an explicit incomplete cell. Final inventory must be zero active worker Machines and zero Fly volumes.
+Strict reconstruction must select exactly one accepted attempt or report an
+explicit incomplete cell. The final owned-resource inventory must be zero.
 
 ## 19. Analytics, reports, and operator UX
 
@@ -2077,9 +1998,6 @@ reflex evaluate
 reflex model promote
 reflex knowledge build
 reflex report
-reflex fly launch
-reflex fly inventory
-reflex fly cleanup
 reflex bench
 ```
 
@@ -2157,7 +2075,7 @@ Every report contains:
 | Property | proptest | Algebraic and round-trip invariants |
 | Fuzz | cargo-fuzz | Untrusted persisted/protocol inputs |
 | Concurrency | Loom | Writer actor, swaps, channels, permits |
-| Distributed | Turmoil + real Fly canary | Leases, partitions, retries |
+| Multi-process | Turmoil + local child processes | Leases, partitions, retries, cleanup |
 | Bench | Criterion/custom | Hot path and end-to-end gates |
 | Scientific | domain matrices | Claims and negative results |
 
@@ -2180,23 +2098,23 @@ Every decoder has an input-size limit before allocation.
 
 Model:
 
-- SQLite writer command completion/cancellation;
+- local attempt claim/retry/cancellation/finalization;
 - bounded event-buffer ownership;
 - model active-pointer promotion;
 - thread-budget acquire/release/shutdown;
-- cell state CAS transitions;
-- local duplicate CAS publication.
+- atomic evidence capability handoff;
+- local duplicate arena publication.
 
 ### 20.4 Turmoil scenarios
 
 Simulate:
 
-- claim response lost after DB commit;
-- heartbeat delay and lease expiry;
-- old worker finalization after replacement;
-- duplicate object upload;
-- coordinator restart during promotion;
-- Postgres/Tigris transient outages;
+- cancellation racing a local completion;
+- stale attempt finalization after retry;
+- duplicate arena insertion;
+- interruption at every evidence-bundle write boundary;
+- restart from the last valid CURRENT bundle;
+- external verifier response loss, delay, duplication, and crash;
 - cancellation during each generation phase.
 
 ### 20.5 Reproducibility classes
@@ -2280,47 +2198,25 @@ Only after Wrela economics and historical/delayed utility exist:
 - portfolio scheduling;
 - learned proposal gate.
 
-## 22. Implementation rules for junior engineers and coding agents
+## 22. Implementation rules
 
 For every task:
 
 1. Read this architecture section and the exact task card.
-2. Inspect all dependency evidence artifacts.
-3. Modify only the listed owner crates/files unless the task explicitly requires a cross-cutting change.
-4. Do not weaken an invariant or performance threshold to make tests pass.
-5. When a required API no longer matches a pinned dependency, open an ADR with primary-source evidence and a minimal migration—not a silent workaround.
-6. Implement the simplest correct/reference version first.
-7. Add correctness tests before optimization.
-8. Add the named benchmark before changing hot code.
-9. Run the task’s acceptance commands and store all four required evidence artifacts.
-10. Stop when any AC fails; do not mark partial work complete.
+2. Modify the owning crates/files unless the task explicitly requires a
+   cross-cutting change.
+3. Do not weaken an invariant or performance threshold to make tests pass.
+4. When a required API no longer matches a pinned dependency, open an ADR
+   with primary-source evidence and a minimal migration—not a silent workaround.
+5. Implement the simplest correct/reference version first.
+6. Add correctness tests before optimization and the named benchmark before
+   changing hot code.
+7. Run `cargo xtask check`. Store genuine ledgers, arena artifacts, datasets,
+   checkpoints, and reports under `evidence/<experiment>/`; do not create task
+   stamps or manual completion checklists.
+8. A failed acceptance criterion remains visibly incomplete.
 
-### 22.1 Required evidence layout
-
-```text
-evidence/tasks/P7.3/
-  result.json       structured AC status and produced digests
-  commands.txt      exact commands and exit status
-  tests.txt         test names, counts, versions, and output references
-  benchmarks.json   host calibration, samples, summary, threshold decision
-```
-
-### 22.2 `result.json` minimum schema
-
-```json
-{
-  "task_id": "P7.3",
-  "commit": "...",
-  "status": "passed",
-  "dependencies": {"P7.1": "digest", "P1.4": "digest"},
-  "deliverables": [{"path": "crates/reflex-ml-micro", "digest": "..."}],
-  "acceptance": [{"criterion": "...", "status": "passed", "evidence": "..."}],
-  "performance": [{"benchmark": "micro_mlp_2607_batch64", "decision": "passed", "evidence": "..."}],
-  "notes": []
-}
-```
-
-### 22.3 When to create an ADR
+### 22.1 When to create an ADR
 
 Create an ADR before:
 
@@ -2330,7 +2226,7 @@ Create an ADR before:
 - changing model/dataset label semantics;
 - weakening or redefining a performance gate;
 - using unsafe code in a hot kernel;
-- changing distributed lease/fencing behavior;
+- changing attempt-epoch fencing or atomic bundle publication;
 - adding a mandatory non-Rust runtime;
 - changing a historical scientific migration claim.
 
@@ -2348,9 +2244,11 @@ P6–P9 complete. The 2,607-parameter numerical reference matches, DecisionGroup
 
 P10 complete. Bit-vector generation 2 improves a frozen verified metric or returns a complete negative result that still demonstrates all lifecycle semantics.
 
-### Gate D — distributed
+### Gate D — resilience
 
-P11 complete. Twenty-worker fault canary reconstructs exactly and leaves zero worker resources.
+Attempt-epoch fencing, atomic bundle publication, cancellation, external
+verifier failure, retry, and cleanup pass the hermetic local fault matrix with
+zero owned resources or staging paths.
 
 ### Gate E — real domains
 
@@ -2386,17 +2284,22 @@ Burn explicitly remains under active development. Reflex therefore wraps it, pin
 
 The micro tier is not a rejection of Burn. It is a benchmark-controlled specialization for models in the thousands of parameters where general framework dispatch can be meaningful relative to arithmetic.
 
-### 24.2 SQLite and PostgreSQL
+### 24.2 Memory-primary state and attempt epochs
 
-SQLite WAL permits concurrent readers but only one writer, and all WAL clients must share a host. This makes it ideal for the local default and unsuitable as the distributed coordination file.
+Single-process ownership removes SQL serialization and distributed lease
+timers without weakening stale-work rejection. A checked monotonic attempt
+epoch is sufficient because all authoritative mutation occurs in one state
+machine. Immutable read views and arena handles give concurrent stages access
+without duplicating ownership.
 
-PostgreSQL `SKIP LOCKED` explicitly supports queue-like multi-consumer access. Reflex combines it with monotonic fencing tokens because row claiming alone does not prevent a stale worker from publishing after lease replacement.
+### 24.3 ArtifactArena and evidence bundles
 
-SQLite versions affected by the WAL-reset corruption bug are not accepted. The bundled/source identity is checked at runtime and in release evidence.
-
-### 24.3 Object storage
-
-Apache `object_store` provides local and S3 implementations with atomic object operations and multipart support. It is hidden behind Reflex’s `ArtifactStore` trait. Tigris is selected for Fly dogfood because it is S3-compatible, available natively through Fly, and exposes a canonical global endpoint.
+Content addressing is useful independently of object storage: it deduplicates
+immutable bytes, binds manifests, and makes replay verifiable. The arena keeps
+that identity in memory under a hard resident-byte cap. Atomic local bundles
+provide the narrower durability operation Reflex actually needs, with one
+digest-verified publication boundary instead of a mutable database plus CAS
+coordination protocol.
 
 ### 24.4 Arrow, Parquet, and DataFusion
 
@@ -2404,11 +2307,7 @@ Parquet is selected for durable analytical/training datasets because it supports
 
 Parquet is not used as the high-rate event log. A custom append-only segment format has simpler crash semantics and lower hot-path overhead. Compaction converts evidence to Parquet afterward.
 
-### 24.5 Fly Machines
-
-Fly `performance` vCPUs receive full CPU quota, unlike burst-limited shared vCPUs. Machines are programmatically creatable, startable, stoppable, and destroyable through the Machines API. That maps cleanly to immutable experiment cells and aggressive cleanup.
-
-### 24.6 Prior systems implications
+### 24.5 Prior systems implications
 
 The general search → verified experience → training → improved search loop has strong precedent in expert iteration, formal theorem proving, algorithm discovery, and evaluator-driven evolution. Reflex does not claim this flywheel as novel.
 
@@ -2432,16 +2331,13 @@ These are the initial version anchors, not permission to float dependencies.
 | Prost | 0.14.x | external protocol messages |
 | BLAKE3 | current locked | internal hashes |
 | sha2 | current locked | SHA-256 imports |
-| rusqlite | 0.40.1 | bundled SQLite; runtime source/version audit |
-| tokio-postgres | 0.7.x | explicit SQL, TLS feature chosen in ADR |
-| object_store | 0.14.x | CAS crate; hidden behind trait |
 | Arrow/Parquet | 58.3.x | match DataFusion line |
 | DataFusion | 54.1.x | analytics binary only |
 | Criterion | 0.8.x | microbenchmarks |
 | cargo-nextest | current locked tool | fast tests |
 | proptest | current locked | properties |
 | Loom | current locked | concurrency models |
-| Turmoil | current locked | distributed simulation |
+| Turmoil | current locked | deterministic local fault simulation where useful |
 | pprof | 0.15.x | CPU/heap profiles |
 | tracing | current locked | spans/events |
 | OpenTelemetry Rust | 0.32.x | optional export |
@@ -2454,14 +2350,10 @@ The following source set guided the stack decisions. The checked-in repository s
 
 1. Rust Release Team, **Announcing Rust 1.97.1**, 2026-07-16.
 2. Tracel AI, **Burn v0.21.0 release notes** and Burn repository documentation.
-3. SQLite project, **Write-Ahead Logging** and release history through 3.53.4.
-4. PostgreSQL project, **PostgreSQL 18 SELECT locking clause documentation**, including `SKIP LOCKED` queue guidance.
-5. Apache DataFusion project, **DataFusion 54.1.0 documentation and release artifacts**.
-6. Apache Arrow Rust crates, Arrow/Parquet 58.3.x dependency line.
-7. Apache `object_store` 0.14.x documentation for atomic APIs and S3 multipart uploads.
-8. Fly.io, **CPU Performance**, **Machines API**, **Machines resource**, **Tigris**, and Managed PostgreSQL documentation.
-9. Project Reflex, **Research Findings Through M1.5** and the accepted **M2A Compositional Headroom Result**.
-10. Wrela, Pixels language/renderer contract, theorem-to-kernel correspondence, cost model, and P8R evidence.
+3. Apache DataFusion project, **DataFusion 54.1.0 documentation and release artifacts**.
+4. Apache Arrow Rust crates, Arrow/Parquet 58.3.x dependency line.
+5. Project Reflex, **Research Findings Through M1.5** and the accepted **M2A Compositional Headroom Result**.
+6. Wrela, Pixels language/renderer contract, theorem-to-kernel correspondence, cost model, and P8R evidence.
 
 ## 27. Final architectural recommendation
 
@@ -2480,7 +2372,11 @@ value in measured economics
 time in an immutable research graph
 ```
 
-Rust makes that decomposition operationally clean and fast enough to run continuously. Burn makes native training plausible. The micro tier ensures tiny policies do not pay avoidable framework overhead. SQLite/PostgreSQL/Tigris/Parquet/DataFusion give each data class an appropriate home. Fly performance Machines give the first dogfood fleet a simple immutable-cell execution model.
+Rust makes that decomposition operationally clean and fast enough to run
+continuously. Burn makes native training plausible. The micro tier ensures tiny
+policies do not pay avoidable framework overhead. A bounded in-memory arena and
+single-owner coordinator keep the hot pipeline direct; atomic bundles,
+Parquet, and DataFusion preserve durable replay and offline analysis locally.
 
 The implementation succeeds when a less capable agent can follow the task graph, build the system without hidden context, run it cheaply, and obtain results whose truth, provenance, performance, and economics can all be reconstructed.
 
@@ -2542,57 +2438,35 @@ message ExpandBatchResponse {
 
 The transport rejects frames larger than the negotiated maximum before allocation. Request IDs are unique per connection. Late responses after cancellation are consumed and recorded but never applied.
 
-### 28.2 SQLite writer actor
+### 28.2 Single-owner local coordination
 
 ```rust
-pub fn spawn_sqlite_writer(path: PathBuf, capacity: usize) -> SqliteWriterHandle {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<SqliteWrite>(capacity);
-    std::thread::Builder::new()
-        .name("reflex-sqlite-writer".into())
-        .spawn(move || {
-            let mut conn = Connection::open(path).expect("open reflex metadata");
-            configure(&conn).expect("configure sqlite");
-            while let Some(first) = rx.blocking_recv() {
-                let mut batch = vec![first];
-                while batch.len() < 256 {
-                    match rx.try_recv() {
-                        Ok(next) => batch.push(next),
-                        Err(_) => break,
-                    }
-                }
-                execute_write_batch(&mut conn, batch);
-            }
-            let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
-        })
-        .expect("spawn sqlite writer");
-    SqliteWriterHandle { tx }
+pub fn drain_ready(
+    state: &mut LocalRunState,
+    execute: impl Fn(CellJob) -> Result<CommittedEvidence>,
+) -> Result<()> {
+    while let Some(job) = state.claim_next()? {
+        let evidence = execute(job)?;
+        state.finalize(job.ticket, AttemptOutcome::Accepted, &evidence)?;
+    }
+    Ok(())
 }
 ```
 
-Production code avoids allocating the temporary `Vec` each loop by reusing a bounded buffer. Every command receives a reply even when the transaction fails.
+One owner mutates dense bounded state. Claims are deterministic and a worker
+result cannot finalize until an atomic evidence commit has minted its
+capability.
 
-### 28.3 Fenced finalization
+### 28.3 Attempt-epoch finalization
 
-```sql
-UPDATE cells
-SET state = 'succeeded',
-    accepted_attempt_no = $2,
-    completion_manifest_digest = $4,
-    lease_expires_at = NULL,
-    updated_at = now()
-WHERE id = $1
-  AND state = 'running'
-  AND attempt_no = $2
-  AND fencing_token = $3
-  AND EXISTS (
-      SELECT 1 FROM artifacts
-      WHERE digest = $4
-        AND kind = 'cell-completion-manifest'
-  )
-RETURNING id;
+```rust
+let job = state.claim_next()?.ok_or(NoReadyCell)?;
+let evidence = bundles.commit(schema, roots)?.1;
+state.finalize(job.ticket, AttemptOutcome::Accepted, &evidence)?;
 ```
 
-Zero returned rows means stale lease, wrong attempt, missing manifest, or prior finalization. The caller reads current state and records the exact conflict; it does not retry as a blind update.
+A mismatched cell, attempt number, epoch, or manifest is rejected. Retry and
+cancellation advance the epoch, so a delayed result cannot become accepted.
 
 ### 28.4 Ledger recovery
 
@@ -2723,26 +2597,30 @@ loop {
             publish_and_finalize(&cas, &meta, lease, result).await?;
         }
         None => {
-            if fleet_policy.should_exit_idle(idle_since.elapsed()) {
+            if worker_policy.should_exit_idle(idle_since.elapsed()) {
                 break;
             }
-            tokio::time::sleep(fleet_policy.poll_interval).await;
+            tokio::time::sleep(worker_policy.poll_interval).await;
         }
     }
 }
 ```
 
-Cell execution owns the four-vCPU compute lease. The claim loop itself never runs a second ordinary cell concurrently on that Machine.
+Cell execution owns the declared compute lease. The claim loop itself never
+runs a second ordinary cell concurrently unless the manifest explicitly
+partitions the worker budget.
 
-## 29. Complete implementation task cards
+## 29. Implementation task cards
 
-The machine-readable manifest is authoritative for dependencies and required fields. These cards are generated from it.
+These cards define ownership and acceptance criteria. They are planning
+guidance, not completion records; executable checks and reconstructable
+scientific artifacts remain authoritative.
 
 ## P0 — Repository and engineering authority
 
-**Goal:** Create the greenfield all-Rust workspace, checked-in authority documents, and an executable task graph.
+**Goal:** Create the greenfield all-Rust workspace and checked-in authority documents.
 
-**Exit gate:** A clean checkout passes the fast gate, the manifest validator proves an acyclic task graph, and no mandatory Python runtime or package exists.
+**Exit gate:** A clean checkout passes the fast gate and no mandatory Python runtime or package exists.
 
 ### P0.1 — Create the all-Rust workspace and pin toolchains
 
@@ -2765,7 +2643,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 1. Create the workspace members exactly as listed in the repository layout.
 2. Set resolver = 3, edition = 2024, rust-version = 1.97.1, and deny unsafe code by default.
-3. Add minimal binaries reflex, reflexd, and reflex-worker with version output.
+3. Add the `reflex` binary with version output and keep offline analytics isolated.
 4. Commit a lockfile generated on Linux and verify it on macOS arm64.
 
 **Acceptance criteria**
@@ -2777,26 +2655,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Clean release build completes within 12 minutes on the pinned performance-4x build host after an empty registry cache.
+- Clean release build completes within 12 minutes on the pinned reference-4vcpu-8gb build host after an empty registry cache.
 - Incremental no-op cargo check completes within 4 seconds on the same host.
-
-**Verification commands**
-
-- `cargo xtask task verify P0.1`
-- `cargo xtask task benchmark P0.1`
-- `cargo xtask task evidence-check P0.1`
-
-**Required evidence**
-
-- `evidence/tasks/P0.1/result.json`
-- `evidence/tasks/P0.1/commands.txt`
-- `evidence/tasks/P0.1/tests.txt`
-- `evidence/tasks/P0.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not copy the Project Reflex source tree wholesale.
-- Do not add a Git dependency without an accepted ADR.
 
 ### P0.2 — Implement authoritative fast and deep check lanes
 
@@ -2819,8 +2679,9 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 1. Wire rustfmt, clippy -D warnings, cargo nextest, doctests, generated-file freshness, dependency policy, and documentation checks.
 2. Make the deep lane add Loom, Turmoil, fuzz smoke, corruption recovery, and distributed integration tests.
-3. Write every command, duration, exit status, and tool version to evidence/checks.
-4. Upload evidence even when a lane fails.
+3. Write one deterministic report per lane containing commands, normalized
+   status, and tool versions. Keep timings in transient CI telemetry.
+4. Upload the report and logs even when a lane fails.
 
 **Acceptance criteria**
 
@@ -2831,26 +2692,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Fast lane p95 is under 8 minutes on a warm performance-4x CI runner.
+- Fast lane p95 is under 8 minutes on a warm reference-4vcpu-8gb CI runner.
 - Deep lane exposes per-suite timing and flags any suite growing by more than 20% from its accepted baseline.
-
-**Verification commands**
-
-- `cargo xtask task verify P0.2`
-- `cargo xtask task benchmark P0.2`
-- `cargo xtask task evidence-check P0.2`
-
-**Required evidence**
-
-- `evidence/tasks/P0.2/result.json`
-- `evidence/tasks/P0.2/commands.txt`
-- `evidence/tasks/P0.2/tests.txt`
-- `evidence/tasks/P0.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P0.3 — Establish dependency, license, and advisory policy
 
@@ -2871,40 +2714,22 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Implementation steps**
 
-1. Allow crates.io releases only by default; require exact workspace pins for Burn and storage-critical crates.
+1. Allow crates.io releases only by default; require exact workspace pins for Burn and persisted-format-critical crates.
 2. Deny unknown licenses and duplicate semver-major versions of security-sensitive crates unless listed in the exception registry.
-3. Generate SPDX or CycloneDX SBOMs for every release image.
-4. Record the Burn, SQLite, PostgreSQL protocol, and Arrow/DataFusion compatibility assumptions in an ADR.
+3. Generate SPDX or CycloneDX SBOMs for every release artifact.
+4. Record the Burn, Tokio, protocol, arena/bundle, and Arrow/DataFusion compatibility assumptions in ADRs.
 
 **Acceptance criteria**
 
 - A deliberately vulnerable fixture is rejected.
 - An unapproved Git source and license are rejected.
-- The SBOM includes transitive native components such as SQLite.
+- The SBOM exactly reconstructs the native binary dependency graph.
 - Dependency exceptions name an owner, rationale, expiry date, and benchmark or compatibility evidence.
 
 **Performance acceptance**
 
 - Supply-chain checks add less than 45 seconds to a warm fast lane.
 - The release image dependency inventory is reproducible across two clean builds.
-
-**Verification commands**
-
-- `cargo xtask task verify P0.3`
-- `cargo xtask task benchmark P0.3`
-- `cargo xtask task evidence-check P0.3`
-
-**Required evidence**
-
-- `evidence/tasks/P0.3/result.json`
-- `evidence/tasks/P0.3/commands.txt`
-- `evidence/tasks/P0.3/tests.txt`
-- `evidence/tasks/P0.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P0.4 — Create ADR, invariant, and evidence traceability
 
@@ -2942,77 +2767,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Docs validation completes in under 2 seconds on the repository corpus.
 - Traceability generation is deterministic and does not read network state.
 
-**Verification commands**
-
-- `cargo xtask task verify P0.4`
-- `cargo xtask task benchmark P0.4`
-- `cargo xtask task evidence-check P0.4`
-
-**Required evidence**
-
-- `evidence/tasks/P0.4/result.json`
-- `evidence/tasks/P0.4/commands.txt`
-- `evidence/tasks/P0.4/tests.txt`
-- `evidence/tasks/P0.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P0.5 — Implement task-manifest validation and junior-agent execution protocol
-
-**Phase:** P0  
-**Dependencies:** P0.2, P0.4  
-**Size:** M  
-**Primary skill:** Developer tooling  
-**Owned scope:** `xtask`, `docs/implementation`
-
-**Purpose.** Turn this plan into an executable dependency graph that a less capable coding agent can follow safely.
-
-**Deliverables**
-
-- YAML task schema
-- DAG validator
-- task evidence validator
-- docs/junior-execution-protocol.md
-
-**Implementation steps**
-
-1. Validate unique IDs, known phases, dependency existence, acyclicity, and required task fields.
-2. Require each task to produce the four named evidence artifacts before it can be marked complete.
-3. Document the exact workflow: read task card, inspect dependencies, implement only owned scope, run named commands, capture evidence, and stop on failed AC.
-4. Generate ready, blocked, and completed task views from durable evidence rather than manual checkboxes.
-
-**Acceptance criteria**
-
-- The validator rejects a cycle, missing dependency, empty AC, missing performance AC, and unauthorized scope expansion.
-- A task cannot complete when any declared acceptance criterion lacks evidence.
-- The protocol tells an agent when to open an ADR instead of improvising.
-- The ready-task output is stable under YAML key reordering.
-
-**Performance acceptance**
-
-- Validation of the complete manifest completes in under 250 ms.
-- Ready-task generation allocates less than 32 MiB at the full v1 manifest size.
-
-**Verification commands**
-
-- `cargo xtask task verify P0.5`
-- `cargo xtask task benchmark P0.5`
-- `cargo xtask task evidence-check P0.5`
-
-**Required evidence**
-
-- `evidence/tasks/P0.5/result.json`
-- `evidence/tasks/P0.5/commands.txt`
-- `evidence/tasks/P0.5/tests.txt`
-- `evidence/tasks/P0.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P1 — Performance constitution and measurement substrate
 
@@ -3039,7 +2793,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Implementation steps**
 
-1. Create named profiles for developer laptop, Fly performance-4x, and canonical scientific CPU.
+1. Create named profiles for developer laptop, provider-neutral reference-4vcpu-8gb, and canonical scientific CPU.
 2. Record CPU model, ISA, kernel, cgroup quota, governor, NUMA, memory, container image, and git identity.
 3. Warm up each benchmark, report distributions, and retain raw samples.
 4. Implement compare with explicit noise bands and per-benchmark regression thresholds.
@@ -3054,25 +2808,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Benchmark harness overhead is below 1% for benchmarks longer than 100 ms.
-- A full fast benchmark suite finishes in under 5 minutes on performance-4x.
-
-**Verification commands**
-
-- `cargo xtask task verify P1.1`
-- `cargo xtask task benchmark P1.1`
-- `cargo xtask task evidence-check P1.1`
-
-**Required evidence**
-
-- `evidence/tasks/P1.1/result.json`
-- `evidence/tasks/P1.1/commands.txt`
-- `evidence/tasks/P1.1/tests.txt`
-- `evidence/tasks/P1.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- A full fast benchmark suite finishes in under 5 minutes on reference-4vcpu-8gb.
 
 ### P1.2 — Implement the global thread-budget broker
 
@@ -3110,24 +2846,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Synthetic mixed workloads sustain at least 90% CPU utilization without run-queue growth beyond 2× vCPU count.
 - Broker acquire/release p95 is below 2 microseconds under 64 contending tasks.
 
-**Verification commands**
-
-- `cargo xtask task verify P1.2`
-- `cargo xtask task benchmark P1.2`
-- `cargo xtask task evidence-check P1.2`
-
-**Required evidence**
-
-- `evidence/tasks/P1.2/result.json`
-- `evidence/tasks/P1.2/commands.txt`
-- `evidence/tasks/P1.2/tests.txt`
-- `evidence/tasks/P1.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P1.3 — Implement child-process CPU, RSS, and I/O accounting
 
 **Phase:** P1  
@@ -3163,24 +2881,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Sampling at 100 ms adds under 0.5% CPU to an 8-worker Lean cell.
 - Accounting state stays below 4 KiB per live process.
-
-**Verification commands**
-
-- `cargo xtask task verify P1.3`
-- `cargo xtask task benchmark P1.3`
-- `cargo xtask task evidence-check P1.3`
-
-**Required evidence**
-
-- `evidence/tasks/P1.3/result.json`
-- `evidence/tasks/P1.3/commands.txt`
-- `evidence/tasks/P1.3/tests.txt`
-- `evidence/tasks/P1.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P1.4 — Add allocation and copy instrumentation to hot paths
 
@@ -3218,31 +2918,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Disabled instrumentation has no measurable effect above a 1% noise floor.
 - Enabled scoped counting adds under 5% to microbenchmarks.
 
-**Verification commands**
-
-- `cargo xtask task verify P1.4`
-- `cargo xtask task benchmark P1.4`
-- `cargo xtask task evidence-check P1.4`
-
-**Required evidence**
-
-- `evidence/tasks/P1.4/result.json`
-- `evidence/tasks/P1.4/commands.txt`
-- `evidence/tasks/P1.4/tests.txt`
-- `evidence/tasks/P1.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P1.5 — Implement deterministic host calibration
 
 **Phase:** P1  
 **Dependencies:** P1.1, P1.3  
 **Size:** M  
 **Primary skill:** Benchmark operations  
-**Owned scope:** `reflex-bench`, `reflex-worker`
+**Owned scope:** `reflex-bench`, `reflex-runtime`
 
 **Purpose.** Measure host capability before accepting scientific or performance-sensitive cells.
 
@@ -3263,32 +2945,14 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Acceptance criteria**
 
 - Identical machine classes cluster within registered variance.
-- A shared-cpu Fly Machine is rejected for performance experiments.
+- A throttled or shared-CPU host is rejected for performance experiments.
 - A worker with missing calibration cannot claim work.
 - Calibration results are immutable and reconstructable.
 
 **Performance acceptance**
 
-- Calibration completes in under 90 seconds on performance-4x.
+- Calibration completes in under 90 seconds on reference-4vcpu-8gb.
 - Calibration uses under 256 MiB RSS and leaves no persistent scratch.
-
-**Verification commands**
-
-- `cargo xtask task verify P1.5`
-- `cargo xtask task benchmark P1.5`
-- `cargo xtask task evidence-check P1.5`
-
-**Required evidence**
-
-- `evidence/tasks/P1.5/result.json`
-- `evidence/tasks/P1.5/commands.txt`
-- `evidence/tasks/P1.5/tests.txt`
-- `evidence/tasks/P1.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P1.6 — Enforce performance budgets in CI and promotion
 
@@ -3326,29 +2990,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Gate evaluation completes in under 1 second for 10,000 benchmark records.
 - Budget registry lookup adds no hot-path code or dependency.
 
-**Verification commands**
-
-- `cargo xtask task verify P1.6`
-- `cargo xtask task benchmark P1.6`
-- `cargo xtask task evidence-check P1.6`
-
-**Required evidence**
-
-- `evidence/tasks/P1.6/result.json`
-- `evidence/tasks/P1.6/commands.txt`
-- `evidence/tasks/P1.6/tests.txt`
-- `evidence/tasks/P1.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-## P2 — Canonical identity and content-addressed storage
+## P2 — Canonical identity, ArtifactArena, and durable bundles
 
 **Goal:** Provide stable identities and immutable bytes for every scientific and model artifact.
 
-**Exit gate:** Local and S3-compatible CAS implementations pass crash, corruption, concurrency, and cross-backend identity tests.
+**Exit gate:** The bounded in-memory arena passes identity, deduplication,
+capacity, ownership, and concurrency tests; atomic local bundles pass
+interrupted-publication, corruption, and replay tests.
 
 ### P2.1 — Implement typed digests and durable IDs
 
@@ -3383,26 +3031,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Hashing sustains at least 1.5 GiB/s on the calibration performance-4x host for 64 MiB buffers.
+- Hashing sustains at least 1.5 GiB/s on the calibration reference-4vcpu-8gb host for 64 MiB buffers.
 - Typed ID parse/format p95 is below 500 ns for cached-size stack buffers.
-
-**Verification commands**
-
-- `cargo xtask task verify P2.1`
-- `cargo xtask task benchmark P2.1`
-- `cargo xtask task evidence-check P2.1`
-
-**Required evidence**
-
-- `evidence/tasks/P2.1/result.json`
-- `evidence/tasks/P2.1/commands.txt`
-- `evidence/tasks/P2.1/tests.txt`
-- `evidence/tasks/P2.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P2.2 — Implement canonical serialization and schema envelopes
 
@@ -3440,133 +3070,95 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Canonical encoding sustains at least 500 MiB/s for large flat records.
 - Encoding a typical decision group allocates at most once into the caller-provided output buffer.
 
-**Verification commands**
-
-- `cargo xtask task verify P2.2`
-- `cargo xtask task benchmark P2.2`
-- `cargo xtask task evidence-check P2.2`
-
-**Required evidence**
-
-- `evidence/tasks/P2.2/result.json`
-- `evidence/tasks/P2.2/commands.txt`
-- `evidence/tasks/P2.2/tests.txt`
-- `evidence/tasks/P2.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P2.3 — Implement crash-safe local content-addressed storage
+### P2.3 — Implement the bounded content-addressed ArtifactArena
 
 **Phase:** P2  
 **Dependencies:** P2.1, P2.2  
 **Size:** L  
-**Primary skill:** Filesystem systems  
+**Primary skill:** Rust memory systems
 **Owned scope:** `reflex-cas`
 
-**Purpose.** Store immutable artifacts locally without partial visibility or identity drift.
+**Purpose.** Share immutable artifacts across the hot pipeline without I/O,
+backend dispatch, unbounded allocation, or identity drift.
 
 **Deliverables**
 
-- FsArtifactStore
-- streaming put/get
-- atomic publish protocol
-- integrity scanner
+- ArtifactArena with a manifest hard cap
+- pooled immutable handles and explicit owner pins
+- checked BLAKE3 insertion and deduplication
+- usage/reconciliation inventory
 
 **Implementation steps**
 
-1. Stream bytes to a same-filesystem temporary object while hashing.
-2. Flush data, fsync the file, atomically rename into a digest-derived fanout path, then fsync the parent directory.
-3. On duplicate put, verify existing size and digest rather than rewriting.
-4. Expose ranged reads and verified streaming reads.
+1. Hash and count caller-owned/pooled bytes, verify any expected digest, and
+   charge unique bytes before visibility.
+2. Deduplicate equal content and return immutable shared handles without a
+   second payload copy.
+3. Pin every object to an explicit cell, attempt, model/knowledge, dataset, or
+   snapshot owner; reclaim only unpinned unreachable caches.
+4. Reject checked-size or capacity overflow. Registered mode never spills,
+   uploads, changes backend, or evicts a pin.
 
 **Acceptance criteria**
 
-- Injected death before each publish step never exposes a partial final object.
-- Concurrent identical puts converge to one valid object.
-- Bit corruption is found by verified read and integrity scan.
-- Object paths contain no user-controlled names.
+- Concurrent identical inserts converge to one immutable allocation.
+- Digest mismatch and arena exhaustion fail before publication.
+- Cancellation releases all owner pins; completion rejects a leaked pin.
+- Pinned objects survive cache reclamation and every usage counter reconciles.
 
 **Performance acceptance**
 
-- Sequential put throughput is within 15% of direct file write for 1 GiB objects.
-- 1 MiB object put p95 is under 15 ms on local NVMe after cache warmup.
+- Insertion including BLAKE3 sustains at least 1 GiB/s/core.
+- Resident bytes never exceed the manifest cap and whole-process RSS remains
+  below 60 GiB on the canonical host.
 
-**Verification commands**
-
-- `cargo xtask task verify P2.3`
-- `cargo xtask task benchmark P2.3`
-- `cargo xtask task evidence-check P2.3`
-
-**Required evidence**
-
-- `evidence/tasks/P2.3/result.json`
-- `evidence/tasks/P2.3/commands.txt`
-- `evidence/tasks/P2.3/tests.txt`
-- `evidence/tasks/P2.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P2.4 — Implement S3/Tigris artifact storage through object_store
+### P2.4 — Implement atomic local evidence bundles
 
 **Phase:** P2  
 **Dependencies:** P2.3  
 **Size:** L  
-**Primary skill:** Cloud storage  
+**Primary skill:** Filesystem durability
 **Owned scope:** `reflex-cas`
 
-**Purpose.** Provide the same immutable artifact semantics on Tigris and other S3-compatible stores.
+**Purpose.** Convert one frozen in-memory experiment view into a complete,
+crash-safe, locally durable replay root.
 
 **Deliverables**
 
-- ObjectStoreArtifactStore
-- multipart uploader
-- preconditioned publish
-- retry and abort policy
+- canonical EvidenceBundleManifest
+- bounded staging writer
+- verified atomic publish and reopen
+- interrupted-publication recovery
 
 **Implementation steps**
 
-1. Use object_store behind the Reflex ArtifactStore trait; no object_store types cross public framework APIs.
-2. For large objects use bounded concurrent multipart upload and always abort failed uploads.
-3. Publish content-addressed keys with create-only preconditions when supported.
-4. Verify returned metadata and optionally re-read a sample or full object according to artifact criticality.
+1. Freeze accepted attempts, ledger cuts, reachable arena roots, receipts,
+   datasets, query identities, and compatibility inputs.
+2. Write an exhaustive sorted member inventory and bytes into a sibling
+   temporary path through bounded staging buffers.
+3. Verify all lengths/digests, fsync files and staged directory, atomically
+   rename to the digest-derived destination, and fsync the parent.
+4. Reopen and verify the final bundle before publication succeeds; remove or
+   report abandoned staging paths during cleanup.
 
 **Acceptance criteria**
 
-- Local MinIO and Tigris integration tests pass the same CAS conformance suite.
-- Network interruption retries do not create a visible corrupt object.
-- Orphan multipart uploads are discoverable and cleaned by policy.
-- Credentials never appear in logs or evidence.
+- Failure before rename never creates a published bundle.
+- Failure after rename leaves a bundle that reconstructs exactly.
+- Missing, extra, duplicate, reordered, truncated, or corrupt members fail.
+- The bundle reconstructs the accepted attempt and every scientific report
+  without mutable runtime state.
 
 **Performance acceptance**
 
-- A performance-4x worker uploads at least 100 MiB/s to a colocated-region test bucket when provider conditions permit; slower provider results are reported, not hidden.
-- Upload memory stays under 2 × configured multipart concurrency × part size.
-
-**Verification commands**
-
-- `cargo xtask task verify P2.4`
-- `cargo xtask task benchmark P2.4`
-- `cargo xtask task evidence-check P2.4`
-
-**Required evidence**
-
-- `evidence/tasks/P2.4/result.json`
-- `evidence/tasks/P2.4/commands.txt`
-- `evidence/tasks/P2.4/tests.txt`
-- `evidence/tasks/P2.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- A bundle of at least 1 GiB stages at 500 MiB/s before the final fsync barrier.
+- Staging memory remains within its declared buffer cap.
 
 ### P2.5 — Add chunked manifests for very large artifacts
+
+> **Superseded by ADR 0014.** Native v1 divides work into bounded
+> arena-resident cells/generations and writes bundle members directly. This
+> upload/resume card has no v1 acceptance criteria.
 
 **Phase:** P2  
 **Dependencies:** P2.3, P2.4  
@@ -3602,25 +3194,11 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Parallel reconstruction saturates at least 80% of measured object-store bandwidth with bounded memory.
 - Manifest parse time is below 10 ms for 100,000 chunks.
 
-**Verification commands**
-
-- `cargo xtask task verify P2.5`
-- `cargo xtask task benchmark P2.5`
-- `cargo xtask task evidence-check P2.5`
-
-**Required evidence**
-
-- `evidence/tasks/P2.5/result.json`
-- `evidence/tasks/P2.5/commands.txt`
-- `evidence/tasks/P2.5/tests.txt`
-- `evidence/tasks/P2.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P2.6 — Implement CAS reachability, retention, and repair
+
+> **Superseded by ADR 0014.** Arena pin/reachability reconciliation is P2.3 and
+> durable publication is P2.4. Remote repair and metadata-driven CAS GC have no
+> v1 acceptance criteria.
 
 **Phase:** P2  
 **Dependencies:** P2.3, P2.5, P4.1  
@@ -3655,24 +3233,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Reachability scans process at least 250,000 metadata references/s/core.
 - GC uses bounded memory and streams graphs larger than RAM.
-
-**Verification commands**
-
-- `cargo xtask task verify P2.6`
-- `cargo xtask task benchmark P2.6`
-- `cargo xtask task evidence-check P2.6`
-
-**Required evidence**
-
-- `evidence/tasks/P2.6/result.json`
-- `evidence/tasks/P2.6/commands.txt`
-- `evidence/tasks/P2.6/tests.txt`
-- `evidence/tasks/P2.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P3 — Evidence ledger and external protocol
 
@@ -3716,24 +3276,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - A typical candidate score event encodes under 32 bytes per candidate excluding shared state features.
 - Schema decoding sustains at least 5 million small events/s/core.
 
-**Verification commands**
-
-- `cargo xtask task verify P3.1`
-- `cargo xtask task benchmark P3.1`
-- `cargo xtask task evidence-check P3.1`
-
-**Required evidence**
-
-- `evidence/tasks/P3.1/result.json`
-- `evidence/tasks/P3.1/commands.txt`
-- `evidence/tasks/P3.1/tests.txt`
-- `evidence/tasks/P3.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P3.2 — Specify the binary evidence segment format
 
 **Phase:** P3  
@@ -3769,24 +3311,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Sequential decode exceeds 750 MiB/s on calibration hardware.
 - Per-block framing overhead stays below 0.5% for 1 MiB blocks.
-
-**Verification commands**
-
-- `cargo xtask task verify P3.2`
-- `cargo xtask task benchmark P3.2`
-- `cargo xtask task evidence-check P3.2`
-
-**Required evidence**
-
-- `evidence/tasks/P3.2/result.json`
-- `evidence/tasks/P3.2/commands.txt`
-- `evidence/tasks/P3.2/tests.txt`
-- `evidence/tasks/P3.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P3.3 — Implement the bounded event writer
 
@@ -3825,24 +3349,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Ledger overhead is at most 3% of CPU on the bit-vector and Lean dogfood cells.
 - Warm append performs zero heap allocations per event.
 
-**Verification commands**
-
-- `cargo xtask task verify P3.3`
-- `cargo xtask task benchmark P3.3`
-- `cargo xtask task evidence-check P3.3`
-
-**Required evidence**
-
-- `evidence/tasks/P3.3/result.json`
-- `evidence/tasks/P3.3/commands.txt`
-- `evidence/tasks/P3.3/tests.txt`
-- `evidence/tasks/P3.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P3.4 — Implement segment recovery, indexing, and compaction input
 
 **Phase:** P3  
@@ -3879,24 +3385,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Recovery scans at least 1 GiB/s on local NVMe.
 - Index size stays below 1% of segment size for representative workloads.
 
-**Verification commands**
-
-- `cargo xtask task verify P3.4`
-- `cargo xtask task benchmark P3.4`
-- `cargo xtask task evidence-check P3.4`
-
-**Required evidence**
-
-- `evidence/tasks/P3.4/result.json`
-- `evidence/tasks/P3.4/commands.txt`
-- `evidence/tasks/P3.4/tests.txt`
-- `evidence/tasks/P3.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P3.5 — Define the external-domain Protobuf protocol
 
 **Phase:** P3  
@@ -3932,24 +3420,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Encoded control overhead averages below 64 bytes per candidate in a 64-candidate batch.
 - Schema generation is deterministic and checked for freshness.
-
-**Verification commands**
-
-- `cargo xtask task verify P3.5`
-- `cargo xtask task benchmark P3.5`
-- `cargo xtask task evidence-check P3.5`
-
-**Required evidence**
-
-- `evidence/tasks/P3.5/result.json`
-- `evidence/tasks/P3.5/commands.txt`
-- `evidence/tasks/P3.5/tests.txt`
-- `evidence/tasks/P3.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P3.6 — Implement the framed external-domain transport
 
@@ -3988,29 +3458,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - A 64-state expansion/apply round trip p95 is below 2 ms excluding domain computation.
 - Transport adds under 5% wall time to the Lean dogfood arm.
 
-**Verification commands**
-
-- `cargo xtask task verify P3.6`
-- `cargo xtask task benchmark P3.6`
-- `cargo xtask task evidence-check P3.6`
-
-**Required evidence**
-
-- `evidence/tasks/P3.6/result.json`
-- `evidence/tasks/P3.6/commands.txt`
-- `evidence/tasks/P3.6/tests.txt`
-- `evidence/tasks/P3.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-## P4 — Metadata and analytical storage
+## P4 — In-memory coordination and analytical data
 
 **Goal:** Separate mutable coordination from immutable evidence and columnar analytical data.
 
-**Exit gate:** SQLite supports zero-service local use, PostgreSQL supports fenced distributed leases, and Parquet/DataFusion reconstruct registered reports.
+**Exit gate:** `MemoryMetaStore` enforces bounded single-owner transitions and
+attempt epochs; a snapshot atomically binds that accepted view to all evidence;
+Parquet/DataFusion reconstruct registered local reports.
 
 ### P4.1 — Define domain-specific storage interfaces
 
@@ -4020,214 +3474,156 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Primary skill:** Storage architecture  
 **Owned scope:** `reflex-meta`, `reflex-cas`, `reflex-dataset`
 
-**Purpose.** Expose Reflex concepts rather than generic SQL or filesystem operations, allowing local and distributed backends to differ internally.
+**Purpose.** Expose Reflex concepts as direct memory-primary operations without
+generic SQL, filesystem, or remote-backend dispatch.
 
 **Deliverables**
 
 - MetaStore trait
-- ArtifactStore trait
+- ArtifactArena trait
 - DatasetStore trait
 - conformance test harness
 
 **Implementation steps**
 
-1. Define methods for experiment creation, cell enqueue/claim/finalize, worker session, artifact publication, model promotion, knowledge edition publication, and lineage indexing.
-2. Require compare-and-set or fencing semantics where state transitions can race.
-3. Keep immutable payload APIs separate from mutable metadata.
-4. Build backend-neutral conformance tests using an in-memory fixture.
+1. Define bounded methods for experiment creation, cell enqueue/claim/finalize,
+   artifact-root publication, model promotion, knowledge edition publication,
+   and lineage indexing.
+2. Require complete attempt identity and monotonic epochs for every state
+   transition that delayed work could reach.
+3. Keep immutable arena payload APIs separate from mutable coordination.
+4. Make the in-memory implementation the conformance authority.
 
 **Acceptance criteria**
 
-- Public framework crates contain no rusqlite, tokio-postgres, or object_store types.
+- Native framework crates contain no rusqlite, tokio-postgres, or object-store
+  types or runtime backend switches.
 - Every mutating method defines idempotency and conflict behavior.
-- SQLite and PostgreSQL pass the same semantic conformance suite.
-- A backend cannot publish metadata for a missing required CAS object.
+- Capacity is checked before enqueue/publication and all counters reconcile.
+- An attempt cannot publish a missing or unpinned arena digest.
 
 **Performance acceptance**
 
-- Trait dispatch adds no measurable overhead to operations dominated by I/O.
+- Coordination overhead stays below 2% of cell CPU.
 - Bulk metadata APIs support at least 1,000 records per call.
 
-**Verification commands**
-
-- `cargo xtask task verify P4.1`
-- `cargo xtask task benchmark P4.1`
-- `cargo xtask task evidence-check P4.1`
-
-**Required evidence**
-
-- `evidence/tasks/P4.1/result.json`
-- `evidence/tasks/P4.1/commands.txt`
-- `evidence/tasks/P4.1/tests.txt`
-- `evidence/tasks/P4.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P4.2 — Implement local SQLite metadata with one writer actor
+### P4.2 — Implement single-owner in-memory metadata
 
 **Phase:** P4  
 **Dependencies:** P4.1, P1.2  
 **Size:** L  
-**Primary skill:** SQLite and Rust  
-**Owned scope:** `reflex-meta-sqlite`
+**Primary skill:** Rust concurrency
+**Owned scope:** `reflex-meta`
 
-**Purpose.** Provide a zero-service local installation while respecting SQLite WAL’s same-host, single-writer constraints.
+**Purpose.** Make cell coordination a direct, bounded in-process state machine
+with immutable read views.
 
 **Deliverables**
 
-- SQLite migrations
-- writer actor
-- read connection pool
-- checkpoint policy
+- MemoryMetaStore
+- bounded typed command/state collections
+- immutable status/report views
+- ownership and capacity inventory
 
 **Implementation steps**
 
-1. Use rusqlite with bundled SQLite and assert a runtime SQLite version containing the WAL-reset fix.
-2. Enable WAL, foreign keys, busy timeout, and synchronous=NORMAL for ordinary local metadata; use explicit stronger barriers for publication and promotion.
-3. Route all writes through one bounded writer actor that batches compatible commands in transactions.
-4. Checkpoint on idle and configured WAL size; expose WAL and checkpoint metrics.
+1. Pre-size bounded indexes from the experiment manifest and reject overflow.
+2. Serialize authoritative mutation through one owner; expose immutable or
+   lock-bounded read snapshots for status and reporting.
+3. Use checked counters and nonzero typed identities throughout.
+4. Reconcile cells, attempts, roots, promotions, and knowledge/model pins at
+   every completion boundary.
 
 **Acceptance criteria**
 
-- Concurrent readers proceed while the writer commits.
-- A killed process never leaves a promoted model or completed cell without its required references.
-- Schema migration is transactional and idempotent.
-- Network filesystems and multi-host access are explicitly rejected.
+- Concurrent readers observe a coherent before-or-after view.
+- Invalid identity, overflow, missing roots, and stale attempts fail without
+  partially mutating state.
+- Native registered configuration cannot select SQL or remote coordination.
+- Completion rejects nonzero owned state.
 
 **Performance acceptance**
 
-- Sustain at least 25,000 small metadata mutations/s in 100-row batches on local NVMe.
-- Queue claim p95 stays below 1 ms with 10,000 ready local cells.
-- Writer actor peak queue memory is bounded by configuration.
+- Claim/finalize p95 is at most 10 µs with 10,000 ready cells.
+- Coordination CPU is below 2% of cell CPU and memory stays within its manifest
+  allocation.
 
-**Verification commands**
-
-- `cargo xtask task verify P4.2`
-- `cargo xtask task benchmark P4.2`
-- `cargo xtask task evidence-check P4.2`
-
-**Required evidence**
-
-- `evidence/tasks/P4.2/result.json`
-- `evidence/tasks/P4.2/commands.txt`
-- `evidence/tasks/P4.2/tests.txt`
-- `evidence/tasks/P4.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not use shared SQLite for Fly workers.
-- Do not store evidence event rows or model tensors in SQLite.
-
-### P4.3 — Implement PostgreSQL metadata schema and migrations
+### P4.3 — Implement monotonic attempt-epoch fencing
 
 **Phase:** P4  
-**Dependencies:** P4.1  
-**Size:** L  
-**Primary skill:** PostgreSQL  
-**Owned scope:** `reflex-meta-postgres`
+**Dependencies:** P4.2
+**Size:** M
+**Primary skill:** State-machine correctness
+**Owned scope:** `reflex-meta`, `reflex-scheduler`
 
-**Purpose.** Provide durable distributed coordination for many stateless workers without turning PostgreSQL into the evidence warehouse.
+**Purpose.** Reject delayed work and select exactly one accepted attempt without
+wall-clock leases or a database.
 
 **Deliverables**
 
-- PostgreSQL 18 schema
-- explicit SQL migrations
-- tokio-postgres repository
-- schema compatibility checks
+- nonzero checked attempt epoch
+- typed AttemptHandle
+- stale publication/finalization rejection
+- cancellation/retry transition tests
 
 **Implementation steps**
 
-1. Create normalized tables for experiments, cells, attempts, worker sessions, leases, artifact references, reports, model states, knowledge editions, and promotions.
-2. Use small immutable JSONB only for nonindexed descriptive metadata; typed columns carry identity and state transitions.
-3. Partition or archive high-churn operational histories only when measured need appears.
-4. Pin prepared statements and require explicit query review.
+1. Increment attempt number and epoch with checked arithmetic on every claim.
+2. Require `(cell_id, attempt_no, epoch)` for root publication and finalization.
+3. Advance the epoch before cancellation drains outstanding work.
+4. Preserve immutable prior attempt records in the ledger and snapshot view.
 
 **Acceptance criteria**
 
-- Fresh migration and upgrade from every supported schema fixture succeed.
-- Foreign keys prevent dangling required references.
-- Schema compatibility is checked before a worker claims cells.
-- No table stores full ledger segments, datasets, checkpoints, or proof artifacts.
+- Two handles cannot accept the same attempt epoch.
+- A prior handle cannot publish after replacement or cancellation.
+- Retry preserves prior evidence and receives distinct identities.
+- Exactly one accepted attempt is selected or the cell remains incomplete.
 
 **Performance acceptance**
 
-- A 20-worker workload keeps database CPU below 15% of one small managed Postgres primary.
-- Common status/report queries use indexed plans with no sequential scan above registered table sizes.
+- Epoch comparison is allocation-free and included in the 10 µs
+  claim/finalize budget.
 
-**Verification commands**
-
-- `cargo xtask task verify P4.3`
-- `cargo xtask task benchmark P4.3`
-- `cargo xtask task evidence-check P4.3`
-
-**Required evidence**
-
-- `evidence/tasks/P4.3/result.json`
-- `evidence/tasks/P4.3/commands.txt`
-- `evidence/tasks/P4.3/tests.txt`
-- `evidence/tasks/P4.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P4.4 — Implement fenced lease-based cell claiming
+### P4.4 — Bind coordination to the atomic snapshot barrier
 
 **Phase:** P4  
-**Dependencies:** P4.3  
+**Dependencies:** P2.4, P4.3
 **Size:** L  
-**Primary skill:** Distributed systems  
-**Owned scope:** `reflex-meta-postgres`, `reflex-scheduler`
+**Primary skill:** Crash consistency
+**Owned scope:** `reflex-meta`, `reflex-scheduler`, `reflex-cas`
 
-**Purpose.** Ensure at-most-one accepted attempt while allowing retries after worker death.
+**Purpose.** Make the accepted in-memory state and immutable evidence one
+verified, atomically durable replay root.
 
 **Deliverables**
 
-- claim SQL
-- lease heartbeat
-- fencing token
-- finalization transaction
+- frozen SnapshotView
+- arena root pin set
+- ledger barrier coordination
+- post-rename reopen verification
 
 **Implementation steps**
 
-1. Claim ready cells in priority order using one CTE with FOR UPDATE SKIP LOCKED.
-2. Increment a monotonic fencing token on each successful claim and return it with the lease.
-3. Require the current token for heartbeat, artifact publication, and finalization.
-4. Expire abandoned leases and enqueue a new attempt without mutating the prior attempt record.
+1. Freeze accepted attempts and advance/cancel every nonaccepted epoch.
+2. Pin the exact arena root set and drain the authoritative ledger to a declared
+   cut.
+3. Pass the immutable view to the P2.4 bundle writer.
+4. Record publication only after final-path reopen verification; always release
+   snapshot pins and staging ownership.
 
 **Acceptance criteria**
 
-- Two workers cannot accept the same fencing token.
-- A stale worker cannot finalize after its lease is replaced.
-- Retried attempts preserve all earlier evidence and receive distinct IDs.
-- Exactly one accepted attempt is selected or the experiment remains incomplete.
+- A bundle cannot mix coordination views or include a stale attempt.
+- Failure before rename leaves no published result; failure after rename
+  reconstructs exactly.
+- Snapshot cancellation releases all roots, buffers, and staging paths.
+- Published reports reconstruct with no mutable store.
 
 **Performance acceptance**
 
-- At 100 concurrent claimers and 100,000 ready cells, claim p95 is below 20 ms on the dogfood PostgreSQL class.
-- Heartbeat load remains below 5 queries/s per active worker through batching.
-
-**Verification commands**
-
-- `cargo xtask task verify P4.4`
-- `cargo xtask task benchmark P4.4`
-- `cargo xtask task evidence-check P4.4`
-
-**Required evidence**
-
-- `evidence/tasks/P4.4/result.json`
-- `evidence/tasks/P4.4/commands.txt`
-- `evidence/tasks/P4.4/tests.txt`
-- `evidence/tasks/P4.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Snapshot throughput and staging memory meet P2.4; freeze/thaw overhead is
+  reported separately and remains below the registered barrier budget.
 
 ### P4.5 — Implement Parquet dataset publication
 
@@ -4264,24 +3660,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Compaction sustains at least 500,000 representative decision rows/s/core.
 - Output is within 1.5× of a hand-written Parquet reference size and uses under 1 GiB streaming memory.
-
-**Verification commands**
-
-- `cargo xtask task verify P4.5`
-- `cargo xtask task benchmark P4.5`
-- `cargo xtask task evidence-check P4.5`
-
-**Required evidence**
-
-- `evidence/tasks/P4.5/result.json`
-- `evidence/tasks/P4.5/commands.txt`
-- `evidence/tasks/P4.5/tests.txt`
-- `evidence/tasks/P4.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P4.6 — Implement the mmap-friendly training batch cache
 
@@ -4320,24 +3698,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Loader CPU is below 10% of one core during micro-model training.
 - Peak staging memory is limited to two configured batches.
 
-**Verification commands**
-
-- `cargo xtask task verify P4.6`
-- `cargo xtask task benchmark P4.6`
-- `cargo xtask task evidence-check P4.6`
-
-**Required evidence**
-
-- `evidence/tasks/P4.6/result.json`
-- `evidence/tasks/P4.6/commands.txt`
-- `evidence/tasks/P4.6/tests.txt`
-- `evidence/tasks/P4.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P4.7 — Integrate DataFusion for all-Rust analytics
 
 **Phase:** P4  
@@ -4346,7 +3706,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Primary skill:** Rust analytics  
 **Owned scope:** `reflex-analytics`
 
-**Purpose.** Provide fast SQL and DataFrame analysis over Parquet while isolating analytical dependency weight from worker binaries.
+**Purpose.** Provide fast SQL and DataFrame analysis over local Parquet exports while isolating analytical dependency weight from the native runtime.
 
 **Deliverables**
 
@@ -4357,40 +3717,22 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Implementation steps**
 
-1. Put DataFusion in a separate binary/crate so its Arrow and object_store dependency versions do not leak into hot worker APIs.
-2. Register local and S3 dataset manifests as logical tables.
+1. Put DataFusion in a separate binary/crate so its dependency graph does not leak into hot runtime APIs.
+2. Register digest-verified local dataset manifests as logical tables.
 3. Provide views for solve rate, matched work, utility, model lineage, retrieval use, and resource accounting.
-4. Configure memory limits, spill directories, partition count, and object-store concurrency from the thread/resource broker.
+4. Configure memory limits, local spill directories, and partition count from the thread/resource broker.
 
 **Acceptance criteria**
 
 - The canonical reports can be regenerated using only published datasets and report SQL.
-- Queries work against local filesystem and Tigris.
+- Queries work against digest-verified local Parquet exports.
 - Out-of-memory analytical queries spill or fail with a named limit rather than killing workers.
 - SQL files are versioned and their digests appear in reports.
 
 **Performance acceptance**
 
-- The M2A-style 180-arm report reconstructs in under 30 seconds from warm object cache.
-- Analytics is absent from the reflex-worker dependency tree.
-
-**Verification commands**
-
-- `cargo xtask task verify P4.7`
-- `cargo xtask task benchmark P4.7`
-- `cargo xtask task evidence-check P4.7`
-
-**Required evidence**
-
-- `evidence/tasks/P4.7/result.json`
-- `evidence/tasks/P4.7/commands.txt`
-- `evidence/tasks/P4.7/tests.txt`
-- `evidence/tasks/P4.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- The M2A-style 180-arm report reconstructs in under 30 seconds from warm page cache.
+- Analytics is absent from the `reflex` native runtime dependency tree.
 
 ## P5 — Domain SDK and local runtime
 
@@ -4434,24 +3776,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Candidate enumeration can fill caller-owned buffers without allocation.
 - Trait methods support batches large enough to amortize virtual dispatch and IPC.
 
-**Verification commands**
-
-- `cargo xtask task verify P5.1`
-- `cargo xtask task benchmark P5.1`
-- `cargo xtask task evidence-check P5.1`
-
-**Required evidence**
-
-- `evidence/tasks/P5.1/result.json`
-- `evidence/tasks/P5.1/commands.txt`
-- `evidence/tasks/P5.1/tests.txt`
-- `evidence/tasks/P5.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P5.2 — Implement object-safe erased domain adapters
 
 **Phase:** P5  
@@ -4487,24 +3811,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Erasure overhead is below 3% on the bit-vector expansion benchmark.
 - Warm native expansion performs zero heap allocations inside framework code.
-
-**Verification commands**
-
-- `cargo xtask task verify P5.2`
-- `cargo xtask task benchmark P5.2`
-- `cargo xtask task evidence-check P5.2`
-
-**Required evidence**
-
-- `evidence/tasks/P5.2/result.json`
-- `evidence/tasks/P5.2/commands.txt`
-- `evidence/tasks/P5.2/tests.txt`
-- `evidence/tasks/P5.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P5.3 — Build task, episode, and cell runtime ownership
 
@@ -4542,24 +3848,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Starting an in-process episode after worker warmup takes under 100 microseconds.
 - Cell runtime metadata stays under 64 KiB excluding domain scratch.
 
-**Verification commands**
-
-- `cargo xtask task verify P5.3`
-- `cargo xtask task benchmark P5.3`
-- `cargo xtask task evidence-check P5.3`
-
-**Required evidence**
-
-- `evidence/tasks/P5.3/result.json`
-- `evidence/tasks/P5.3/commands.txt`
-- `evidence/tasks/P5.3/tests.txt`
-- `evidence/tasks/P5.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P5.4 — Implement the external-domain host and supervisor
 
 **Phase:** P5  
@@ -4595,24 +3883,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Lean-like worker startup cost is amortized over at least 100 episodes in dogfood.
 - Supervisor CPU overhead stays below 1% of cell CPU.
-
-**Verification commands**
-
-- `cargo xtask task verify P5.4`
-- `cargo xtask task benchmark P5.4`
-- `cargo xtask task evidence-check P5.4`
-
-**Required evidence**
-
-- `evidence/tasks/P5.4/result.json`
-- `evidence/tasks/P5.4/commands.txt`
-- `evidence/tasks/P5.4/tests.txt`
-- `evidence/tasks/P5.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P5.5 — Define verifier authority and isolated verification workers
 
@@ -4650,24 +3920,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Verification orchestration adds under 2% to verifier CPU-intensive workloads.
 - Receipt size stays below 4 KiB excluding referenced proof artifacts.
 
-**Verification commands**
-
-- `cargo xtask task verify P5.5`
-- `cargo xtask task benchmark P5.5`
-- `cargo xtask task evidence-check P5.5`
-
-**Required evidence**
-
-- `evidence/tasks/P5.5/result.json`
-- `evidence/tasks/P5.5/commands.txt`
-- `evidence/tasks/P5.5/tests.txt`
-- `evidence/tasks/P5.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P5.6 — Create the domain conformance kit and tutorial skeleton
 
 **Phase:** P5  
@@ -4703,24 +3955,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Conformance suite runs in under 10 seconds for a small native domain.
 - Template adds no dependency beyond the domain SDK and chosen verifier.
-
-**Verification commands**
-
-- `cargo xtask task verify P5.6`
-- `cargo xtask task benchmark P5.6`
-- `cargo xtask task evidence-check P5.6`
-
-**Required evidence**
-
-- `evidence/tasks/P5.6/result.json`
-- `evidence/tasks/P5.6/commands.txt`
-- `evidence/tasks/P5.6/tests.txt`
-- `evidence/tasks/P5.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P6 — Deterministic AND-OR search kernel
 
@@ -4764,24 +3998,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Node storage overhead averages below 96 bytes per live search node excluding domain payload.
 - Propagation processes at least 10 million trivial child completions/s/core.
 
-**Verification commands**
-
-- `cargo xtask task verify P6.1`
-- `cargo xtask task benchmark P6.1`
-- `cargo xtask task evidence-check P6.1`
-
-**Required evidence**
-
-- `evidence/tasks/P6.1/result.json`
-- `evidence/tasks/P6.1/commands.txt`
-- `evidence/tasks/P6.1/tests.txt`
-- `evidence/tasks/P6.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P6.2 — Implement structure-of-arrays candidate and feature batches
 
 **Phase:** P6  
@@ -4817,24 +4033,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Synthetic candidate construction exceeds 5 million candidate metadata records/s/core.
 - Feature packing bandwidth exceeds 10 GiB/s for f32 dense features.
-
-**Verification commands**
-
-- `cargo xtask task verify P6.2`
-- `cargo xtask task benchmark P6.2`
-- `cargo xtask task evidence-check P6.2`
-
-**Required evidence**
-
-- `evidence/tasks/P6.2/result.json`
-- `evidence/tasks/P6.2/commands.txt`
-- `evidence/tasks/P6.2/tests.txt`
-- `evidence/tasks/P6.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P6.3 — Implement deterministic frontier ordering
 
@@ -4872,24 +4070,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Push/pop throughput exceeds 8 million operations/s/core at 100,000 live entries.
 - Frontier memory is bounded and reported per cell.
 
-**Verification commands**
-
-- `cargo xtask task verify P6.3`
-- `cargo xtask task benchmark P6.3`
-- `cargo xtask task evidence-check P6.3`
-
-**Required evidence**
-
-- `evidence/tasks/P6.3/result.json`
-- `evidence/tasks/P6.3/commands.txt`
-- `evidence/tasks/P6.3/tests.txt`
-- `evidence/tasks/P6.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P6.4 — Implement transposition, dominance, and reflex caches
 
 **Phase:** P6  
@@ -4924,25 +4104,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Lookup p95 is below 200 ns on a 1-million-state in-memory table under four search threads.
-- Sharding scales to at least 3.2× one-thread throughput on performance-4x.
-
-**Verification commands**
-
-- `cargo xtask task verify P6.4`
-- `cargo xtask task benchmark P6.4`
-- `cargo xtask task evidence-check P6.4`
-
-**Required evidence**
-
-- `evidence/tasks/P6.4/result.json`
-- `evidence/tasks/P6.4/commands.txt`
-- `evidence/tasks/P6.4/tests.txt`
-- `evidence/tasks/P6.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Sharding scales to at least 3.2× one-thread throughput on reference-4vcpu-8gb.
 
 ### P6.5 — Implement logical, CPU, wall, and memory budgets
 
@@ -4980,24 +4142,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Hot logical budget checks add under 2 ns/action in optimized builds.
 - OS sampling overhead remains within P1.3 limits.
 
-**Verification commands**
-
-- `cargo xtask task verify P6.5`
-- `cargo xtask task benchmark P6.5`
-- `cargo xtask task evidence-check P6.5`
-
-**Required evidence**
-
-- `evidence/tasks/P6.5/result.json`
-- `evidence/tasks/P6.5/commands.txt`
-- `evidence/tasks/P6.5/tests.txt`
-- `evidence/tasks/P6.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P6.6 — Implement search policies and exploration mixtures
 
 **Phase:** P6  
@@ -5033,24 +4177,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Uniform and no-op heuristic score at least 10 million candidates/s/core.
 - Batch interface amortizes learned scoring to meet P7 gates.
-
-**Verification commands**
-
-- `cargo xtask task verify P6.6`
-- `cargo xtask task benchmark P6.6`
-- `cargo xtask task evidence-check P6.6`
-
-**Required evidence**
-
-- `evidence/tasks/P6.6/result.json`
-- `evidence/tasks/P6.6/commands.txt`
-- `evidence/tasks/P6.6/tests.txt`
-- `evidence/tasks/P6.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P6.7 — Implement certified proof-DAG extraction
 
@@ -5088,24 +4214,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Extract 1 million proof edges/s/core for acyclic fixtures.
 - Memory scales linearly and can spill sorted edge runs when the DAG exceeds configured RAM.
 
-**Verification commands**
-
-- `cargo xtask task verify P6.7`
-- `cargo xtask task benchmark P6.7`
-- `cargo xtask task evidence-check P6.7`
-
-**Required evidence**
-
-- `evidence/tasks/P6.7/result.json`
-- `evidence/tasks/P6.7/commands.txt`
-- `evidence/tasks/P6.7/tests.txt`
-- `evidence/tasks/P6.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P6.8 — Implement deterministic replay and search audit
 
 **Phase:** P6  
@@ -5141,24 +4249,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Logical replay runs at least 2× faster than original verifier-heavy cells when using accepted receipts.
 - Memory stays bounded by configured replay window plus search state.
-
-**Verification commands**
-
-- `cargo xtask task verify P6.8`
-- `cargo xtask task benchmark P6.8`
-- `cargo xtask task evidence-check P6.8`
-
-**Required evidence**
-
-- `evidence/tasks/P6.8/result.json`
-- `evidence/tasks/P6.8/commands.txt`
-- `evidence/tasks/P6.8/tests.txt`
-- `evidence/tasks/P6.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P7 — All-Rust model runtime
 
@@ -5202,24 +4292,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Compatibility checks complete in under 100 microseconds.
 - Model-spec parsing allocates bounded memory proportional to layer count, not parameter count.
 
-**Verification commands**
-
-- `cargo xtask task verify P7.1`
-- `cargo xtask task benchmark P7.1`
-- `cargo xtask task evidence-check P7.1`
-
-**Required evidence**
-
-- `evidence/tasks/P7.1/result.json`
-- `evidence/tasks/P7.1/commands.txt`
-- `evidence/tasks/P7.1/tests.txt`
-- `evidence/tasks/P7.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P7.2 — Integrate Burn behind the reflex-ml abstraction
 
 **Phase:** P7  
@@ -5256,24 +4328,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Release worker without GPU features avoids GPU backend dependency weight.
 - Backend adapter overhead is below 2% of raw Burn forward time.
 
-**Verification commands**
-
-- `cargo xtask task verify P7.2`
-- `cargo xtask task benchmark P7.2`
-- `cargo xtask task evidence-check P7.2`
-
-**Required evidence**
-
-- `evidence/tasks/P7.2/result.json`
-- `evidence/tasks/P7.2/commands.txt`
-- `evidence/tasks/P7.2/tests.txt`
-- `evidence/tasks/P7.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not use Burn Central or any hosted service as a required component.
-- Do not directly depend on CubeCL public APIs in v1.
-
 ### P7.3 — Implement the micro linear and MLP inference engine
 
 **Phase:** P7  
@@ -5307,27 +4361,9 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- A 2,607-parameter MLP scoring 64 candidates has p95 latency at or below 100 microseconds on one Fly performance vCPU.
+- A 2,607-parameter MLP scoring 64 candidates has p95 latency at or below 100 microseconds on one calibrated reference vCPU.
 - Single-candidate p95 is below 5 microseconds.
-- Four independent batches scale at least 3.2× on performance-4x.
-
-**Verification commands**
-
-- `cargo xtask task verify P7.3`
-- `cargo xtask task benchmark P7.3`
-- `cargo xtask task evidence-check P7.3`
-
-**Required evidence**
-
-- `evidence/tasks/P7.3/result.json`
-- `evidence/tasks/P7.3/commands.txt`
-- `evidence/tasks/P7.3/tests.txt`
-- `evidence/tasks/P7.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Four independent batches scale at least 3.2× on reference-4vcpu-8gb.
 
 ### P7.4 — Build the model backend benchmark and selection tool
 
@@ -5362,26 +4398,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Full CPU backend sweep completes in under 20 minutes on performance-4x.
+- Full CPU backend sweep completes in under 20 minutes on reference-4vcpu-8gb.
 - Recommendation computation completes in under 1 second.
-
-**Verification commands**
-
-- `cargo xtask task verify P7.4`
-- `cargo xtask task benchmark P7.4`
-- `cargo xtask task evidence-check P7.4`
-
-**Required evidence**
-
-- `evidence/tasks/P7.4/result.json`
-- `evidence/tasks/P7.4/commands.txt`
-- `evidence/tasks/P7.4/tests.txt`
-- `evidence/tasks/P7.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P7.5 — Implement batched ranker inference in search
 
@@ -5419,24 +4437,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Promoted model scoring plus feature extraction is at most 10% of total search CPU on its qualification workload unless it yields registered net savings.
 - Batching adds under 100 microseconds queue delay at p95 for interactive local runs.
 
-**Verification commands**
-
-- `cargo xtask task verify P7.5`
-- `cargo xtask task benchmark P7.5`
-- `cargo xtask task evidence-check P7.5`
-
-**Required evidence**
-
-- `evidence/tasks/P7.5/result.json`
-- `evidence/tasks/P7.5/commands.txt`
-- `evidence/tasks/P7.5/tests.txt`
-- `evidence/tasks/P7.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P7.6 — Define the vector-valued taste critic interface
 
 **Phase:** P7  
@@ -5471,24 +4471,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Scoring overhead scales linearly with head count and adds under 5% to a shared-trunk forward for eight scalar heads.
-
-**Verification commands**
-
-- `cargo xtask task verify P7.6`
-- `cargo xtask task benchmark P7.6`
-- `cargo xtask task evidence-check P7.6`
-
-**Required evidence**
-
-- `evidence/tasks/P7.6/result.json`
-- `evidence/tasks/P7.6/commands.txt`
-- `evidence/tasks/P7.6/tests.txt`
-- `evidence/tasks/P7.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P7.7 — Define the proposal-model boundary and safety gate
 
@@ -5526,24 +4508,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Rejected proposals cannot cause unbounded allocation or verifier load.
 - Batch validation meets domain-specific throughput gates.
 
-**Verification commands**
-
-- `cargo xtask task verify P7.7`
-- `cargo xtask task benchmark P7.7`
-- `cargo xtask task evidence-check P7.7`
-
-**Required evidence**
-
-- `evidence/tasks/P7.7/result.json`
-- `evidence/tasks/P7.7/commands.txt`
-- `evidence/tasks/P7.7/tests.txt`
-- `evidence/tasks/P7.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P7.8 — Implement immutable model checkpoint storage
 
 **Phase:** P7  
@@ -5580,24 +4544,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Loading the 3K model takes under 5 ms from page cache.
 - Checkpoint write is streamed and uses less than 1.25× model+optimizer bytes of peak scratch.
 
-**Verification commands**
-
-- `cargo xtask task verify P7.8`
-- `cargo xtask task benchmark P7.8`
-- `cargo xtask task evidence-check P7.8`
-
-**Required evidence**
-
-- `evidence/tasks/P7.8/result.json`
-- `evidence/tasks/P7.8/commands.txt`
-- `evidence/tasks/P7.8/tests.txt`
-- `evidence/tasks/P7.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P7.9 — Implement stable, candidate, experimental, and shadow model states
 
 **Phase:** P7  
@@ -5633,24 +4579,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Atomic model pointer load adds under 10 ns per episode boundary.
 - Shadow mode respects a configured CPU percentage and cannot starve active search.
-
-**Verification commands**
-
-- `cargo xtask task verify P7.9`
-- `cargo xtask task benchmark P7.9`
-- `cargo xtask task evidence-check P7.9`
-
-**Required evidence**
-
-- `evidence/tasks/P7.9/result.json`
-- `evidence/tasks/P7.9/commands.txt`
-- `evidence/tasks/P7.9/tests.txt`
-- `evidence/tasks/P7.9/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P8 — Dataset compilation and training
 
@@ -5694,24 +4622,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - A typical 64-candidate group stores under 4 KiB excluding feature arrays.
 - Group validation processes at least 500,000 candidates/s/core.
 
-**Verification commands**
-
-- `cargo xtask task verify P8.1`
-- `cargo xtask task benchmark P8.1`
-- `cargo xtask task evidence-check P8.1`
-
-**Required evidence**
-
-- `evidence/tasks/P8.1/result.json`
-- `evidence/tasks/P8.1/commands.txt`
-- `evidence/tasks/P8.1/tests.txt`
-- `evidence/tasks/P8.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P8.2 — Implement the event-to-decision-group compiler
 
 **Phase:** P8  
@@ -5747,24 +4657,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Compiler sustains at least 500,000 candidate rows/s/core.
 - Streaming memory remains below 2 GiB on 100-million-row datasets.
-
-**Verification commands**
-
-- `cargo xtask task verify P8.2`
-- `cargo xtask task benchmark P8.2`
-- `cargo xtask task evidence-check P8.2`
-
-**Required evidence**
-
-- `evidence/tasks/P8.2/result.json`
-- `evidence/tasks/P8.2/commands.txt`
-- `evidence/tasks/P8.2/tests.txt`
-- `evidence/tasks/P8.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P8.3 — Implement multi-positive pairwise and listwise objectives
 
@@ -5802,24 +4694,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Loss computation processes at least 1 million candidates/s/core for 64-candidate groups on Flex.
 - Temporary tensor memory is bounded by batch candidate count, not global action space.
 
-**Verification commands**
-
-- `cargo xtask task verify P8.3`
-- `cargo xtask task benchmark P8.3`
-- `cargo xtask task evidence-check P8.3`
-
-**Required evidence**
-
-- `evidence/tasks/P8.3/result.json`
-- `evidence/tasks/P8.3/commands.txt`
-- `evidence/tasks/P8.3/tests.txt`
-- `evidence/tasks/P8.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P8.4 — Implement censored sampling and frontier coverage policies
 
 **Phase:** P8  
@@ -5855,24 +4729,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Generate a 10-million-group sample manifest in under 30 seconds.
 - Sampling uses streaming/reservoir methods when indexes exceed RAM.
-
-**Verification commands**
-
-- `cargo xtask task verify P8.4`
-- `cargo xtask task benchmark P8.4`
-- `cargo xtask task evidence-check P8.4`
-
-**Required evidence**
-
-- `evidence/tasks/P8.4/result.json`
-- `evidence/tasks/P8.4/commands.txt`
-- `evidence/tasks/P8.4/tests.txt`
-- `evidence/tasks/P8.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P8.5 — Build deterministic training batch assembly
 
@@ -5910,24 +4766,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Batch assembly is below 10% of training step CPU.
 - Warm assembly performs zero per-candidate heap allocation.
 
-**Verification commands**
-
-- `cargo xtask task verify P8.5`
-- `cargo xtask task benchmark P8.5`
-- `cargo xtask task evidence-check P8.5`
-
-**Required evidence**
-
-- `evidence/tasks/P8.5/result.json`
-- `evidence/tasks/P8.5/commands.txt`
-- `evidence/tasks/P8.5/tests.txt`
-- `evidence/tasks/P8.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P8.6 — Implement the Burn custom training loop
 
 **Phase:** P8  
@@ -5961,27 +4799,9 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Train one epoch over 1 million 64-candidate decision rows with a 3K MLP in at most 60 seconds on performance-4x.
+- Train one epoch over 1 million 64-candidate decision rows with a 3K MLP in at most 60 seconds on reference-4vcpu-8gb.
 - Peak RSS stays below 2 GiB for that benchmark.
 - All four CPUs are used without oversubscription.
-
-**Verification commands**
-
-- `cargo xtask task verify P8.6`
-- `cargo xtask task benchmark P8.6`
-- `cargo xtask task evidence-check P8.6`
-
-**Required evidence**
-
-- `evidence/tasks/P8.6/result.json`
-- `evidence/tasks/P8.6/commands.txt`
-- `evidence/tasks/P8.6/tests.txt`
-- `evidence/tasks/P8.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P8.7 — Implement the specialized micro-model trainer
 
@@ -6019,24 +4839,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Micro training beats or matches Burn Flex total epoch time by the accepted 15% ownership threshold; otherwise it remains a benchmark-only implementation.
 - Training allocates only at batch and checkpoint boundaries.
 
-**Verification commands**
-
-- `cargo xtask task verify P8.7`
-- `cargo xtask task benchmark P8.7`
-- `cargo xtask task evidence-check P8.7`
-
-**Required evidence**
-
-- `evidence/tasks/P8.7/result.json`
-- `evidence/tasks/P8.7/commands.txt`
-- `evidence/tasks/P8.7/tests.txt`
-- `evidence/tasks/P8.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P8.8 — Implement offline ranking and search-proxy evaluation
 
 **Phase:** P8  
@@ -6073,24 +4875,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Evaluate 10 million candidates/s/core with the micro scorer where features are memory-resident.
 - Report generation streams per-state slices to Parquet.
 
-**Verification commands**
-
-- `cargo xtask task verify P8.8`
-- `cargo xtask task benchmark P8.8`
-- `cargo xtask task evidence-check P8.8`
-
-**Required evidence**
-
-- `evidence/tasks/P8.8/result.json`
-- `evidence/tasks/P8.8/commands.txt`
-- `evidence/tasks/P8.8/tests.txt`
-- `evidence/tasks/P8.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P8.9 — Implement capacity, architecture, loss, and seed sweeps
 
 **Phase:** P8  
@@ -6126,24 +4910,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Scheduler overhead stays under 1% of total sweep CPU.
 - Duplicate configs are deduplicated by identity before execution.
-
-**Verification commands**
-
-- `cargo xtask task verify P8.9`
-- `cargo xtask task benchmark P8.9`
-- `cargo xtask task evidence-check P8.9`
-
-**Required evidence**
-
-- `evidence/tasks/P8.9/result.json`
-- `evidence/tasks/P8.9/commands.txt`
-- `evidence/tasks/P8.9/tests.txt`
-- `evidence/tasks/P8.9/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P9 — Autonomous collect–train–evaluate–promote loop
 
@@ -6187,24 +4953,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - State transition transaction p95 is below 20 ms distributed and 2 ms local.
 - Reconstruction handles 100,000 generations in bounded memory.
 
-**Verification commands**
-
-- `cargo xtask task verify P9.1`
-- `cargo xtask task benchmark P9.1`
-- `cargo xtask task evidence-check P9.1`
-
-**Required evidence**
-
-- `evidence/tasks/P9.1/result.json`
-- `evidence/tasks/P9.1/commands.txt`
-- `evidence/tasks/P9.1/tests.txt`
-- `evidence/tasks/P9.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P9.2 — Implement immutable experiment and cell manifests
 
 **Phase:** P9  
@@ -6240,24 +4988,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Manifest validation completes under 5 ms for typical cells.
 - Diff handles 10,000-cell matrices in under 2 seconds.
-
-**Verification commands**
-
-- `cargo xtask task verify P9.2`
-- `cargo xtask task benchmark P9.2`
-- `cargo xtask task evidence-check P9.2`
-
-**Required evidence**
-
-- `evidence/tasks/P9.2/result.json`
-- `evidence/tasks/P9.2/commands.txt`
-- `evidence/tasks/P9.2/tests.txt`
-- `evidence/tasks/P9.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P9.3 — Implement generation collection and dataset triggers
 
@@ -6295,24 +5025,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Coordinator handles 100,000 cells with under 1 GiB RSS.
 - Plan expansion is under 5 seconds for 1 million logical episodes.
 
-**Verification commands**
-
-- `cargo xtask task verify P9.3`
-- `cargo xtask task benchmark P9.3`
-- `cargo xtask task evidence-check P9.3`
-
-**Required evidence**
-
-- `evidence/tasks/P9.3/result.json`
-- `evidence/tasks/P9.3/commands.txt`
-- `evidence/tasks/P9.3/tests.txt`
-- `evidence/tasks/P9.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P9.4 — Implement declarative evaluation and promotion policy
 
 **Phase:** P9  
@@ -6349,33 +5061,15 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Policy evaluation over 100,000 metric rows completes in under 100 ms.
 - Promotion adds no search hot-path code.
 
-**Verification commands**
-
-- `cargo xtask task verify P9.4`
-- `cargo xtask task benchmark P9.4`
-- `cargo xtask task evidence-check P9.4`
-
-**Required evidence**
-
-- `evidence/tasks/P9.4/result.json`
-- `evidence/tasks/P9.4/commands.txt`
-- `evidence/tasks/P9.4/tests.txt`
-- `evidence/tasks/P9.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P9.5 — Implement crash-safe resume, retry, and cancellation
 
 **Phase:** P9  
 **Dependencies:** P9.1, P4.4  
 **Size:** L  
 **Primary skill:** Reliability  
-**Owned scope:** `reflex-scheduler`, `reflex-worker`
+**Owned scope:** `reflex-engine`, `reflex`
 
-**Purpose.** Allow long autonomous runs to survive process and Machine loss without ambiguous scientific state.
+**Purpose.** Resume from the last atomic local barrier without ambiguous scientific state.
 
 **Deliverables**
 
@@ -6386,7 +5080,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Implementation steps**
 
-1. Reconcile metadata leases, CAS completion markers, and ledger tails after coordinator restart.
+1. Reopen and verify CURRENT, rebuild its root set in the arena, and discard volatile post-barrier work.
 2. Retry infrastructure failures under the manifest’s bounded policy; never retry scientific failures as if they were infrastructure.
 3. Cancellation stops new claims, drains or kills active cells according to mode, and publishes partial evidence.
 4. Use fencing tokens for all finalization.
@@ -6402,24 +5096,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Reconciliation of 10,000 attempts completes under 10 seconds.
 - Worker cancellation p95 is under 5 seconds excluding uninterruptible verifier behavior.
-
-**Verification commands**
-
-- `cargo xtask task verify P9.5`
-- `cargo xtask task benchmark P9.5`
-- `cargo xtask task evidence-check P9.5`
-
-**Required evidence**
-
-- `evidence/tasks/P9.5/result.json`
-- `evidence/tasks/P9.5/commands.txt`
-- `evidence/tasks/P9.5/tests.txt`
-- `evidence/tasks/P9.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P9.6 — Implement stopping conditions and compute economics
 
@@ -6456,24 +5132,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Budget checks add negligible coordinator load.
 - Economics aggregation handles 100 million utility rows through Parquet/DataFusion.
-
-**Verification commands**
-
-- `cargo xtask task verify P9.6`
-- `cargo xtask task benchmark P9.6`
-- `cargo xtask task evidence-check P9.6`
-
-**Required evidence**
-
-- `evidence/tasks/P9.6/result.json`
-- `evidence/tasks/P9.6/commands.txt`
-- `evidence/tasks/P9.6/tests.txt`
-- `evidence/tasks/P9.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P10 — Verified bit-vector vertical slice
 
@@ -6517,24 +5175,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Interpret at least 100 million primitive ops/s/core.
 - Generate 100,000 tasks in under 5 seconds.
 
-**Verification commands**
-
-- `cargo xtask task verify P10.1`
-- `cargo xtask task benchmark P10.1`
-- `cargo xtask task evidence-check P10.1`
-
-**Required evidence**
-
-- `evidence/tasks/P10.1/result.json`
-- `evidence/tasks/P10.1/commands.txt`
-- `evidence/tasks/P10.1/tests.txt`
-- `evidence/tasks/P10.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P10.2 — Implement candidate rewrites and exhaustive verification
 
 **Phase:** P10  
@@ -6570,24 +5210,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Verify at least 50,000 small candidate pairs/s/core.
 - Candidate enumeration and apply meet P6 allocation budgets.
-
-**Verification commands**
-
-- `cargo xtask task verify P10.2`
-- `cargo xtask task benchmark P10.2`
-- `cargo xtask task evidence-check P10.2`
-
-**Required evidence**
-
-- `evidence/tasks/P10.2/result.json`
-- `evidence/tasks/P10.2/commands.txt`
-- `evidence/tasks/P10.2/tests.txt`
-- `evidence/tasks/P10.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P10.3 — Add bit-vector features and cheap baselines
 
@@ -6625,24 +5247,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Feature extraction exceeds 5 million candidates/s/core.
 - Heuristic scoring exceeds 10 million candidates/s/core.
 
-**Verification commands**
-
-- `cargo xtask task verify P10.3`
-- `cargo xtask task benchmark P10.3`
-- `cargo xtask task evidence-check P10.3`
-
-**Required evidence**
-
-- `evidence/tasks/P10.3/result.json`
-- `evidence/tasks/P10.3/commands.txt`
-- `evidence/tasks/P10.3/tests.txt`
-- `evidence/tasks/P10.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P10.4 — Run the first collect and proof-DAG dataset generation
 
 **Phase:** P10  
@@ -6676,26 +5280,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- The entire collection completes in under 15 minutes on one performance-4x.
+- The entire collection completes in under 15 minutes on one reference-4vcpu-8gb.
 - Accepted evidence stays under 2 GiB.
-
-**Verification commands**
-
-- `cargo xtask task verify P10.4`
-- `cargo xtask task benchmark P10.4`
-- `cargo xtask task evidence-check P10.4`
-
-**Required evidence**
-
-- `evidence/tasks/P10.4/result.json`
-- `evidence/tasks/P10.4/commands.txt`
-- `evidence/tasks/P10.4/tests.txt`
-- `evidence/tasks/P10.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P10.5 — Train and qualify the first all-Rust ranker
 
@@ -6733,24 +5319,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Training and evaluation satisfy P7/P8 throughput budgets.
 - Inference overhead remains below 10% of search CPU.
 
-**Verification commands**
-
-- `cargo xtask task verify P10.5`
-- `cargo xtask task benchmark P10.5`
-- `cargo xtask task evidence-check P10.5`
-
-**Required evidence**
-
-- `evidence/tasks/P10.5/result.json`
-- `evidence/tasks/P10.5/commands.txt`
-- `evidence/tasks/P10.5/tests.txt`
-- `evidence/tasks/P10.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P10.6 — Complete the second autonomous generation and tutorial
 
 **Phase:** P10  
@@ -6759,7 +5327,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Primary skill:** Developer experience  
 **Owned scope:** `domains/reflex-domain-bitvec`, `docs/tutorials`
 
-**Purpose.** Prove the autonomous loop and provide the reference implementation a junior engineer can follow.
+**Purpose.** Prove the autonomous loop and provide a reference implementation a new domain author can follow.
 
 **Deliverables**
 
@@ -6784,520 +5352,9 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Tutorial run completes under 30 minutes on performance-4x.
+- Tutorial run completes under 30 minutes on reference-4vcpu-8gb.
 - Local setup requires no service or Python installation.
 
-**Verification commands**
-
-- `cargo xtask task verify P10.6`
-- `cargo xtask task benchmark P10.6`
-- `cargo xtask task evidence-check P10.6`
-
-**Required evidence**
-
-- `evidence/tasks/P10.6/result.json`
-- `evidence/tasks/P10.6/commands.txt`
-- `evidence/tasks/P10.6/tests.txt`
-- `evidence/tasks/P10.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-## P11 — Fly.io distributed execution
-
-**Goal:** Run immutable cells efficiently across 20 performance-4x Machines with PostgreSQL and Tigris.
-
-**Exit gate:** A 20-worker canary reaches the utilization and reconstruction gates, survives worker loss, and leaves zero active Machines or volumes.
-
-### P11.1 — Define Fly deployment topology and resource classes
-
-**Phase:** P11  
-**Dependencies:** P4.4, P9.2  
-**Size:** M  
-**Primary skill:** Cloud architecture  
-**Owned scope:** `reflex-fly`, `deploy/fly`
-
-**Purpose.** Specify stateless worker, coordinator, metadata, and object-store roles for the first 20-machine dogfood pool.
-
-**Deliverables**
-
-- Fly app topology
-- resource class registry
-- network policy
-- deployment diagrams
-
-**Implementation steps**
-
-1. Use performance-4x/8 GiB as the ordinary worker class and reserve 16/32 GiB only for measured high-memory jobs.
-2. Keep workers volume-free and stateless; use RAM/ephemeral scratch and Tigris uploads.
-3. Use Managed Postgres or an explicitly supported PostgreSQL service for coordination.
-4. Place workers, Postgres, and Tigris access in compatible regions and private networks.
-
-**Acceptance criteria**
-
-- No worker requires a Fly Volume.
-- Resource class is part of cell identity.
-- Secrets and egress paths are documented.
-- A stopped worker can be destroyed without losing accepted evidence.
-
-**Performance acceptance**
-
-- Ordinary worker target peak RSS is below 6 GiB.
-- Network round-trip and object throughput are measured during calibration.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.1`
-- `cargo xtask task benchmark P11.1`
-- `cargo xtask task evidence-check P11.1`
-
-**Required evidence**
-
-- `evidence/tasks/P11.1/result.json`
-- `evidence/tasks/P11.1/commands.txt`
-- `evidence/tasks/P11.1/tests.txt`
-- `evidence/tasks/P11.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.2 — Implement the Fly Machines API client
-
-**Phase:** P11  
-**Dependencies:** P11.1  
-**Size:** L  
-**Primary skill:** Cloud API integration  
-**Owned scope:** `reflex-fly`
-
-**Purpose.** Provision, start, wait, stop, and destroy worker Machines programmatically with idempotent operations.
-
-**Deliverables**
-
-- Machines REST client
-- typed configs
-- retry policy
-- deploy-token support
-
-**Implementation steps**
-
-1. Use the internal Machines endpoint when running inside Fly and the public endpoint otherwise.
-2. Create Machines with exact image digest, guest CPU/memory, env/secrets references, metadata, and auto-destroy policy.
-3. Implement wait for started/stopped states and bounded retries for idempotent operations.
-4. Record every API request identity and resulting Machine ID without logging tokens.
-
-**Acceptance criteria**
-
-- Repeated create requests with the same controller operation do not leak duplicate workers.
-- Stop and destroy leave the expected terminal state.
-- Unrecognized image digest or resource class fails before create.
-- Deploy tokens are app scoped.
-
-**Performance acceptance**
-
-- Launch 20 Machines to running within 90 seconds under normal provider conditions.
-- Controller API CPU remains negligible.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.2`
-- `cargo xtask task benchmark P11.2`
-- `cargo xtask task evidence-check P11.2`
-
-**Required evidence**
-
-- `evidence/tasks/P11.2/result.json`
-- `evidence/tasks/P11.2/commands.txt`
-- `evidence/tasks/P11.2/tests.txt`
-- `evidence/tasks/P11.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.3 — Implement worker bootstrap and registration
-
-**Phase:** P11  
-**Dependencies:** P11.2, P5.3, P1.5  
-**Size:** L  
-**Primary skill:** Worker runtime  
-**Owned scope:** `reflex-worker`, `reflex-fly`
-
-**Purpose.** Bring a clean stateless Machine to calibrated, compatible, claim-ready state automatically.
-
-**Deliverables**
-
-- bootstrap sequence
-- health endpoint
-- worker session record
-- graceful drain
-
-**Implementation steps**
-
-1. Verify binary/image identity and required secrets.
-2. Create RAM/ephemeral scratch, run host calibration, connect to PostgreSQL/Tigris, and register capabilities.
-3. Warm domain workers, CAS clients, and model backends according to worker role.
-4. On signal, stop claiming, finish or cancel cells by policy, flush evidence, and unregister.
-
-**Acceptance criteria**
-
-- A worker cannot claim before calibration and compatibility pass.
-- Bootstrap failure produces logs and self-terminates without work.
-- Worker session records exact host and image identity.
-- Drain leaves no unflushed accepted cell.
-
-**Performance acceptance**
-
-- Worker becomes claim-ready in under 120 seconds including calibration.
-- Warm reusable process startup is excluded and separately reported.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.3`
-- `cargo xtask task benchmark P11.3`
-- `cargo xtask task evidence-check P11.3`
-
-**Required evidence**
-
-- `evidence/tasks/P11.3/result.json`
-- `evidence/tasks/P11.3/commands.txt`
-- `evidence/tasks/P11.3/tests.txt`
-- `evidence/tasks/P11.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.4 — Configure Tigris as the distributed CAS
-
-**Phase:** P11  
-**Dependencies:** P2.4, P11.1  
-**Size:** M  
-**Primary skill:** Object storage operations  
-**Owned scope:** `reflex-fly`, `deploy/fly`
-
-**Purpose.** Use Fly-native S3-compatible storage for immutable inputs and evidence.
-
-**Deliverables**
-
-- bucket configuration
-- credential policy
-- lifecycle rules
-- integration test
-
-**Implementation steps**
-
-1. Use the canonical t3.storage.dev endpoint and region auto.
-2. Create prefixes for permanent evidence, releases, caches, and ephemeral uploads with explicit retention policy.
-3. Use separate least-privilege credentials for workers and release/audit roles where feasible.
-4. Validate multipart cleanup and read-after-publish semantics.
-
-**Acceptance criteria**
-
-- Workers can put/get only intended bucket scope.
-- Accepted evidence remains after worker destruction.
-- Lifecycle rules never delete permanent evidence.
-- Secrets are absent from image layers and reports.
-
-**Performance acceptance**
-
-- Upload/download throughput meets the measured regional baseline or is reported as an external bottleneck.
-- CAS calls use bounded concurrency and retry budgets.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.4`
-- `cargo xtask task benchmark P11.4`
-- `cargo xtask task evidence-check P11.4`
-
-**Required evidence**
-
-- `evidence/tasks/P11.4/result.json`
-- `evidence/tasks/P11.4/commands.txt`
-- `evidence/tasks/P11.4/tests.txt`
-- `evidence/tasks/P11.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.5 — Provision and validate distributed PostgreSQL
-
-**Phase:** P11  
-**Dependencies:** P4.3, P11.1  
-**Size:** M  
-**Primary skill:** Database operations  
-**Owned scope:** `deploy/fly`, `reflex-meta-postgres`
-
-**Purpose.** Provide supported, backed-up coordination for dogfood experiments.
-
-**Deliverables**
-
-- Managed Postgres setup
-- connection/TLS config
-- backup validation
-- capacity dashboard
-
-**Implementation steps**
-
-1. Provision PostgreSQL 18-compatible managed service with private connectivity and TLS.
-2. Apply migrations through a single release-holder job.
-3. Configure connection pools for controller and workers; do not create one connection per episode.
-4. Run backup/restore drill into a disposable database.
-
-**Acceptance criteria**
-
-- Workers use least-privilege application roles.
-- Migration lock prevents concurrent release holders.
-- Restore reproduces experiments and work state.
-- Database deletion is separate from app cleanup and documented.
-
-**Performance acceptance**
-
-- 20-worker canary remains within P4.3 database CPU and query latency budgets.
-- Connection count stays below configured capacity with 2× worker burst.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.5`
-- `cargo xtask task benchmark P11.5`
-- `cargo xtask task evidence-check P11.5`
-
-**Required evidence**
-
-- `evidence/tasks/P11.5/result.json`
-- `evidence/tasks/P11.5/commands.txt`
-- `evidence/tasks/P11.5/tests.txt`
-- `evidence/tasks/P11.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.6 — Implement fleet scheduling and autoscaling
-
-**Phase:** P11  
-**Dependencies:** P11.2, P11.3, P4.4  
-**Size:** L  
-**Primary skill:** Distributed scheduling  
-**Owned scope:** `reflex-scheduler`, `reflex-fly`
-
-**Purpose.** Map ready immutable cells to the smallest qualified worker fleet and shut idle compute down promptly.
-
-**Deliverables**
-
-- fleet controller
-- resource-class queues
-- scale-up/down policy
-- capacity report
-
-**Implementation steps**
-
-1. Count ready work by resource class, expected duration, image/domain capability, and region.
-2. Launch up to configured maximum Machines; ordinary experiments default to one cell using all four CPUs.
-3. Stop and destroy idle workers after grace period when no compatible ready cells remain.
-4. Never resize a Machine during a cell.
-
-**Acceptance criteria**
-
-- Twenty ordinary cells launch onto twenty workers without competing cells per Machine.
-- High-memory cells claim only qualified classes.
-- Idle cleanup reaches zero active Machines.
-- Scale decisions reconstruct from queue and fleet events.
-
-**Performance acceptance**
-
-- Primary matrix worker utilization is at least 85% excluding calibration and provider launch time.
-- Coordinator CPU overhead is under 2% of fleet summed CPU.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.6`
-- `cargo xtask task benchmark P11.6`
-- `cargo xtask task evidence-check P11.6`
-
-**Required evidence**
-
-- `evidence/tasks/P11.6/result.json`
-- `evidence/tasks/P11.6/commands.txt`
-- `evidence/tasks/P11.6/tests.txt`
-- `evidence/tasks/P11.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.7 — Implement distributed artifact publication and finalization
-
-**Phase:** P11  
-**Dependencies:** P11.4, P11.5, P4.4  
-**Size:** L  
-**Primary skill:** Distributed reliability  
-**Owned scope:** `reflex-worker`, `reflex-meta-postgres`
-
-**Purpose.** Guarantee that a completed cell means all required evidence is durable and indexed.
-
-**Deliverables**
-
-- completion marker
-- publication transaction
-- artifact verification
-- attempt selection
-
-**Implementation steps**
-
-1. Upload ledger segments, receipts, resource totals, summaries, and referenced outputs to Tigris.
-2. Verify object metadata/digests, then insert artifact references under the current fencing token.
-3. Publish a canonical completion manifest last.
-4. Finalize the attempt and update experiment counts in one metadata transaction.
-
-**Acceptance criteria**
-
-- Database cannot mark success before completion manifest and required objects exist.
-- Stale token publication is rejected.
-- A retry can reuse identical immutable objects.
-- Strict aggregation sees exactly expected attempts and artifacts.
-
-**Performance acceptance**
-
-- Finalization p95 is under 2 seconds for ordinary cells after uploads complete.
-- Metadata transaction stays small and does not enumerate every event.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.7`
-- `cargo xtask task benchmark P11.7`
-- `cargo xtask task evidence-check P11.7`
-
-**Required evidence**
-
-- `evidence/tasks/P11.7/result.json`
-- `evidence/tasks/P11.7/commands.txt`
-- `evidence/tasks/P11.7/tests.txt`
-- `evidence/tasks/P11.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.8 — Add cost, quota, and cleanup guardrails
-
-**Phase:** P11  
-**Dependencies:** P11.6  
-**Size:** M  
-**Primary skill:** FinOps and operations  
-**Owned scope:** `reflex-fly`, `reflex-scheduler`
-
-**Purpose.** Prevent autonomous training from leaving compute or storage running unexpectedly.
-
-**Deliverables**
-
-- fleet budget policy
-- Machine inventory audit
-- cleanup command
-- planning cost report
-
-**Implementation steps**
-
-1. Set maximum Machines, Machine-hours, launch rate, idle grace, experiment budget, and emergency stop.
-2. List active Machines, volumes, apps, buckets, and database resources associated with an experiment.
-3. Stop/destroy workers on completion or budget breach while preserving evidence.
-4. Distinguish planning-rate estimates from provider invoice authority.
-
-**Acceptance criteria**
-
-- Budget breach stops new launches and begins drain.
-- Cleanup proves zero active worker Machines and zero worker volumes.
-- Database and permanent bucket require explicit separate deletion.
-- Every run produces estimated Machine-hours and accepted compute totals.
-
-**Performance acceptance**
-
-- Fleet inventory completes in under 10 seconds for 1,000 Machines.
-- Guardrail checks do not delay cell claims measurably.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.8`
-- `cargo xtask task benchmark P11.8`
-- `cargo xtask task evidence-check P11.8`
-
-**Required evidence**
-
-- `evidence/tasks/P11.8/result.json`
-- `evidence/tasks/P11.8/commands.txt`
-- `evidence/tasks/P11.8/tests.txt`
-- `evidence/tasks/P11.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
-### P11.9 — Run the 20-worker distributed fault canary
-
-**Phase:** P11  
-**Dependencies:** P11.3, P11.7, P11.8  
-**Size:** XL  
-**Primary skill:** Distributed testing  
-**Owned scope:** `reflex-scheduler`, `reflex-worker`, `evidence/fly-canary`
-
-**Purpose.** Qualify the Fly dogfood substrate before expensive scientific or Wrela campaigns.
-
-**Deliverables**
-
-- 20-worker matrix
-- fault injection plan
-- strict reconstruction report
-- cleanup evidence
-
-**Implementation steps**
-
-1. Launch 20 performance-4x workers and run deterministic bit-vector cells.
-2. Kill workers before claim, mid-search, mid-upload, and after upload before finalization.
-3. Interrupt coordinator and selected database connections.
-4. Resume, accept exactly one attempt per cell, reconstruct reports, and clean all workers.
-
-**Acceptance criteria**
-
-- All cells are accepted once or explicitly fail under registered retry policy.
-- No missing, duplicate, or mutated evidence passes strict aggregation.
-- Scientific outputs match a no-fault control.
-- Final inventory is zero Machines and zero volumes.
-
-**Performance acceptance**
-
-- Fleet utilization is at least 85%.
-- Coordinator overhead is below 2%.
-- Queue claim p95 is below 20 ms.
-- Ordinary worker peak RSS remains below 6 GiB.
-
-**Verification commands**
-
-- `cargo xtask task verify P11.9`
-- `cargo xtask task benchmark P11.9`
-- `cargo xtask task evidence-check P11.9`
-
-**Required evidence**
-
-- `evidence/tasks/P11.9/result.json`
-- `evidence/tasks/P11.9/commands.txt`
-- `evidence/tasks/P11.9/tests.txt`
-- `evidence/tasks/P11.9/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P12 — Wrela dogfood integration
 
@@ -7307,10 +5364,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 ### P12.1 — Define the Wrela Kernel Package v1
 
-**Phase:** P12  
-**Dependencies:** P5.6, P2.5  
-**Size:** L  
-**Primary skill:** Compiler interfaces  
+**Phase:** P12
+**Dependencies:** P5.6, P2.5
+**Size:** L
+**Primary skill:** Compiler interfaces
 **Owned scope:** `domains/reflex-domain-wrela`, `docs/wrela`
 
 **Purpose.** Create a narrow, content-addressed semantic package for pure bounded Wrela kernels rather than ingesting arbitrary source.
@@ -7340,24 +5397,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Validate a 100,000-node kernel package in under 500 ms.
 - Package metadata stays compact; large fixtures/traces are CAS references.
-
-**Verification commands**
-
-- `cargo xtask task verify P12.1`
-- `cargo xtask task benchmark P12.1`
-- `cargo xtask task evidence-check P12.1`
-
-**Required evidence**
-
-- `evidence/tasks/P12.1/result.json`
-- `evidence/tasks/P12.1/commands.txt`
-- `evidence/tasks/P12.1/tests.txt`
-- `evidence/tasks/P12.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P12.2 — Implement Wrela export, candidate check, and cost commands
 
@@ -7395,24 +5434,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Warm candidate check startup is under 250 ms excluding compilation/verifier work.
 - Batch mode handles at least 100 candidates per process invocation.
 
-**Verification commands**
-
-- `cargo xtask task verify P12.2`
-- `cargo xtask task benchmark P12.2`
-- `cargo xtask task evidence-check P12.2`
-
-**Required evidence**
-
-- `evidence/tasks/P12.2/result.json`
-- `evidence/tasks/P12.2/commands.txt`
-- `evidence/tasks/P12.2/tests.txt`
-- `evidence/tasks/P12.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P12.3 — Implement the Wrela external domain adapter
 
 **Phase:** P12  
@@ -7448,24 +5469,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Transport/framework overhead is under 5% of total Wrela evaluation wall time.
 - Feature extraction meets candidate throughput targets for first campaign.
-
-**Verification commands**
-
-- `cargo xtask task verify P12.3`
-- `cargo xtask task benchmark P12.3`
-- `cargo xtask task evidence-check P12.3`
-
-**Required evidence**
-
-- `evidence/tasks/P12.3/result.json`
-- `evidence/tasks/P12.3/commands.txt`
-- `evidence/tasks/P12.3/tests.txt`
-- `evidence/tasks/P12.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P12.4 — Build the certified strategy-scheduling domain
 
@@ -7503,24 +5506,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - State/action feature extraction is under 10% of certificate work.
 - Executor supports at least 100,000 strategy attempts/s where verifier kernels are cheap.
 
-**Verification commands**
-
-- `cargo xtask task verify P12.4`
-- `cargo xtask task benchmark P12.4`
-- `cargo xtask task evidence-check P12.4`
-
-**Required evidence**
-
-- `evidence/tasks/P12.4/result.json`
-- `evidence/tasks/P12.4/commands.txt`
-- `evidence/tasks/P12.4/tests.txt`
-- `evidence/tasks/P12.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P12.5 — Implement Wrela equivalence, refinement, and economics receipts
 
 **Phase:** P12  
@@ -7557,28 +5542,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Receipt generation adds under 2% to the underlying conformance/cost runs.
 - Utility aggregation is streaming and bounded.
 
-**Verification commands**
-
-- `cargo xtask task verify P12.5`
-- `cargo xtask task benchmark P12.5`
-- `cargo xtask task evidence-check P12.5`
-
-**Required evidence**
-
-- `evidence/tasks/P12.5/result.json`
-- `evidence/tasks/P12.5/commands.txt`
-- `evidence/tasks/P12.5/tests.txt`
-- `evidence/tasks/P12.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P12.6 — Collect, train, and evaluate the Wrela strategy ranker
 
 **Phase:** P12  
-**Dependencies:** P12.4, P8.9, P11.9  
+**Dependencies:** P12.4, P8.9
 **Size:** XL  
 **Primary skill:** ML experiment execution  
 **Owned scope:** `domains/reflex-domain-wrela`, `reflex-training`
@@ -7609,25 +5576,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Target gate: at least 15% certificate-work reduction or 3% whole-workload reduction with inference included.
-- Distributed matrix uses one cell per performance-4x worker and stays within 8 GiB.
-
-**Verification commands**
-
-- `cargo xtask task verify P12.6`
-- `cargo xtask task benchmark P12.6`
-- `cargo xtask task evidence-check P12.6`
-
-**Required evidence**
-
-- `evidence/tasks/P12.6/result.json`
-- `evidence/tasks/P12.6/commands.txt`
-- `evidence/tasks/P12.6/tests.txt`
-- `evidence/tasks/P12.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Distributed matrix uses one cell per reference-4vcpu-8gb worker and stays within 8 GiB.
 
 ### P12.7 — Implement immutable Wrela optimization catalogs
 
@@ -7665,24 +5614,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Lookup/application meets Wrela compile-time overhead budget.
 - Edition load is mmap-friendly and bounded by active entry count.
 
-**Verification commands**
-
-- `cargo xtask task verify P12.7`
-- `cargo xtask task benchmark P12.7`
-- `cargo xtask task evidence-check P12.7`
-
-**Required evidence**
-
-- `evidence/tasks/P12.7/result.json`
-- `evidence/tasks/P12.7/commands.txt`
-- `evidence/tasks/P12.7/tests.txt`
-- `evidence/tasks/P12.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P12.8 — Run the clipped-coverage and fixed-Q discovery campaigns
 
 **Phase:** P12  
@@ -7718,24 +5649,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Coverage success gate is 20% coverage-work or 8% locked-renderer cost reduction; fixed-Q gate is campaign-preregistered.
 - Campaign overhead and compute are fully reported.
-
-**Verification commands**
-
-- `cargo xtask task verify P12.8`
-- `cargo xtask task benchmark P12.8`
-- `cargo xtask task evidence-check P12.8`
-
-**Required evidence**
-
-- `evidence/tasks/P12.8/result.json`
-- `evidence/tasks/P12.8/commands.txt`
-- `evidence/tasks/P12.8/tests.txt`
-- `evidence/tasks/P12.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P13 — Lean adapter and compositional-learning follow-up
 
@@ -7779,28 +5692,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Adapter overhead is under 5% of representative evaluation wall time.
 - Persistent workers retain the previously measured startup amortization.
 
-**Verification commands**
-
-- `cargo xtask task verify P13.1`
-- `cargo xtask task benchmark P13.1`
-- `cargo xtask task evidence-check P13.1`
-
-**Required evidence**
-
-- `evidence/tasks/P13.1/result.json`
-- `evidence/tasks/P13.1/commands.txt`
-- `evidence/tasks/P13.1/tests.txt`
-- `evidence/tasks/P13.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P13.2 — Reconstruct the M1.5 reference result under Reflex
 
 **Phase:** P13  
-**Dependencies:** P13.1, P11.9, P8.9  
+**Dependencies:** P13.1, P8.9
 **Size:** XL  
 **Primary skill:** Scientific reproduction  
 **Owned scope:** `domains/reflex-domain-lean`, `evidence/lean-m1.5`
@@ -7832,24 +5727,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Representative evaluation is no slower than Project Reflex after excluding unavoidable protocol migration cost, or an ADR blocks release.
 - Peak RSS stays within 8 GiB.
-
-**Verification commands**
-
-- `cargo xtask task verify P13.2`
-- `cargo xtask task benchmark P13.2`
-- `cargo xtask task evidence-check P13.2`
-
-**Required evidence**
-
-- `evidence/tasks/P13.2/result.json`
-- `evidence/tasks/P13.2/commands.txt`
-- `evidence/tasks/P13.2/tests.txt`
-- `evidence/tasks/P13.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P13.3 — Import and reconstruct the complete M2A negative result
 
@@ -7887,24 +5764,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Reconstruction completes under 30 seconds from warm local cache.
 - Imported evidence remains content-addressed and deduplicated.
 
-**Verification commands**
-
-- `cargo xtask task verify P13.3`
-- `cargo xtask task benchmark P13.3`
-- `cargo xtask task evidence-check P13.3`
-
-**Required evidence**
-
-- `evidence/tasks/P13.3/result.json`
-- `evidence/tasks/P13.3/commands.txt`
-- `evidence/tasks/P13.3/tests.txt`
-- `evidence/tasks/P13.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P13.4 — Mine multi-proof DAGs for a bounded M2A subset
 
 **Phase:** P13  
@@ -7940,24 +5799,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Use the 20-worker pool with one search cell per worker.
 - DAG mining remains within declared compute and storage budget.
-
-**Verification commands**
-
-- `cargo xtask task verify P13.4`
-- `cargo xtask task benchmark P13.4`
-- `cargo xtask task evidence-check P13.4`
-
-**Required evidence**
-
-- `evidence/tasks/P13.4/result.json`
-- `evidence/tasks/P13.4/commands.txt`
-- `evidence/tasks/P13.4/tests.txt`
-- `evidence/tasks/P13.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P13.5 — Build the M2B proof-DAG training datasets
 
@@ -7995,24 +5836,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Dataset compilation meets P8 throughput and memory gates.
 - Collision analysis streams and does not require all feature rows in RAM.
 
-**Verification commands**
-
-- `cargo xtask task verify P13.5`
-- `cargo xtask task benchmark P13.5`
-- `cargo xtask task evidence-check P13.5`
-
-**Required evidence**
-
-- `evidence/tasks/P13.5/result.json`
-- `evidence/tasks/P13.5/commands.txt`
-- `evidence/tasks/P13.5/tests.txt`
-- `evidence/tasks/P13.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P13.6 — Train M2B loss, capacity, and feature ablations
 
 **Phase:** P13  
@@ -8046,26 +5869,8 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Training cells fit performance-4x/8 GiB.
+- Training cells fit reference-4vcpu-8gb/8 GiB.
 - All-Rust training meets or improves Project Reflex wall/CPU throughput.
-
-**Verification commands**
-
-- `cargo xtask task verify P13.6`
-- `cargo xtask task benchmark P13.6`
-- `cargo xtask task evidence-check P13.6`
-
-**Required evidence**
-
-- `evidence/tasks/P13.6/result.json`
-- `evidence/tasks/P13.6/commands.txt`
-- `evidence/tasks/P13.6/tests.txt`
-- `evidence/tasks/P13.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P13.7 — Run first-action and oracle-ranking diagnostics
 
@@ -8103,28 +5908,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Oracle lookup adds under 5% to diagnostic search.
 - Diagnostics reuse mined DAGs without rerunning unnecessary proof search.
 
-**Verification commands**
-
-- `cargo xtask task verify P13.7`
-- `cargo xtask task benchmark P13.7`
-- `cargo xtask task evidence-check P13.7`
-
-**Required evidence**
-
-- `evidence/tasks/P13.7/result.json`
-- `evidence/tasks/P13.7/commands.txt`
-- `evidence/tasks/P13.7/tests.txt`
-- `evidence/tasks/P13.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P13.8 — Run the preregistered M2B confirmatory matrix
 
 **Phase:** P13  
-**Dependencies:** P13.6, P13.7, P11.9  
+**Dependencies:** P13.6, P13.7
 **Size:** XL  
 **Primary skill:** Scientific experiment execution  
 **Owned scope:** `domains/reflex-domain-lean`, `evidence/lean-m2b`
@@ -8155,25 +5942,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Matrix uses the ordinary 20-worker class unless measured memory requires promotion.
-- Fleet and cell performance meet P11 gates.
-
-**Verification commands**
-
-- `cargo xtask task verify P13.8`
-- `cargo xtask task benchmark P13.8`
-- `cargo xtask task evidence-check P13.8`
-
-**Required evidence**
-
-- `evidence/tasks/P13.8/result.json`
-- `evidence/tasks/P13.8/commands.txt`
-- `evidence/tasks/P13.8/tests.txt`
-- `evidence/tasks/P13.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Worker and cell performance meet the calibrated budgets.
 
 ## P14 — Verified knowledge economy
 
@@ -8217,24 +5986,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Load one million compact records in under 10 seconds from local page cache or stream an index without loading all payloads.
 - Manifest memory scales with active index, not proof bytes.
 
-**Verification commands**
-
-- `cargo xtask task verify P14.1`
-- `cargo xtask task benchmark P14.1`
-- `cargo xtask task evidence-check P14.1`
-
-**Required evidence**
-
-- `evidence/tasks/P14.1/result.json`
-- `evidence/tasks/P14.1/commands.txt`
-- `evidence/tasks/P14.1/tests.txt`
-- `evidence/tasks/P14.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P14.2 — Implement the retrieval interface and baseline indexes
 
 **Phase:** P14  
@@ -8270,24 +6021,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - K100K-style retrieval p95 is below 1 ms for hot in-memory index.
 - Index build is streaming and supports 1 million records within 8 GiB.
-
-**Verification commands**
-
-- `cargo xtask task verify P14.2`
-- `cargo xtask task benchmark P14.2`
-- `cargo xtask task evidence-check P14.2`
-
-**Required evidence**
-
-- `evidence/tasks/P14.2/result.json`
-- `evidence/tasks/P14.2/commands.txt`
-- `evidence/tasks/P14.2/tests.txt`
-- `evidence/tasks/P14.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P14.3 — Implement per-cell knowledge overlays and online activation
 
@@ -8325,24 +6058,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Overlay lookup adds under 20% to base retrieval p95 at configured size.
 - Compaction does not block active readers.
 
-**Verification commands**
-
-- `cargo xtask task verify P14.3`
-- `cargo xtask task benchmark P14.3`
-- `cargo xtask task evidence-check P14.3`
-
-**Required evidence**
-
-- `evidence/tasks/P14.3/result.json`
-- `evidence/tasks/P14.3/commands.txt`
-- `evidence/tasks/P14.3/tests.txt`
-- `evidence/tasks/P14.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P14.4 — Implement behavioral knowledge-use accounting
 
 **Phase:** P14  
@@ -8378,24 +6093,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Use accounting adds under 5% to retrieval/application CPU.
 - Ablation scheduler deduplicates matched cells.
-
-**Verification commands**
-
-- `cargo xtask task verify P14.4`
-- `cargo xtask task benchmark P14.4`
-- `cargo xtask task evidence-check P14.4`
-
-**Required evidence**
-
-- `evidence/tasks/P14.4/result.json`
-- `evidence/tasks/P14.4/commands.txt`
-- `evidence/tasks/P14.4/tests.txt`
-- `evidence/tasks/P14.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P14.5 — Define immutable vector-valued utility and economics
 
@@ -8433,24 +6130,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Aggregation processes at least 5 million observations/s/core.
 - Hot observation append uses compact typed events, not dynamic maps.
 
-**Verification commands**
-
-- `cargo xtask task verify P14.5`
-- `cargo xtask task benchmark P14.5`
-- `cargo xtask task evidence-check P14.5`
-
-**Required evidence**
-
-- `evidence/tasks/P14.5/result.json`
-- `evidence/tasks/P14.5/commands.txt`
-- `evidence/tasks/P14.5/tests.txt`
-- `evidence/tasks/P14.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P14.6 — Implement curation, tiering, and utility ledgers
 
 **Phase:** P14  
@@ -8484,31 +6163,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Performance acceptance**
 
-- Curator scores one million records in under 60 seconds on performance-4x.
+- Curator scores one million records in under 60 seconds on reference-4vcpu-8gb.
 - Hot-set lookup meets P14.2 latency.
-
-**Verification commands**
-
-- `cargo xtask task verify P14.6`
-- `cargo xtask task benchmark P14.6`
-- `cargo xtask task evidence-check P14.6`
-
-**Required evidence**
-
-- `evidence/tasks/P14.6/result.json`
-- `evidence/tasks/P14.6/commands.txt`
-- `evidence/tasks/P14.6/tests.txt`
-- `evidence/tasks/P14.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P14.7 — Run junk-injection and knowledge-growth experiments
 
 **Phase:** P14  
-**Dependencies:** P14.6, P11.9  
+**Dependencies:** P14.6
 **Size:** XL  
 **Primary skill:** Scientific experiment execution  
 **Owned scope:** `reflex-knowledge`, `evidence/knowledge-economy`
@@ -8539,25 +6200,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Performance acceptance**
 
 - Ordinary cells stay within 8 GiB through streaming/index design.
-- Distributed execution meets P11 gates.
-
-**Verification commands**
-
-- `cargo xtask task verify P14.7`
-- `cargo xtask task benchmark P14.7`
-- `cargo xtask task evidence-check P14.7`
-
-**Required evidence**
-
-- `evidence/tasks/P14.7/result.json`
-- `evidence/tasks/P14.7/commands.txt`
-- `evidence/tasks/P14.7/tests.txt`
-- `evidence/tasks/P14.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
+- Portable multi-process execution passes the hermetic resilience gate.
 
 ## P15 — Research graph, taste, and proposal learning
 
@@ -8601,24 +6244,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Stream at least 1 million edges/s/core into Parquet.
 - Bounded traversal of a 100-million-edge graph avoids loading it all in RAM.
 
-**Verification commands**
-
-- `cargo xtask task verify P15.1`
-- `cargo xtask task benchmark P15.1`
-- `cargo xtask task evidence-check P15.1`
-
-**Required evidence**
-
-- `evidence/tasks/P15.1/result.json`
-- `evidence/tasks/P15.1/commands.txt`
-- `evidence/tasks/P15.1/tests.txt`
-- `evidence/tasks/P15.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P15.2 — Implement delayed and counterfactual credit assignment
 
 **Phase:** P15  
@@ -8654,24 +6279,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Credit computation streams or partitions graphs larger than RAM.
 - One million-edge acyclic fixture completes under 10 seconds/core.
-
-**Verification commands**
-
-- `cargo xtask task verify P15.2`
-- `cargo xtask task benchmark P15.2`
-- `cargo xtask task evidence-check P15.2`
-
-**Required evidence**
-
-- `evidence/tasks/P15.2/result.json`
-- `evidence/tasks/P15.2/commands.txt`
-- `evidence/tasks/P15.2/tests.txt`
-- `evidence/tasks/P15.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P15.3 — Build delayed-utility and Mathlib-Rewind-compatible taste datasets
 
@@ -8709,24 +6316,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Dataset construction remains streaming over multi-year library histories.
 - Feature snapshot storage is deduplicated by content identity.
 
-**Verification commands**
-
-- `cargo xtask task verify P15.3`
-- `cargo xtask task benchmark P15.3`
-- `cargo xtask task evidence-check P15.3`
-
-**Required evidence**
-
-- `evidence/tasks/P15.3/result.json`
-- `evidence/tasks/P15.3/commands.txt`
-- `evidence/tasks/P15.3/tests.txt`
-- `evidence/tasks/P15.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P15.4 — Train and calibrate taste critics
 
 **Phase:** P15  
@@ -8762,24 +6351,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Training uses bounded resources declared per critic class.
 - Inference overhead is measured against expected exploration savings.
-
-**Verification commands**
-
-- `cargo xtask task verify P15.4`
-- `cargo xtask task benchmark P15.4`
-- `cargo xtask task evidence-check P15.4`
-
-**Required evidence**
-
-- `evidence/tasks/P15.4/result.json`
-- `evidence/tasks/P15.4/commands.txt`
-- `evidence/tasks/P15.4/tests.txt`
-- `evidence/tasks/P15.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P15.5 — Implement the portfolio research scheduler
 
@@ -8817,24 +6388,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Schedule 1 million frontier items/s/core in batch mode.
 - Allocation overhead is below 1% of exploration compute.
 
-**Verification commands**
-
-- `cargo xtask task verify P15.5`
-- `cargo xtask task benchmark P15.5`
-- `cargo xtask task evidence-check P15.5`
-
-**Required evidence**
-
-- `evidence/tasks/P15.5/result.json`
-- `evidence/tasks/P15.5/commands.txt`
-- `evidence/tasks/P15.5/tests.txt`
-- `evidence/tasks/P15.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P15.6 — Gate and integrate learned proposal models
 
 **Phase:** P15  
@@ -8870,24 +6423,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Proposal inference respects configured budget and batching.
 - Verifier queue remains bounded under invalid-proposal bursts.
-
-**Verification commands**
-
-- `cargo xtask task verify P15.6`
-- `cargo xtask task benchmark P15.6`
-- `cargo xtask task evidence-check P15.6`
-
-**Required evidence**
-
-- `evidence/tasks/P15.6/result.json`
-- `evidence/tasks/P15.6/commands.txt`
-- `evidence/tasks/P15.6/tests.txt`
-- `evidence/tasks/P15.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ## P16 — Operator experience, hardening, and v1 release
 
@@ -8931,31 +6466,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - CLI startup p95 is under 50 ms for local metadata-only commands.
 - Status for 100,000 cells returns in under 2 seconds with pagination.
 
-**Verification commands**
-
-- `cargo xtask task verify P16.1`
-- `cargo xtask task benchmark P16.1`
-- `cargo xtask task evidence-check P16.1`
-
-**Required evidence**
-
-- `evidence/tasks/P16.1/result.json`
-- `evidence/tasks/P16.1/commands.txt`
-- `evidence/tasks/P16.1/tests.txt`
-- `evidence/tasks/P16.1/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P16.2 — Implement the thin operator API and dashboard data endpoints
 
 **Phase:** P16  
 **Dependencies:** P16.1, P4.3  
 **Size:** M  
 **Primary skill:** Rust web services  
-**Owned scope:** `reflexd`
+**Owned scope:** `reflex`
 
 **Purpose.** Expose remote control and observability without moving search or ML logic into the HTTP layer.
 
@@ -8984,24 +6501,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Read endpoint p95 is below 100 ms at dogfood scale.
 - API CPU is below 1% of fleet compute.
-
-**Verification commands**
-
-- `cargo xtask task verify P16.2`
-- `cargo xtask task benchmark P16.2`
-- `cargo xtask task evidence-check P16.2`
-
-**Required evidence**
-
-- `evidence/tasks/P16.2/result.json`
-- `evidence/tasks/P16.2/commands.txt`
-- `evidence/tasks/P16.2/tests.txt`
-- `evidence/tasks/P16.2/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P16.3 — Build canonical reports and explainability views
 
@@ -9039,28 +6538,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - M2A-style report regenerates under 30 seconds warm.
 - Report queries use bounded memory.
 
-**Verification commands**
-
-- `cargo xtask task verify P16.3`
-- `cargo xtask task benchmark P16.3`
-- `cargo xtask task evidence-check P16.3`
-
-**Required evidence**
-
-- `evidence/tasks/P16.3/result.json`
-- `evidence/tasks/P16.3/commands.txt`
-- `evidence/tasks/P16.3/tests.txt`
-- `evidence/tasks/P16.3/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P16.4 — Integrate tracing, OpenTelemetry, metrics, and profiling
 
 **Phase:** P16  
-**Dependencies:** P1.1, P11.3  
+**Dependencies:** P1.1, P5.3
 **Size:** L  
 **Primary skill:** Observability  
 **Owned scope:** `reflex-observability`
@@ -9078,7 +6559,7 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 1. Instrument experiment/cell/episode/search/domain/verifier/training/CAS/database boundaries with stable fields and IDs.
 2. Use sampled traces and counters/histograms; never emit one log line per candidate.
-3. Expose queue depths, CPU pools, inference, ledger, CAS, Postgres, Tigris, retries, and Machine lifecycle.
+3. Expose queue depths, CPU pools, inference, ledger, CAS, Postgres, retries, and worker lifecycle.
 4. Support on-demand CPU/heap profiles attached to evidence.
 
 **Acceptance criteria**
@@ -9093,28 +6574,10 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Default observability overhead is under 2% CPU.
 - Cardinality limits prevent per-state/candidate metrics.
 
-**Verification commands**
-
-- `cargo xtask task verify P16.4`
-- `cargo xtask task benchmark P16.4`
-- `cargo xtask task evidence-check P16.4`
-
-**Required evidence**
-
-- `evidence/tasks/P16.4/result.json`
-- `evidence/tasks/P16.4/commands.txt`
-- `evidence/tasks/P16.4/tests.txt`
-- `evidence/tasks/P16.4/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P16.5 — Complete property, fuzz, concurrency, and distributed fault testing
 
 **Phase:** P16  
-**Dependencies:** P11.9, P13.8  
+**Dependencies:** P9.5, P13.8
 **Size:** XL  
 **Primary skill:** Test engineering  
 **Owned scope:** `workspace tests`, `fuzz`
@@ -9147,31 +6610,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - Fast fuzz smoke fits deep CI; extended fuzz runs publish corpora nightly or manually.
 - Tests have bounded timeouts and no flakes across 100 repetitions.
 
-**Verification commands**
-
-- `cargo xtask task verify P16.5`
-- `cargo xtask task benchmark P16.5`
-- `cargo xtask task evidence-check P16.5`
-
-**Required evidence**
-
-- `evidence/tasks/P16.5/result.json`
-- `evidence/tasks/P16.5/commands.txt`
-- `evidence/tasks/P16.5/tests.txt`
-- `evidence/tasks/P16.5/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
 ### P16.6 — Harden verifier isolation, secrets, and untrusted domains
 
 **Phase:** P16  
-**Dependencies:** P5.5, P11.4  
+**Dependencies:** P5.5, P2.4
 **Size:** L  
 **Primary skill:** Security engineering  
-**Owned scope:** `reflex-runtime`, `reflex-worker`
+**Owned scope:** `reflex-runtime`, `reflex-domain-host`
 
 **Purpose.** Assume candidate generators and external domain processes can crash, hang, or behave maliciously without letting them corrupt authority or credentials.
 
@@ -9185,14 +6630,14 @@ The machine-readable manifest is authoritative for dependencies and required fie
 **Implementation steps**
 
 1. Run untrusted external processes with dedicated user, process group, rlimits/cgroups, bounded filesystem, no unnecessary network, and minimal environment.
-2. Keep Tigris/Postgres/Fly tokens scoped by role and out of child environments unless required.
+2. Give external verifier children no credentials and only the minimal declared environment.
 3. Validate all lengths and paths before allocation or file access.
 4. Document trust boundaries and remaining assumptions.
 
 **Acceptance criteria**
 
 - A fork bomb, memory bomb, oversized frame, path traversal, and secret-print fixture are contained or rejected.
-- Verifier and worker credentials are distinct where architecture permits.
+- External verifier children receive no framework or storage credentials.
 - Untrusted process cannot write accepted metadata directly.
 - Security failures are durable cell outcomes.
 
@@ -9200,24 +6645,6 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - Sandbox setup adds under 100 ms per persistent worker.
 - Limits do not reduce normal verifier throughput beyond accepted 3% overhead.
-
-**Verification commands**
-
-- `cargo xtask task verify P16.6`
-- `cargo xtask task benchmark P16.6`
-- `cargo xtask task evidence-check P16.6`
-
-**Required evidence**
-
-- `evidence/tasks/P16.6/result.json`
-- `evidence/tasks/P16.6/commands.txt`
-- `evidence/tasks/P16.6/tests.txt`
-- `evidence/tasks/P16.6/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P16.7 — Package releases and optional interoperability crates
 
@@ -9238,40 +6665,22 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 **Implementation steps**
 
-1. Publish reflex, reflexd, and reflex-worker binaries for Linux x86_64/aarch64 and macOS arm64 where supported.
-2. Build minimal worker/controller images pinned by digest.
+1. Publish the `reflex` binary for Linux x86_64/aarch64 and macOS arm64 where supported.
+2. Publish checksums and exact native compatibility metadata for each binary.
 3. Keep Python, ONNX, and libtorch adapters optional and disabled from v1 critical path; add them only after native release gates.
 4. Publish migration/compatibility policy.
 
 **Acceptance criteria**
 
 - Default cargo install path contains no Python runtime.
-- Images run as nonroot and include no build secrets.
+- Packaged binaries include no build secrets.
 - Checksums and SBOM verify.
 - Optional crates cannot alter core persisted semantics.
 
 **Performance acceptance**
 
-- Release worker image is kept small enough for fast Fly launches; target under 500 MiB compressed and justify increases.
+- Release worker image is kept small enough for fast startup; target under 500 MiB compressed and justify increases.
 - Binary startup and image pull appear in canary evidence.
-
-**Verification commands**
-
-- `cargo xtask task verify P16.7`
-- `cargo xtask task benchmark P16.7`
-- `cargo xtask task evidence-check P16.7`
-
-**Required evidence**
-
-- `evidence/tasks/P16.7/result.json`
-- `evidence/tasks/P16.7/commands.txt`
-- `evidence/tasks/P16.7/tests.txt`
-- `evidence/tasks/P16.7/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
 
 ### P16.8 — Run the v1 acceptance and handoff audit
 
@@ -9288,12 +6697,13 @@ The machine-readable manifest is authoritative for dependencies and required fie
 - invariant closure report
 - performance closure report
 - dogfood results
-- junior-agent handoff run
+- new-domain handoff run
 
 **Implementation steps**
 
-1. Close every blocking invariant and task evidence entry.
-2. Run local bit-vector, 20-worker Fly, Wrela, Lean M1.5/M2A/M2B, and knowledge-economy gates.
+1. Close every blocking invariant and acceptance criterion with executable or
+   reconstructable evidence.
+2. Run local bit-vector, portable multi-process fault, Wrela, Lean M1.5/M2A/M2B, and knowledge-economy gates.
 3. Have an engineer or coding agent unfamiliar with internals implement a small new domain using only public docs and record friction.
 4. Audit dependencies, security, backups, cleanup, and rollback.
 
@@ -9308,22 +6718,3 @@ The machine-readable manifest is authoritative for dependencies and required fie
 
 - All §5 v1 quantitative budgets pass on their named host classes or have accepted nonexpiring ADR replacements.
 - The full acceptance suite reports total CPU, wall, RSS, storage, and cost.
-
-**Verification commands**
-
-- `cargo xtask task verify P16.8`
-- `cargo xtask task benchmark P16.8`
-- `cargo xtask task evidence-check P16.8`
-
-**Required evidence**
-
-- `evidence/tasks/P16.8/result.json`
-- `evidence/tasks/P16.8/commands.txt`
-- `evidence/tasks/P16.8/tests.txt`
-- `evidence/tasks/P16.8/benchmarks.json`
-
-**Prohibited shortcuts**
-
-- Do not weaken an upstream invariant, acceptance criterion, evidence requirement, or performance budget to make this task pass.
-- Do not expand beyond the owned crates or introduce a new architectural dependency without an accepted ADR.
-
