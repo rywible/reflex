@@ -1,8 +1,0 @@
-{
-  "commit": "f524792-dirty",
-  "migrations": [
-    "sql/reports/0001_solve_rates.sql"
-  ],
-  "proto": "sha256:315bba1f5fb9157d01df18bbc0b55c65bf16efc3d48d99f835cb0ce03d9510ad",
-  "sql": "sha256:1806e926ccce514e38019dab3dd2a53e89f580d465bfabe096984a70d2abeeb0"
-}

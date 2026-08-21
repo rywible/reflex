@@ -1,9 +1,0 @@
-[package]
-name = "deny-unapproved-git-fixture"
-version = "0.0.0"
-edition = "2021"
-publish = false
-
-[dependencies]
-# Git sources are denied unless listed in deny.toml allow-git (P0.3 AC).
-serde = { git = "https://github.com/serde-rs/serde", rev = "v1.0.215" }
