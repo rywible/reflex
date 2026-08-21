@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v1";
 const CORPUS_NAME: &str = "unary-u8-xor-development-v1";
+const EXPECTED_SEMANTIC_OUTCOME: &str =
+    "8c5e4703787465fece63053886929642901c74fdbd02ff4412d0a15fca366130";
 const WARMUPS: u32 = 2;
 const REPLICATES: u32 = 10;
 const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -247,6 +249,14 @@ fn run_baseline(output: &Path) -> Result<(), AnyError> {
         deviations.push("semantic outcomes differed across assigned runs".into());
     }
     let semantic_outcome_sha256 = successful_digests.into_iter().next();
+    if semantic_outcome_sha256
+        .as_deref()
+        .is_some_and(|digest| digest != EXPECTED_SEMANTIC_OUTCOME)
+    {
+        deviations.push(format!(
+            "semantic outcome differs from frozen Bootstrap comparator {EXPECTED_SEMANTIC_OUTCOME}"
+        ));
+    }
     let summaries = summarize(&runs);
     let failures = runs.iter().filter(|run| run.failure.is_some()).count();
     let mut report = Report {
