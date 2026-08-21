@@ -165,6 +165,11 @@ where
             unique.push(artifact);
         }
     }
+    let recovered_keys = unique
+        .iter()
+        .take(recovered_replays)
+        .map(VerifiedArtifact::key)
+        .collect::<Vec<_>>();
 
     let goal_frontiers = request
         .goals
@@ -185,13 +190,24 @@ where
     }
     let success_conditions_satisfied =
         all_success_conditions_satisfied(domain, &request.goals, &goal_frontiers);
-    let completion = if observer(ParetoUpdate {
-        sequence: 1,
-        added: &pareto,
-        removed: &[],
-    })
-    .is_break()
-    {
+    let added = pareto
+        .iter()
+        .filter(|artifact| !recovered_keys.contains(&artifact.key()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = recovered_keys
+        .iter()
+        .filter(|key| !pareto.iter().any(|artifact| artifact.key() == **key))
+        .copied()
+        .collect::<Vec<_>>();
+    let stopped_by_observer = (!added.is_empty() || !removed.is_empty())
+        && observer(ParetoUpdate {
+            sequence: 1,
+            added: &added,
+            removed: &removed,
+        })
+        .is_break();
+    let completion = if stopped_by_observer {
         Completion::StoppedByObserver
     } else if success_conditions_satisfied {
         Completion::SuccessConditionsSatisfied

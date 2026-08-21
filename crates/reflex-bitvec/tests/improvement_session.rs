@@ -126,3 +126,63 @@ fn resume_rejects_corrupt_verification_metadata() {
     );
     std::fs::remove_file(bundle_path).ok();
 }
+
+#[test]
+fn resume_preserves_keys_and_observes_only_frontier_deltas() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-resume-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let make_request = |bundle| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::one(Expression::xor(
+                Expression::input(),
+                Expression::constant(0),
+            )),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(10_000).unwrap(),
+            ),
+            bundle,
+        )
+        .unwrap()
+    };
+    let fresh = improve(
+        BitVecDomain::unary_u8(),
+        make_request(BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+    let retained_key = fresh.pareto().artifacts()[0].key();
+
+    let mut update_count = 0;
+    let resumed = improve(
+        BitVecDomain::unary_u8(),
+        make_request(BundlePlan::Resume {
+            source: bundle_path.clone(),
+            target: bundle_path.clone(),
+        }),
+        |_| {
+            update_count += 1;
+            ControlFlow::Continue(())
+        },
+    )
+    .unwrap();
+
+    assert!(
+        resumed.pareto().artifacts()[0].key() == retained_key && update_count == 0,
+        "Resume reverifies retained state without reporting it as a new Pareto improvement"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
