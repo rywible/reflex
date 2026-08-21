@@ -1,0 +1,12 @@
+[package]
+name = "reflex-bitvec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reflex = { path = "../reflex" }
+
+[lints]
+workspace = true
