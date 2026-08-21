@@ -144,23 +144,32 @@ impl Expression {
     }
 
     fn subexpression(&self, root: u32) -> Self {
-        fn copy_node(source: &Expression, id: u32, output: &mut Vec<Node>) -> u32 {
+        fn copy_node(
+            source: &Expression,
+            id: u32,
+            output: &mut Vec<Node>,
+            copied: &mut HashMap<u32, u32>,
+        ) -> u32 {
+            if let Some(copied) = copied.get(&id) {
+                return *copied;
+            }
             let node = match source.nodes[id as usize] {
                 Node::Input => Node::Input,
                 Node::Constant(value) => Node::Constant(value),
                 Node::Xor(left, right) => {
-                    let new_left = copy_node(source, left, output);
-                    let new_right = copy_node(source, right, output);
+                    let new_left = copy_node(source, left, output, copied);
+                    let new_right = copy_node(source, right, output, copied);
                     Node::Xor(new_left, new_right)
                 }
             };
             let new_id = u32::try_from(output.len()).expect("expression exceeds u32 node IDs");
             output.push(node);
+            copied.insert(id, new_id);
             new_id
         }
 
         let mut nodes = Vec::new();
-        copy_node(self, root, &mut nodes);
+        copy_node(self, root, &mut nodes, &mut HashMap::new());
         Self { nodes }
     }
 

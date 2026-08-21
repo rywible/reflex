@@ -206,6 +206,99 @@ fn canonical_dedup_does_not_reverify_an_already_known_artifact() {
 }
 
 #[test]
+fn pareto_dominance_never_crosses_seed_relative_correctness_claims() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-seed-relative-pareto-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seeds = NonEmpty::try_from_iter([0, 1].map(|constant| {
+        Expression::xor(
+            Expression::xor(
+                Expression::xor(Expression::input(), Expression::constant(constant)),
+                Expression::constant(0),
+            ),
+            Expression::constant(0),
+        )
+    }))
+    .unwrap();
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(seeds),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    let artifacts = outcome.pareto().artifacts();
+
+    assert!(
+        artifacts.len() == 2
+            && artifacts[0].origin_key() != artifacts[1].origin_key()
+            && artifacts
+                .iter()
+                .any(|artifact| artifact.artifact().node_count() == 1)
+            && artifacts
+                .iter()
+                .any(|artifact| artifact.artifact().node_count() == 3),
+        "incomparable Correctness Claims require independent per-Seed Pareto retention"
+    );
+    let resume_seeds = NonEmpty::try_from_iter([0, 1].map(|constant| {
+        Expression::xor(
+            Expression::xor(
+                Expression::xor(Expression::input(), Expression::constant(constant)),
+                Expression::constant(0),
+            ),
+            Expression::constant(0),
+        )
+    }))
+    .unwrap();
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let resumed = improve(
+        BitVecDomain::unary_u8(),
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::new(resume_seeds),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(10_000).unwrap(),
+            ),
+            BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            },
+        )
+        .unwrap(),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+    assert_eq!(resumed.pareto().artifacts().len(), 2);
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
 fn verification_budget_stops_before_an_unaffordable_epoch() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-epoch-budget-{}-{}.bundle",

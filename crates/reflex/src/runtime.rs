@@ -1440,6 +1440,9 @@ fn dominates<D: DomainDefinition>(
     left: &VerifiedArtifact<D>,
     right: &VerifiedArtifact<D>,
 ) -> bool {
+    if left.origin_key() != right.origin_key() {
+        return false;
+    }
     let mut strictly_better = false;
     for objective in goal.objectives.iter() {
         let Some(left_value) = left
