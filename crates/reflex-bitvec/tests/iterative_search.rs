@@ -206,6 +206,50 @@ fn canonical_dedup_does_not_reverify_an_already_known_artifact() {
 }
 
 #[test]
+fn candidate_dedup_is_scoped_to_the_seed_relative_correctness_claim() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-claim-relative-dedup-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seeds = NonEmpty::try_from_iter(
+        [1, 2].map(|constant| Expression::xor(Expression::input(), Expression::constant(constant))),
+    )
+    .unwrap();
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(seeds),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        outcome.usage().verification_requests,
+        4,
+        "the same Candidate Artifact requires independent verdicts for distinct Correctness Claims"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
 fn pareto_dominance_never_crosses_seed_relative_correctness_claims() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-seed-relative-pareto-{}-{}.bundle",

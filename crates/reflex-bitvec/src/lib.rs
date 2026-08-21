@@ -544,11 +544,11 @@ impl ExpressionOperators {
     fn new() -> Self {
         Self {
             catalog: vec![
+                OperatorDescriptor::new(PrimitiveOperator::ProbeZero, SymbolId::new("probe-zero")),
                 OperatorDescriptor::new(
                     PrimitiveOperator::SimplifyXorIdentity,
                     SymbolId::new("simplify-xor-identity"),
                 ),
-                OperatorDescriptor::new(PrimitiveOperator::ProbeZero, SymbolId::new("probe-zero")),
             ],
         }
     }

@@ -7,6 +7,7 @@ pub mod measurement;
 pub mod session;
 
 mod durability;
+mod learning;
 mod resource;
 mod runtime;
 

@@ -61,16 +61,31 @@ impl ProductionResourceMeter {
     }
 
     pub(crate) fn time_exhausted(&self) -> Result<bool, ()> {
+        self.time_exhausted_against(self.elapsed_limit, self.cpu_limit)
+    }
+
+    pub(crate) fn search_time_exhausted(&self) -> Result<bool, ()> {
+        self.time_exhausted_against(
+            self.elapsed_limit.saturating_mul(4) / 5,
+            self.cpu_limit.saturating_mul(4) / 5,
+        )
+    }
+
+    fn time_exhausted_against(
+        &self,
+        elapsed_limit: Duration,
+        cpu_limit: Duration,
+    ) -> Result<bool, ()> {
         Ok(self
             .elapsed_before
             .get()
             .saturating_add(self.wall_started.elapsed())
-            >= self.elapsed_limit
+            >= elapsed_limit
             || self
                 .cpu_before
                 .get()
                 .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?)
-                >= self.cpu_limit)
+                >= cpu_limit)
     }
 
     pub(crate) fn usage(

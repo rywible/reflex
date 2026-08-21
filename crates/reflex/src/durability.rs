@@ -7,7 +7,6 @@ use atomic_write_file::AtomicWriteFile;
 use sha2::{Digest, Sha256};
 
 pub(crate) const MAGIC: &[u8; 8] = b"REFLEX\0\x03";
-const SEGMENT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -28,6 +27,13 @@ impl SegmentKind {
             4 => Ok(Self::Experience),
             5 => Ok(Self::Recovery),
             _ => Err(CodecError),
+        }
+    }
+
+    const fn current_version(self) -> u32 {
+        match self {
+            Self::Session | Self::Artifacts | Self::Recovery => 1,
+            Self::Revisions | Self::Experience => 2,
         }
     }
 }
@@ -189,7 +195,7 @@ pub(crate) fn seal(identity: &[u8], segments: &[Segment]) -> Result<Vec<u8>, Cod
     );
     for segment in segments {
         output.push(segment.kind as u8);
-        push_u32(&mut output, SEGMENT_VERSION);
+        push_u32(&mut output, segment.kind.current_version());
         push_bytes(&mut output, &segment.payload);
         output.extend_from_slice(&Sha256::digest(&segment.payload));
     }
@@ -220,7 +226,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedBundle, CodecError> {
     let mut prior = None;
     for _ in 0..count {
         let kind = SegmentKind::decode(take(&mut input, 1)?[0])?;
-        if prior.is_some_and(|prior| prior >= kind) || read_u32(&mut input)? != SEGMENT_VERSION {
+        if prior.is_some_and(|prior| prior >= kind)
+            || read_u32(&mut input)? != kind.current_version()
+        {
             return Err(CodecError);
         }
         prior = Some(kind);

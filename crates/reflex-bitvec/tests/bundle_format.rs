@@ -47,21 +47,95 @@ fn v3_bundle_segments_preserve_refuted_experience() {
     let segments = read_segments(&bytes);
     let experience = segments
         .iter()
-        .find(|(kind, _)| *kind == 4)
-        .map(|(_, payload)| *payload)
+        .find(|(kind, _, _)| *kind == 4)
+        .map(|(_, _, payload)| *payload)
         .unwrap();
     let count = u64::from_le_bytes(experience[..8].try_into().unwrap());
     let candidate_length =
-        usize::try_from(u64::from_le_bytes(experience[104..112].try_into().unwrap())).unwrap();
-    let verdict = experience[112 + candidate_length];
+        usize::try_from(u64::from_le_bytes(experience[168..176].try_into().unwrap())).unwrap();
+    let verdict = experience[176 + candidate_length];
 
     assert!(
         &bytes[..8] == b"REFLEX\0\x03"
-            && segments.iter().map(|(kind, _)| *kind).eq(1..=5)
+            && segments.iter().map(|(kind, _, _)| *kind).eq(1..=5)
+            && segments
+                .iter()
+                .map(|(_, version, _)| *version)
+                .eq([1, 2, 1, 2, 1])
             && count == 1
             && verdict == 2
             && outcome.usage().verification_requests == 2,
         "the canonical Experience segment retains an ordinary Refuted verdict"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn v3_experience_keeps_resource_admission_and_measurement_observations_separate() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-v3-delayed-observations-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(Expression::xor(
+            Expression::input(),
+            Expression::constant(0),
+        )),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+    improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    let bytes = std::fs::read(&bundle_path).unwrap();
+    let segments = read_segments(&bytes);
+    let mut experience = segments
+        .iter()
+        .find(|(kind, _, _)| *kind == 4)
+        .map(|(_, _, payload)| *payload)
+        .unwrap();
+    assert_eq!(read_u64(&mut experience), 1);
+    experience = &experience[160..];
+    let candidate_length = usize::try_from(read_u64(&mut experience)).unwrap();
+    experience = &experience[candidate_length..];
+    assert_eq!(experience[0], 1);
+    experience = &experience[1..];
+    let operator_length = usize::try_from(read_u64(&mut experience)).unwrap();
+    experience = &experience[operator_length + 16 * 4..];
+    let verification_requests = read_u32(&mut experience);
+    let _epoch = read_u64(&mut experience);
+    let consequence_count = usize::try_from(read_u64(&mut experience)).unwrap();
+    experience = &experience[consequence_count * 33..];
+    let measurement_count = read_u64(&mut experience);
+    experience = &experience[32..];
+    let environment_length = usize::try_from(read_u64(&mut experience)).unwrap();
+    experience = &experience[environment_length..];
+    let value_count = read_u64(&mut experience);
+
+    assert!(
+        verification_requests == 1
+            && consequence_count >= 3
+            && measurement_count == 1
+            && environment_length > 0
+            && value_count == 4,
+        "the immutable attempt, delayed consequences, and encoded Measurements remain distinct records"
     );
     std::fs::remove_file(bundle_path).ok();
 }
@@ -124,7 +198,109 @@ fn resume_rejects_a_bad_segment_checksum_even_with_a_valid_file_checksum() {
     std::fs::remove_file(bundle_path).ok();
 }
 
-fn read_segments(mut bytes: &[u8]) -> Vec<(u8, &[u8])> {
+#[test]
+fn resume_rejects_unknown_segment_versions_and_model_digest_mismatches() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-v3-schema-integrity-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let make_request = |bundle| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::one(Expression::xor(
+                Expression::input(),
+                Expression::constant(1),
+            )),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(10_000).unwrap(),
+            ),
+            bundle,
+        )
+        .unwrap()
+    };
+    improve(
+        BitVecDomain::unary_u8(),
+        make_request(BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+    let valid = std::fs::read(&bundle_path).unwrap();
+
+    let mut bad_version = valid.clone();
+    let (version, _, _, _) = segment_location(&bad_version, 4);
+    bad_version[version..version + 4].copy_from_slice(&99_u32.to_le_bytes());
+    refresh_file_checksum(&mut bad_version);
+    std::fs::write(&bundle_path, bad_version).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::CorruptBundle)
+    ));
+
+    let mut false_verdict = valid.clone();
+    let (_, payload, length, checksum) = segment_location(&false_verdict, 4);
+    let candidate_length = usize::try_from(u64::from_le_bytes(
+        false_verdict[payload + 168..payload + 176]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    false_verdict[payload + 176 + candidate_length] = 1;
+    let segment_digest = Sha256::digest(&false_verdict[payload..payload + length]);
+    false_verdict[checksum..checksum + 32].copy_from_slice(&segment_digest);
+    refresh_file_checksum(&mut false_verdict);
+    std::fs::write(&bundle_path, false_verdict).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::CorruptBundle)
+    ));
+
+    let mut bad_model_digest = valid;
+    let (_, payload, length, checksum) = segment_location(&bad_model_digest, 2);
+    bad_model_digest[payload + 32] ^= 0xff;
+    let segment_digest = Sha256::digest(&bad_model_digest[payload..payload + length]);
+    bad_model_digest[checksum..checksum + 32].copy_from_slice(&segment_digest);
+    refresh_file_checksum(&mut bad_model_digest);
+    std::fs::write(&bundle_path, bad_model_digest).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::CorruptBundle)
+    ));
+    std::fs::remove_file(bundle_path).ok();
+}
+
+fn read_segments(mut bytes: &[u8]) -> Vec<(u8, u32, &[u8])> {
     bytes = &bytes[8..];
     let identity_length = usize::try_from(read_u64(&mut bytes)).unwrap();
     bytes = &bytes[identity_length..];
@@ -133,16 +309,20 @@ fn read_segments(mut bytes: &[u8]) -> Vec<(u8, &[u8])> {
     for _ in 0..count {
         let kind = bytes[0];
         bytes = &bytes[1..];
-        assert_eq!(read_u32(&mut bytes), 1);
+        let version = read_u32(&mut bytes);
         let length = usize::try_from(read_u64(&mut bytes)).unwrap();
         let (payload, remainder) = bytes.split_at(length);
-        segments.push((kind, payload));
+        segments.push((kind, version, payload));
         bytes = &remainder[32..];
     }
     segments
 }
 
 fn segment_checksum_offset(bytes: &[u8], expected_kind: u8) -> usize {
+    segment_location(bytes, expected_kind).3
+}
+
+fn segment_location(bytes: &[u8], expected_kind: u8) -> (usize, usize, usize, usize) {
     let mut offset = 8;
     let identity_length = usize::try_from(u64::from_le_bytes(
         bytes[offset..offset + 8].try_into().unwrap(),
@@ -153,18 +333,28 @@ fn segment_checksum_offset(bytes: &[u8], expected_kind: u8) -> usize {
     offset += 4;
     for _ in 0..count {
         let kind = bytes[offset];
-        offset += 1 + 4;
+        offset += 1;
+        let version_offset = offset;
+        offset += 4;
         let length = usize::try_from(u64::from_le_bytes(
             bytes[offset..offset + 8].try_into().unwrap(),
         ))
         .unwrap();
-        offset += 8 + length;
+        offset += 8;
+        let payload_offset = offset;
+        offset += length;
         if kind == expected_kind {
-            return offset;
+            return (version_offset, payload_offset, length, offset);
         }
         offset += 32;
     }
     panic!("missing segment kind {expected_kind}")
+}
+
+fn refresh_file_checksum(bytes: &mut [u8]) {
+    let content_length = bytes.len() - 32;
+    let checksum = Sha256::digest(&bytes[..content_length]);
+    bytes[content_length..].copy_from_slice(&checksum);
 }
 
 fn read_u32(bytes: &mut &[u8]) -> u32 {

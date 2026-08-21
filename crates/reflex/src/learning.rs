@@ -1,0 +1,1023 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use sha2::{Digest, Sha256};
+
+pub(crate) const FEATURE_COUNT: usize = 16;
+pub(crate) const HEAD_COUNT: usize = 7;
+const FEATURE_REVISION: u32 = 1;
+const TARGET_REVISION: u32 = 1;
+const CALIBRATION_REVISION: u32 = 1;
+const MAX_REPLAY_BATCH: usize = 16_384;
+const TRAINING_EPOCHS: usize = 8;
+const MAX_SELECTION_USES: u8 = 3;
+const MIN_SELECTION_CASES: usize = 8;
+const MAX_SPECIALISTS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Features(pub(crate) [f32; FEATURE_COUNT]);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Targets(pub(crate) [f32; HEAD_COUNT]);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Forecast {
+    pub(crate) estimate: f32,
+    pub(crate) calibration_error: f32,
+    pub(crate) uncertainty: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PotentialForecast(pub(crate) [Forecast; HEAD_COUNT]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerdictTarget {
+    Accepted,
+    Refuted,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptObservation {
+    pub(crate) id: [u8; 32],
+    pub(crate) artifact: [u8; 32],
+    pub(crate) claim: [u8; 32],
+    pub(crate) parent: [u8; 32],
+    pub(crate) features: Features,
+    pub(crate) verdict: VerdictTarget,
+    pub(crate) verification_cost: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConsequenceKind {
+    Admitted,
+    ParetoImprovement,
+    CrossGoalUse,
+    Compression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConsequenceObservation {
+    pub(crate) subject: [u8; 32],
+    pub(crate) kind: ConsequenceKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CorpusRole {
+    Replay,
+    Selection { uses: u8 },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TrainingExample {
+    pub(crate) key: [u8; 32],
+    pub(crate) corpus_key: [u8; 32],
+    pub(crate) features: Features,
+    pub(crate) targets: Targets,
+    pub(crate) role: CorpusRole,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FtrlModel {
+    z: [[f32; FEATURE_COUNT]; HEAD_COUNT],
+    n: [[f32; FEATURE_COUNT]; HEAD_COUNT],
+    calibration_count: [u64; HEAD_COUNT],
+    calibration_error: [f32; HEAD_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromotionDecision {
+    Promote,
+    Specialist,
+    Reject,
+    Rollback,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LearningState {
+    generation: u64,
+    champion: Option<FtrlModel>,
+    predecessor: Option<FtrlModel>,
+    predecessor_is_bootstrap: bool,
+    specialists: Vec<FtrlModel>,
+    roles: BTreeMap<[u8; 32], CorpusRole>,
+}
+
+impl LearningState {
+    pub(crate) fn pinned_model(&self) -> Option<&FtrlModel> {
+        self.champion.as_ref()
+    }
+
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let inline = std::mem::size_of_val(self) as u64;
+        let specialists = (self.specialists.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<FtrlModel>() as u64);
+        let corpus_index = (self.roles.len() as u64).saturating_mul(128);
+        inline
+            .saturating_add(specialists)
+            .saturating_add(corpus_index)
+    }
+
+    pub(crate) fn corpus_is_valid(&self, attempts: &[([u8; 32], [u8; 32])]) -> bool {
+        self.roles
+            .keys()
+            .all(|key| attempts.iter().any(|(_, corpus)| corpus == key))
+    }
+
+    pub(crate) fn training_scratch_bytes(example_count: usize) -> u64 {
+        let total = example_count as u64;
+        let retained = example_count.min(MAX_REPLAY_BATCH) as u64;
+        let example = std::mem::size_of::<TrainingExample>() as u64;
+        total
+            .saturating_mul(example)
+            .saturating_add(retained.saturating_mul(example).saturating_mul(2))
+            .saturating_add(retained.saturating_mul(192))
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
+    fn specialist_count(&self) -> usize {
+        self.specialists.len()
+    }
+
+    pub(crate) fn learn(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
+        for example in examples.iter_mut() {
+            example.role = *self
+                .roles
+                .entry(example.corpus_key)
+                .or_insert_with(|| assign_role(example.corpus_key));
+        }
+        let selection = bounded_corpus(examples, true);
+        if self.champion.is_some() {
+            let predecessor = if self.predecessor_is_bootstrap {
+                Some(FtrlModel::zero())
+            } else {
+                self.predecessor.clone()
+            };
+            if predecessor.as_ref().is_some_and(|predecessor| {
+                compare_models(
+                    self.champion.as_ref().expect("the champion exists"),
+                    predecessor,
+                    &selection,
+                ) == PromotionDecision::Promote
+            }) {
+                let decision = self.rollback();
+                self.finish_selection(examples);
+                return decision;
+            }
+        }
+        let replay = bounded_corpus(examples, false);
+        let mut challenger = FtrlModel::zero();
+        for _ in 0..TRAINING_EPOCHS {
+            for example in &replay {
+                challenger.update(example);
+            }
+        }
+        let champion = self.champion.clone().unwrap_or_else(FtrlModel::zero);
+        let decision = compare_models(&champion, &challenger, &selection);
+        match decision {
+            PromotionDecision::Promote => {
+                self.predecessor = self.champion.replace(challenger);
+                self.predecessor_is_bootstrap = self.predecessor.is_none();
+                self.generation = self.generation.saturating_add(1);
+            }
+            PromotionDecision::Specialist => {
+                self.retain_specialist(challenger);
+            }
+            PromotionDecision::Reject | PromotionDecision::Rollback => {}
+        }
+        self.finish_selection(examples);
+        decision
+    }
+
+    fn finish_selection(&mut self, examples: &mut [TrainingExample]) {
+        rotate_selection(examples, MAX_SELECTION_USES);
+        for example in examples {
+            self.roles.insert(example.corpus_key, example.role);
+        }
+    }
+
+    pub(crate) fn rollback(&mut self) -> PromotionDecision {
+        if self.predecessor_is_bootstrap {
+            if let Some(regressed) = self.champion.take() {
+                self.retain_specialist(regressed);
+            }
+            self.predecessor_is_bootstrap = false;
+            self.generation = self.generation.saturating_add(1);
+            return PromotionDecision::Rollback;
+        }
+        let Some(predecessor) = self.predecessor.take() else {
+            return PromotionDecision::Reject;
+        };
+        if let Some(regressed) = self.champion.replace(predecessor) {
+            self.retain_specialist(regressed);
+        }
+        self.generation = self.generation.saturating_add(1);
+        PromotionDecision::Rollback
+    }
+
+    fn retain_specialist(&mut self, specialist: FtrlModel) {
+        if !self
+            .specialists
+            .iter()
+            .any(|model| revision_digest(model) == revision_digest(&specialist))
+        {
+            self.specialists.push(specialist);
+            if self.specialists.len() > MAX_SPECIALISTS {
+                self.specialists.remove(0);
+            }
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(b"RFLS\x02");
+        output.extend_from_slice(&self.generation.to_le_bytes());
+        push_model(&mut output, self.champion.as_ref());
+        match (&self.predecessor, self.predecessor_is_bootstrap) {
+            (None, false) => output.push(0),
+            (None, true) => output.push(1),
+            (Some(model), false) => {
+                output.push(2);
+                push_bytes(&mut output, &model.encode());
+            }
+            (Some(_), true) => unreachable!("a predecessor cannot be Bootstrap and learned"),
+        }
+        output.extend_from_slice(&(self.specialists.len() as u64).to_le_bytes());
+        for specialist in &self.specialists {
+            push_bytes(&mut output, &specialist.encode());
+        }
+        output.extend_from_slice(&(self.roles.len() as u64).to_le_bytes());
+        for (key, role) in &self.roles {
+            output.extend_from_slice(key);
+            match role {
+                CorpusRole::Replay => output.push(0),
+                CorpusRole::Selection { uses } => {
+                    output.push(1);
+                    output.push(*uses);
+                }
+            }
+        }
+        output
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ()> {
+        let mut input = bytes;
+        if take(&mut input, 5)? != b"RFLS\x02" {
+            return Err(());
+        }
+        let generation = read_u64(&mut input)?;
+        let champion = read_model(&mut input)?;
+        let (predecessor, predecessor_is_bootstrap) = match take(&mut input, 1)?[0] {
+            0 => (None, false),
+            1 => (None, true),
+            2 => (Some(FtrlModel::decode(take_sized(&mut input)?)?), false),
+            _ => return Err(()),
+        };
+        let specialist_count = usize::try_from(read_u64(&mut input)?).map_err(|_| ())?;
+        if specialist_count
+            > input
+                .len()
+                .saturating_div(5 + HEAD_COUNT * FEATURE_COUNT * 8 + 8)
+        {
+            return Err(());
+        }
+        let mut specialists = Vec::with_capacity(specialist_count);
+        for _ in 0..specialist_count {
+            specialists.push(FtrlModel::decode(take_sized(&mut input)?)?);
+        }
+        let role_count = usize::try_from(read_u64(&mut input)?).map_err(|_| ())?;
+        if role_count > input.len().saturating_div(33) {
+            return Err(());
+        }
+        let mut roles = BTreeMap::new();
+        for _ in 0..role_count {
+            let key: [u8; 32] = take(&mut input, 32)?.try_into().unwrap();
+            let role = match take(&mut input, 1)?[0] {
+                0 => CorpusRole::Replay,
+                1 => {
+                    let uses = take(&mut input, 1)?[0];
+                    if uses >= 3 {
+                        return Err(());
+                    }
+                    CorpusRole::Selection { uses }
+                }
+                _ => return Err(()),
+            };
+            if roles.insert(key, role).is_some() {
+                return Err(());
+            }
+        }
+        if !input.is_empty()
+            || generation == 0
+                && (champion.is_some()
+                    || predecessor.is_some()
+                    || predecessor_is_bootstrap
+                    || !specialists.is_empty())
+            || generation > 0 && champion.is_none() && specialists.is_empty()
+            || champion.is_none() && (predecessor.is_some() || predecessor_is_bootstrap)
+            || champion.as_ref().is_some_and(|champion| {
+                predecessor.as_ref().is_some_and(|predecessor| {
+                    revision_digest(champion) == revision_digest(predecessor)
+                })
+            })
+            || specialists.iter().any(|specialist| {
+                champion.as_ref().is_some_and(|champion| {
+                    revision_digest(champion) == revision_digest(specialist)
+                }) || predecessor.as_ref().is_some_and(|predecessor| {
+                    revision_digest(predecessor) == revision_digest(specialist)
+                })
+            })
+            || specialists.iter().enumerate().any(|(index, specialist)| {
+                specialists[index + 1..]
+                    .iter()
+                    .any(|other| revision_digest(specialist) == revision_digest(other))
+            })
+        {
+            return Err(());
+        }
+        Ok(Self {
+            generation,
+            champion,
+            predecessor,
+            predecessor_is_bootstrap,
+            specialists,
+            roles,
+        })
+    }
+
+    pub(crate) fn revision_digest(&self, semantic_identity: &str) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"reflex-model-revision-v2\0");
+        digest.update((semantic_identity.len() as u64).to_le_bytes());
+        digest.update(semantic_identity.as_bytes());
+        match &self.champion {
+            Some(champion) => {
+                digest.update([1]);
+                digest.update(champion.encode());
+            }
+            None => digest.update([0]),
+        }
+        digest.finalize().into()
+    }
+}
+
+impl FtrlModel {
+    pub(crate) fn zero() -> Self {
+        Self {
+            z: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
+            n: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
+            calibration_count: [0; HEAD_COUNT],
+            calibration_error: [0.0; HEAD_COUNT],
+        }
+    }
+
+    fn predict(&self, features: Features) -> Targets {
+        let mut predictions = [0.0; HEAD_COUNT];
+        for (head, prediction) in predictions.iter_mut().enumerate() {
+            let weights = self.weights(head);
+            let linear = weights
+                .iter()
+                .zip(features.0)
+                .map(|(weight, feature)| weight * feature)
+                .sum::<f32>();
+            *prediction = sigmoid(linear);
+        }
+        Targets(predictions)
+    }
+
+    pub(crate) fn forecast(&self, features: Features) -> PotentialForecast {
+        let estimates = self.predict(features);
+        PotentialForecast(std::array::from_fn(|head| {
+            let support = self.n[head]
+                .iter()
+                .zip(features.0)
+                .map(|(accumulated_gradient, feature)| accumulated_gradient * feature * feature)
+                .sum::<f32>();
+            let epistemic = (1.0 / (1.0 + support.max(0.0))).sqrt();
+            let calibration_error = if self.calibration_count[head] == 0 {
+                1.0
+            } else {
+                self.calibration_error[head]
+            };
+            Forecast {
+                estimate: estimates.0[head],
+                calibration_error,
+                uncertainty: epistemic.max(calibration_error).clamp(0.0, 1.0),
+            }
+        }))
+    }
+
+    pub(crate) fn update(&mut self, example: &TrainingExample) {
+        const ALPHA: f32 = 0.1;
+        if !example.features.0.iter().all(|value| value.is_finite())
+            || !example
+                .targets
+                .0
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        {
+            return;
+        }
+        let predictions = self.predict(example.features);
+        for head in 0..HEAD_COUNT {
+            let weights = self.weights(head);
+            for (index, (feature, weight)) in
+                example.features.0.iter().copied().zip(weights).enumerate()
+            {
+                let gradient = (predictions.0[head] - example.targets.0[head]) * feature;
+                let sigma = ((self.n[head][index] + gradient * gradient).sqrt()
+                    - self.n[head][index].sqrt())
+                    / ALPHA;
+                self.z[head][index] += gradient - sigma * weight;
+                self.n[head][index] += gradient * gradient;
+            }
+            self.calibration_count[head] = self.calibration_count[head].saturating_add(1);
+            let count = f32::from(u16::try_from(self.calibration_count[head]).unwrap_or(u16::MAX));
+            let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
+            self.calibration_error[head] += (absolute_error - self.calibration_error[head]) / count;
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(17 + HEAD_COUNT * (FEATURE_COUNT * 8 + 12));
+        output.extend_from_slice(b"RFLM\x02");
+        output.extend_from_slice(&FEATURE_REVISION.to_le_bytes());
+        output.extend_from_slice(&TARGET_REVISION.to_le_bytes());
+        output.extend_from_slice(&CALIBRATION_REVISION.to_le_bytes());
+        for values in [&self.z, &self.n] {
+            for head in values {
+                for value in head {
+                    output.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for count in self.calibration_count {
+            output.extend_from_slice(&count.to_le_bytes());
+        }
+        for error in self.calibration_error {
+            output.extend_from_slice(&error.to_bits().to_le_bytes());
+        }
+        output
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ()> {
+        let expected = 17 + HEAD_COUNT * (FEATURE_COUNT * 8 + 12);
+        if bytes.len() != expected || &bytes[..5] != b"RFLM\x02" {
+            return Err(());
+        }
+        let mut input = &bytes[5..];
+        if read_u32(&mut input)? != FEATURE_REVISION
+            || read_u32(&mut input)? != TARGET_REVISION
+            || read_u32(&mut input)? != CALIBRATION_REVISION
+        {
+            return Err(());
+        }
+        let mut model = Self::zero();
+        for (state_index, values) in [&mut model.z, &mut model.n].into_iter().enumerate() {
+            for head in values {
+                for value in head {
+                    let (encoded, remainder) = input.split_at(4);
+                    input = remainder;
+                    *value = f32::from_bits(u32::from_le_bytes(encoded.try_into().unwrap()));
+                    if !value.is_finite() || state_index == 1 && *value < 0.0 {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        for count in &mut model.calibration_count {
+            *count = read_u64(&mut input)?;
+        }
+        for (count, error) in model
+            .calibration_count
+            .iter()
+            .zip(&mut model.calibration_error)
+        {
+            *error = f32::from_bits(read_u32(&mut input)?);
+            if !error.is_finite() || !(0.0..=1.0).contains(error) || *count == 0 && *error != 0.0 {
+                return Err(());
+            }
+        }
+        if !input.is_empty() {
+            return Err(());
+        }
+        Ok(model)
+    }
+
+    fn weights(&self, head: usize) -> [f32; FEATURE_COUNT] {
+        const ALPHA: f32 = 0.1;
+        const BETA: f32 = 1.0;
+        const L1: f32 = 0.0;
+        const L2: f32 = 1.0;
+        std::array::from_fn(|index| {
+            let z = self.z[head][index];
+            if z.abs() <= L1 {
+                0.0
+            } else {
+                -(z - z.signum() * L1) / ((BETA + self.n[head][index].sqrt()) / ALPHA + L2)
+            }
+        })
+    }
+}
+
+pub(crate) fn derive_targets(
+    attempts: &[AttemptObservation],
+    consequences: &[ConsequenceObservation],
+) -> Vec<TrainingExample> {
+    let mut consequence_flags = HashMap::<[u8; 32], u8>::new();
+    for consequence in consequences {
+        let flag = match consequence.kind {
+            ConsequenceKind::Admitted => 1,
+            ConsequenceKind::ParetoImprovement => 2,
+            ConsequenceKind::CrossGoalUse => 4,
+            ConsequenceKind::Compression => 8,
+        };
+        *consequence_flags.entry(consequence.subject).or_default() |= flag;
+    }
+    let mut accepted_children = HashMap::<([u8; 32], [u8; 32]), usize>::new();
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.verdict == VerdictTarget::Accepted)
+    {
+        *accepted_children
+            .entry((attempt.parent, attempt.claim))
+            .or_default() += 1;
+    }
+    attempts
+        .iter()
+        .map(|attempt| {
+            let accepted = attempt.verdict == VerdictTarget::Accepted;
+            let flags = consequence_flags.get(&attempt.id).copied().unwrap_or(0);
+            let has = |kind| {
+                flags
+                    & match kind {
+                        ConsequenceKind::Admitted => 1,
+                        ConsequenceKind::ParetoImprovement => 2,
+                        ConsequenceKind::CrossGoalUse => 4,
+                        ConsequenceKind::Compression => 8,
+                    }
+                    != 0
+            };
+            let descendants = accepted_children
+                .get(&(attempt.artifact, attempt.claim))
+                .copied()
+                .unwrap_or(0);
+            let immediate = accepted
+                && (has(ConsequenceKind::Admitted) || has(ConsequenceKind::ParetoImprovement));
+            let dead_end = !accepted || (descendants == 0 && !immediate);
+            TrainingExample {
+                key: attempt.id,
+                corpus_key: attempt.claim,
+                features: attempt.features,
+                targets: Targets([
+                    f32::from(immediate),
+                    f32::from(u8::try_from(descendants.min(4)).unwrap()) / 4.0,
+                    f32::from(has(ConsequenceKind::CrossGoalUse)),
+                    f32::from(has(ConsequenceKind::Compression)),
+                    f32::from(accepted),
+                    (attempt.verification_cost / 16.0).clamp(0.0, 1.0),
+                    f32::from(dead_end),
+                ]),
+                role: assign_role(attempt.claim),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn assign_role(key: [u8; 32]) -> CorpusRole {
+    if key[0].is_multiple_of(5) {
+        CorpusRole::Selection { uses: 0 }
+    } else {
+        CorpusRole::Replay
+    }
+}
+
+pub(crate) fn rotate_selection(examples: &mut [TrainingExample], maximum_uses: u8) {
+    for example in examples {
+        if let CorpusRole::Selection { uses } = &mut example.role {
+            *uses = uses.saturating_add(1);
+            if *uses >= maximum_uses {
+                example.role = CorpusRole::Replay;
+            }
+        }
+    }
+}
+
+fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<TrainingExample> {
+    let eligible = |example: &&TrainingExample| {
+        matches!(example.role, CorpusRole::Selection { .. }) == selection
+    };
+    let capacity = MAX_REPLAY_BATCH.min(examples.len());
+    let mut groups = HashSet::<[u8; 32]>::with_capacity(capacity);
+    let mut selected_keys = HashSet::<[u8; 32]>::with_capacity(capacity);
+    let mut corpus = Vec::with_capacity(capacity);
+    for example in examples.iter().filter(eligible) {
+        if groups.insert(example.corpus_key) {
+            selected_keys.insert(example.key);
+            corpus.push(example.clone());
+            if corpus.len() == MAX_REPLAY_BATCH {
+                break;
+            }
+        }
+    }
+    if corpus.len() < MAX_REPLAY_BATCH {
+        for example in examples.iter().filter(eligible) {
+            if groups.contains(&example.corpus_key) && selected_keys.insert(example.key) {
+                corpus.push(example.clone());
+                if corpus.len() == MAX_REPLAY_BATCH {
+                    break;
+                }
+            }
+        }
+    }
+    corpus.sort_unstable_by_key(|example| example.key);
+    corpus
+}
+
+pub(crate) fn compare_models(
+    champion: &FtrlModel,
+    challenger: &FtrlModel,
+    selection: &[TrainingExample],
+) -> PromotionDecision {
+    if selection
+        .iter()
+        .map(|example| example.corpus_key)
+        .collect::<BTreeSet<_>>()
+        .len()
+        < MIN_SELECTION_CASES
+    {
+        return PromotionDecision::Reject;
+    }
+    let champion_loss = losses(champion, selection);
+    let challenger_loss = losses(challenger, selection);
+    let improved = challenger_loss
+        .iter()
+        .zip(champion_loss)
+        .filter(|(challenger, champion)| **challenger < *champion * 0.98)
+        .count();
+    let protected_regression = challenger_loss
+        .iter()
+        .zip(champion_loss)
+        .any(|(challenger, champion)| *challenger > champion * 1.05 + f32::EPSILON);
+    let champion_total = champion_loss.iter().sum::<f32>();
+    let challenger_total = challenger_loss.iter().sum::<f32>();
+    if !protected_regression && challenger_total < champion_total * 0.99 {
+        PromotionDecision::Promote
+    } else if improved > 0 {
+        PromotionDecision::Specialist
+    } else {
+        PromotionDecision::Reject
+    }
+}
+
+pub(crate) fn revision_digest(model: &FtrlModel) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"reflex-ftrl-model-revision-v2\0");
+    digest.update(model.encode());
+    digest.finalize().into()
+}
+
+fn losses(model: &FtrlModel, selection: &[TrainingExample]) -> [f32; HEAD_COUNT] {
+    let mut groups = BTreeMap::<[u8; 32], ([f32; HEAD_COUNT], u32)>::new();
+    for example in selection {
+        let prediction = model.predict(example.features);
+        let group = groups
+            .entry(example.corpus_key)
+            .or_insert(([0.0; HEAD_COUNT], 0));
+        group.1 = group.1.saturating_add(1);
+        for (head, loss) in group.0.iter_mut().enumerate() {
+            let error = prediction.0[head] - example.targets.0[head];
+            *loss += error * error;
+        }
+    }
+    let mut losses = [0.0; HEAD_COUNT];
+    for (group_losses, count) in groups.values() {
+        let count = f32::from(u16::try_from(*count).unwrap_or(u16::MAX));
+        for (loss, group_loss) in losses.iter_mut().zip(group_losses) {
+            *loss += group_loss / count;
+        }
+    }
+    let group_count = f32::from(u16::try_from(groups.len()).unwrap_or(u16::MAX));
+    for loss in &mut losses {
+        *loss /= group_count;
+    }
+    losses
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exponential = value.exp();
+        exponential / (1.0 + exponential)
+    }
+}
+
+fn push_model(output: &mut Vec<u8>, model: Option<&FtrlModel>) {
+    match model {
+        Some(model) => {
+            output.push(1);
+            push_bytes(output, &model.encode());
+        }
+        None => output.push(0),
+    }
+}
+
+fn read_model(input: &mut &[u8]) -> Result<Option<FtrlModel>, ()> {
+    match take(input, 1)?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(FtrlModel::decode(take_sized(input)?)?)),
+        _ => Err(()),
+    }
+}
+
+fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn read_u64(input: &mut &[u8]) -> Result<u64, ()> {
+    Ok(u64::from_le_bytes(take(input, 8)?.try_into().unwrap()))
+}
+
+fn read_u32(input: &mut &[u8]) -> Result<u32, ()> {
+    Ok(u32::from_le_bytes(take(input, 4)?.try_into().unwrap()))
+}
+
+fn take_sized<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], ()> {
+    let length = usize::try_from(read_u64(input)?).map_err(|_| ())?;
+    take(input, length)
+}
+
+fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], ()> {
+    if input.len() < count {
+        return Err(());
+    }
+    let (value, remainder) = input.split_at(count);
+    *input = remainder;
+    Ok(value)
+}
+
+#[cfg(test)]
+fn target_map(examples: &[TrainingExample]) -> BTreeMap<[u8; 32], Targets> {
+    examples
+        .iter()
+        .map(|example| (example.key, example.targets))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn features(operator_bucket: usize) -> Features {
+        let mut values = [0.0; FEATURE_COUNT];
+        values[0] = 1.0;
+        values[4 + operator_bucket] = 1.0;
+        Features(values)
+    }
+
+    fn example(key: u8, bucket: usize, accepted: bool, role: CorpusRole) -> TrainingExample {
+        let mut targets = [0.0; HEAD_COUNT];
+        targets[0] = f32::from(accepted);
+        targets[6] = f32::from(!accepted);
+        TrainingExample {
+            key: [key; 32],
+            corpus_key: [key; 32],
+            features: features(bucket),
+            targets: Targets(targets),
+            role,
+        }
+    }
+
+    #[test]
+    fn ftrl_updates_raise_observed_probability_and_reject_non_finite_state() {
+        let sample = example(1, 0, true, CorpusRole::Replay);
+        let mut model = FtrlModel::zero();
+        let before = model.predict(sample.features).0[0];
+        model.update(&sample);
+        let after = model.predict(sample.features).0[0];
+        let forecast = model.forecast(sample.features).0[0];
+        let encoded = model.encode();
+
+        assert!(
+            (before - 0.5).abs() < f32::EPSILON
+                && after > before
+                && (model.z[0][0] + 0.5).abs() < f32::EPSILON
+                && (model.n[0][0] - 0.25).abs() < f32::EPSILON
+                && forecast.calibration_error.is_finite()
+                && forecast.uncertainty < 1.0
+                && FtrlModel::decode(&encoded)
+                    .unwrap()
+                    .predict(sample.features)
+                    == model.predict(sample.features)
+        );
+        let mut malformed = encoded;
+        malformed[17..21].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        assert!(FtrlModel::decode(&malformed).is_err());
+        let mut incompatible = model.encode();
+        incompatible[5..9].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(FtrlModel::decode(&incompatible).is_err());
+    }
+
+    #[test]
+    fn delayed_descendants_revise_targets_without_mutating_attempts() {
+        let parent = AttemptObservation {
+            id: [1; 32],
+            artifact: [11; 32],
+            claim: [21; 32],
+            parent: [0; 32],
+            features: features(0),
+            verdict: VerdictTarget::Accepted,
+            verification_cost: 1.0,
+        };
+        let child = AttemptObservation {
+            id: [2; 32],
+            artifact: [12; 32],
+            claim: parent.claim,
+            parent: parent.artifact,
+            features: features(0),
+            verdict: VerdictTarget::Accepted,
+            verification_cost: 1.0,
+        };
+        let before = derive_targets(std::slice::from_ref(&parent), &[]);
+        let after = derive_targets(
+            &[parent.clone(), child],
+            &[
+                ConsequenceObservation {
+                    subject: parent.id,
+                    kind: ConsequenceKind::Admitted,
+                },
+                ConsequenceObservation {
+                    subject: parent.id,
+                    kind: ConsequenceKind::ParetoImprovement,
+                },
+            ],
+        );
+        let revised = target_map(&after)[&parent.id];
+
+        assert!(
+            before[0].targets.0[1] == 0.0
+                && (revised.0[0] - 1.0).abs() < f32::EPSILON
+                && revised.0[1] > 0.0
+                && revised.0[2] == 0.0
+                && parent.verdict == VerdictTarget::Accepted
+        );
+    }
+
+    #[test]
+    fn selection_is_disjoint_rotates_and_gates_promotion() {
+        let mut examples = (0..50)
+            .map(|key| {
+                example(
+                    key,
+                    usize::from(key % 2),
+                    key % 2 == 0,
+                    assign_role([key; 32]),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            examples
+                .iter()
+                .any(|example| matches!(example.role, CorpusRole::Replay))
+        );
+        assert!(
+            examples
+                .iter()
+                .any(|example| matches!(example.role, CorpusRole::Selection { .. }))
+        );
+        let mut challenger = FtrlModel::zero();
+        for _ in 0..8 {
+            for sample in examples
+                .iter()
+                .filter(|sample| matches!(sample.role, CorpusRole::Replay))
+            {
+                challenger.update(sample);
+            }
+        }
+        let selection = examples
+            .iter()
+            .filter(|sample| matches!(sample.role, CorpusRole::Selection { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compare_models(&FtrlModel::zero(), &challenger, &selection),
+            PromotionDecision::Promote
+        );
+        for _ in 0..3 {
+            rotate_selection(&mut examples, 3);
+        }
+        assert!(
+            examples
+                .iter()
+                .all(|example| matches!(example.role, CorpusRole::Replay))
+        );
+        assert_ne!(
+            revision_digest(&challenger),
+            revision_digest(&FtrlModel::zero())
+        );
+    }
+
+    #[test]
+    fn model_state_round_trips_promotions_and_rolls_back_to_bootstrap() {
+        let mut examples = (0..50)
+            .map(|key| {
+                example(
+                    key,
+                    usize::from(key % 2),
+                    key % 2 == 0,
+                    assign_role([key; 32]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = LearningState::default();
+        assert_eq!(state.learn(&mut examples), PromotionDecision::Promote);
+        let digest = state.revision_digest("domain");
+        let encoded = state.encode();
+        let mut recovered = LearningState::decode(&encoded).unwrap();
+
+        assert!(
+            recovered.generation() == 1
+                && recovered.pinned_model().is_some()
+                && recovered.revision_digest("domain") == digest
+                && recovered.encode() == encoded
+                && recovered.specialist_count() == 0
+        );
+        assert_eq!(recovered.rollback(), PromotionDecision::Rollback);
+        assert!(recovered.pinned_model().is_none() && recovered.specialist_count() == 1);
+    }
+
+    #[test]
+    fn fresh_selection_evidence_automatically_rolls_back_a_regressed_champion() {
+        let mut regressed = FtrlModel::zero();
+        regressed.z[0][0] = 10.0;
+        regressed.n[0][0] = 1.0;
+        regressed.z[6][0] = -10.0;
+        regressed.n[6][0] = 1.0;
+        let mut state = LearningState {
+            generation: 1,
+            champion: Some(regressed),
+            predecessor: None,
+            predecessor_is_bootstrap: true,
+            specialists: Vec::new(),
+            roles: BTreeMap::new(),
+        };
+        let mut examples = (0..8)
+            .map(|index| {
+                let key = u8::try_from(index * 5).unwrap();
+                example(key, 0, true, CorpusRole::Selection { uses: 0 })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(state.learn(&mut examples), PromotionDecision::Rollback);
+        assert!(state.pinned_model().is_none() && state.specialist_count() == 1);
+    }
+
+    #[test]
+    fn comparison_retains_incomparable_specialists_and_rejects_non_improvements() {
+        let selection = (0..8)
+            .map(|key| example(key, 0, true, CorpusRole::Selection { uses: 0 }))
+            .collect::<Vec<_>>();
+        let champion = FtrlModel::zero();
+        let mut incomparable = FtrlModel::zero();
+        incomparable.z[0][0] = -10.0;
+        incomparable.n[0][0] = 1.0;
+        incomparable.z[1][0] = -10.0;
+        incomparable.n[1][0] = 1.0;
+
+        assert_eq!(
+            compare_models(&champion, &incomparable, &selection),
+            PromotionDecision::Specialist
+        );
+        assert_eq!(
+            compare_models(&champion, &champion, &selection),
+            PromotionDecision::Reject
+        );
+    }
+
+    #[test]
+    fn learning_state_rejects_corpus_overlap_and_invalid_revision_ancestry() {
+        let mut roles = BTreeMap::new();
+        roles.insert([7; 32], CorpusRole::Replay);
+        let state = LearningState {
+            roles,
+            ..LearningState::default()
+        };
+        assert!(state.corpus_is_valid(&[([1; 32], [7; 32])]));
+        assert!(!state.corpus_is_valid(&[([1; 32], [9; 32])]));
+        let encoded = state.encode();
+        let mut duplicate = encoded.clone();
+        duplicate[23..31].copy_from_slice(&2_u64.to_le_bytes());
+        duplicate.extend_from_slice(&encoded[31..]);
+        assert!(LearningState::decode(&duplicate).is_err());
+
+        let mut invalid_ancestry = LearningState::default().encode();
+        invalid_ancestry[14] = 1;
+        assert!(LearningState::decode(&invalid_ancestry).is_err());
+    }
+}

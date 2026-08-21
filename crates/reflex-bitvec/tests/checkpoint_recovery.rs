@@ -34,8 +34,8 @@ fn observer_boundary_checkpoint_survives_an_abrupt_process_exit() {
 
     assert!(
         outcome.pareto().artifacts()[0].artifact().node_count() == 1
-            && outcome.usage().verification_requests == 6,
-        "interrupted Resume must retain prior usage and charge recovery plus continued work"
+            && outcome.usage().verification_requests == 7,
+        "interrupted Resume must retain prior usage and charge Artifact, Experience, Seed, and continued-work Verification"
     );
     std::fs::remove_file(bundle_path).ok();
 }
