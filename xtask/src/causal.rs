@@ -21,7 +21,16 @@ type BundleSegment = (u8, u32, Vec<u8>);
 
 const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v3";
 const EXPECTED_SPEC_SHA256: &str =
-    "aa95b69dc0940fdde4bc2087392764de597b08212f318745a19965c231b592b9";
+    "32d8beccdbd2d42135dc6b5b345819e7d217f831e04dd8945ba657408f5a11eb";
+const BOOTSTRAP_COMPARATOR_REPORT: &str = "docs/baselines/bootstrap-reference-domain-v5.json";
+const BOOTSTRAP_COMPARATOR_FILE_SHA256: &str =
+    "86815912731844b5364428be606f6d471fb8dd84759e33fb5abe7919afaefe71";
+const BOOTSTRAP_COMPARATOR_CONTENT_SHA256: &str =
+    "d5ebcd52766d5163ca04027c9937a0628b9dab28d80de656d7109f4755cd0dd5";
+const BOOTSTRAP_COMPARATOR_PROTOCOL_SHA256: &str =
+    "98bb32c2506224f908917ffe251926f2fafce5178430c5ceaf6a4ed8f0eaada4";
+const BOOTSTRAP_COMPARATOR_SEMANTIC_SHA256: &str =
+    "ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582";
 const CONSUMED_V1_REPORT: &str = "docs/experiments/u8-causal-confirmation-v1.json";
 const CONSUMED_V1_AUDIT_SHA256: &str =
     "7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c";
@@ -106,6 +115,7 @@ struct ExperimentSpec {
     domain_identity: &'static str,
     development_corpus: &'static str,
     consumed_audit_corpus: &'static str,
+    bootstrap_comparator: &'static str,
     training_generator: &'static str,
     training_verification_requests: u64,
     pilot_exclusion_cases: usize,
@@ -142,6 +152,35 @@ struct ExperimentSpec {
     pareto_scope: &'static str,
     anytime_trace: &'static str,
     recovery: &'static str,
+}
+
+#[derive(Deserialize)]
+struct BootstrapComparatorReport {
+    schema: String,
+    protocol_sha256: String,
+    environment: BootstrapComparatorEnvironment,
+    protocol_deviations: Vec<String>,
+    semantic_outcome_sha256: Option<String>,
+    runs: Vec<BootstrapComparatorRun>,
+    content_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct BootstrapComparatorEnvironment {
+    git_dirty: bool,
+}
+
+#[derive(Deserialize)]
+struct BootstrapComparatorRun {
+    result: Option<BootstrapComparatorChild>,
+    failure: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BootstrapComparatorChild {
+    semantic_outcome_sha256: String,
+    recovery_valid: bool,
+    recovery_semantic_outcome_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -403,6 +442,7 @@ pub(super) fn materialize_audit(arguments: &[String]) -> Result<(), AnyError> {
     if environment()?.git_dirty {
         return Err("audit materialization requires a clean committed worktree".into());
     }
+    validate_bootstrap_comparator()?;
     if output.exists() {
         return Err(format!(
             "refusing to replace an existing audit artifact: {}",
@@ -460,6 +500,7 @@ fn confirm_configuration(
     if environment.git_dirty {
         return Err("confirmatory execution requires a clean worktree".into());
     }
+    validate_bootstrap_comparator()?;
     Ok((output, specification, specification_sha256, environment))
 }
 
@@ -637,6 +678,7 @@ fn specification() -> ExperimentSpec {
         domain_identity: "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v3",
         development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, every consumed v1 audit semantic group, and every consumed v2 audit semantic group",
         consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c and v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081",
+        bootstrap_comparator: "reflex-bootstrap-baseline-v5 report file sha256 86815912731844b5364428be606f6d471fb8dd84759e33fb5abe7919afaefe71; protocol sha256 98bb32c2506224f908917ffe251926f2fafce5178430c5ceaf6a4ed8f0eaada4; content sha256 d5ebcd52766d5163ca04027c9937a0628b9dab28d80de656d7109f4755cd0dd5; semantic outcome sha256 ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582",
         training_generator: "96 refuted Seeds xor(input,c) for c=1..96 followed by 96 useful Seeds xor(xor(xor(input,c),0),0) for c=97..192",
         training_verification_requests: 100_000,
         pilot_exclusion_cases: PILOT_EXCLUSION_CASES,
@@ -688,6 +730,41 @@ fn specification() -> ExperimentSpec {
         anytime_trace: "record audit-origin Pareto aggregate totals at observer sequence 1, every 256th sequence, and the final sequence",
         recovery: "resume each completed output with the same Seeds, a 1000000-request replay envelope, and a trivially satisfied NodeCount<=u64::MAX Success Condition; require SuccessConditionsSatisfied before search plus identical audit count, aggregates, and Artifact-key digest",
     }
+}
+
+fn validate_bootstrap_comparator() -> Result<(), AnyError> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask manifest must have a workspace parent")?;
+    let report_path = workspace.join(BOOTSTRAP_COMPARATOR_REPORT);
+    if hash_file(&report_path)? != BOOTSTRAP_COMPARATOR_FILE_SHA256 {
+        return Err(
+            "Bootstrap comparator report does not match its preregistered file hash".into(),
+        );
+    }
+    let report: BootstrapComparatorReport = serde_json::from_slice(&std::fs::read(report_path)?)?;
+    let valid = report.schema == "reflex-performance-report-v1"
+        && report.protocol_sha256 == BOOTSTRAP_COMPARATOR_PROTOCOL_SHA256
+        && report.content_sha256 == BOOTSTRAP_COMPARATOR_CONTENT_SHA256
+        && !report.environment.git_dirty
+        && report.protocol_deviations.is_empty()
+        && report.semantic_outcome_sha256.as_deref() == Some(BOOTSTRAP_COMPARATOR_SEMANTIC_SHA256)
+        && report.runs.len() == 96
+        && report.runs.iter().all(|run| {
+            run.failure.is_none()
+                && run.result.as_ref().is_some_and(|result| {
+                    result.recovery_valid
+                        && result.semantic_outcome_sha256 == BOOTSTRAP_COMPARATOR_SEMANTIC_SHA256
+                        && result.recovery_semantic_outcome_sha256.as_deref()
+                            == Some(BOOTSTRAP_COMPARATOR_SEMANTIC_SHA256)
+                })
+        });
+    if !valid {
+        return Err(
+            "Bootstrap comparator report is incomplete or contains a Protocol Deviation".into(),
+        );
+    }
+    Ok(())
 }
 
 fn build_training_bundles(full: &Path, bootstrap: &Path) -> Result<(), AnyError> {
@@ -1607,6 +1684,11 @@ mod tests {
     #[test]
     fn specification_is_content_addressed() {
         assert_eq!(hash_json(&specification()).unwrap(), EXPECTED_SPEC_SHA256);
+    }
+
+    #[test]
+    fn bootstrap_comparator_is_complete_and_content_addressed() {
+        validate_bootstrap_comparator().unwrap();
     }
 
     #[test]
