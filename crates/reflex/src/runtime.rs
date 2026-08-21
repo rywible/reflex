@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
@@ -17,6 +17,7 @@ use crate::domain::{
 };
 use crate::durability::{self, Segment, SegmentKind};
 use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
+use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
     LearningState, PotentialForecast, VerdictTarget, derive_targets,
@@ -43,6 +44,7 @@ struct RecoveredBundle<D: DomainDefinition> {
     experience: Vec<ExperienceEntry>,
     revisions: Option<RevisionIds>,
     interrupted_usage: Option<ResourceUsage>,
+    knowledge: KnowledgeState,
     learning: LearningState,
     consequences: Vec<ConsequenceObservation>,
     measurements: Vec<MeasurementObservation>,
@@ -56,6 +58,7 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
             experience: Vec::new(),
             revisions: None,
             interrupted_usage: None,
+            knowledge: KnowledgeState::default(),
             learning: LearningState::default(),
             consequences: Vec::new(),
             measurements: Vec::new(),
@@ -114,6 +117,7 @@ struct ProposedCandidate<D: DomainDefinition> {
     operator_symbol: Vec<u8>,
     features: Features,
     epoch: u64,
+    protected_derived: bool,
 }
 
 struct ReadSeeds<D: DomainDefinition> {
@@ -192,6 +196,8 @@ where
     let mut experience = recovered_bundle.experience;
     let mut consequences = recovered_bundle.consequences;
     let mut measurement_observations = recovered_bundle.measurements;
+    let mut knowledge = recovered_bundle.knowledge;
+    let pinned_knowledge = knowledge.pinned_revision().clone();
     let mut learning = recovered_bundle.learning;
     let pinned_model = learning.pinned_model().cloned();
     let recovered_revisions = recovered_bundle.revisions;
@@ -241,7 +247,12 @@ where
     let recovered = materialize(domain, recovered_stored, &environment)?;
     replay_experience(domain, &recovered, &experience)?;
     if recovered_revisions.is_some_and(|revisions| {
-        let expected = revision_ids(domain.semantic_identity().as_str(), &recovered, &learning);
+        let expected = revision_ids(
+            domain.semantic_identity().as_str(),
+            &recovered,
+            &knowledge,
+            &learning,
+        );
         revisions.knowledge != expected.knowledge || revisions.model != expected.model
     }) {
         return Err(SessionError::CorruptBundle);
@@ -288,6 +299,7 @@ where
         &experience,
         &consequences,
         &measurement_observations,
+        &knowledge,
         &learning,
         SessionSeal::Interrupted(initial_usage),
     )?;
@@ -300,10 +312,12 @@ where
         .enumerate()
         .map(|(origin, artifact)| (artifact, origin))
         .collect::<Vec<_>>();
+    let resuming_interrupted = recovered_bundle.interrupted_usage.is_some();
     for artifact in recovered {
         if let Some(origin) = roots
             .iter()
             .position(|root| root.key() == artifact.inner.origin_key)
+            && (resuming_interrupted || pinned_knowledge.schedules(artifact.key().0))
             && !frontier
                 .iter()
                 .any(|(scheduled, _)| scheduled.key() == artifact.key())
@@ -328,6 +342,7 @@ where
         &experience,
         &consequences,
         &measurement_observations,
+        &knowledge,
         &learning,
     ));
     if !resource_meter
@@ -382,6 +397,7 @@ where
                 &experience,
                 &consequences,
                 &measurement_observations,
+                &knowledge,
                 &learning,
             ))
             .saturating_add(
@@ -447,15 +463,23 @@ where
                     candidate,
                     operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
                     epoch: sequence,
+                    protected_derived: false,
                 });
             }
         }
+        application_bytes = application_bytes.saturating_add(append_derived_candidates(
+            domain,
+            &parents,
+            &pinned_knowledge,
+            &mut operator_scratch,
+            usize::try_from(remaining_verifications).unwrap_or(usize::MAX),
+            sequence,
+            &mut candidates,
+        )?);
         test_fault_point("candidate-created");
         candidates =
             retain_novel_candidates(domain, &known, &experience, &roots, &frontier, candidates)?;
-        if let Some(model) = pinned_model.as_ref() {
-            order_by_learned_potential(model, &mut candidates);
-        }
+        order_by_learned_potential(pinned_model.as_ref(), &mut candidates);
         if candidates.is_empty() {
             break;
         }
@@ -506,6 +530,7 @@ where
             &experience,
             &consequences,
             &measurement_observations,
+            &knowledge,
             &learning,
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
@@ -527,6 +552,7 @@ where
                 &experience,
                 &consequences,
                 &measurement_observations,
+                &knowledge,
                 &learning,
             ))
             .saturating_add(experience_checkpoint.capacity() as u64)
@@ -621,6 +647,7 @@ where
             &experience,
             &consequences,
             &measurement_observations,
+            &knowledge,
             &learning,
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
@@ -645,6 +672,7 @@ where
                 &experience,
                 &consequences,
                 &measurement_observations,
+                &knowledge,
                 &learning,
             ))
             .saturating_add(proposed_checkpoint.capacity() as u64)
@@ -719,6 +747,102 @@ where
     {
         completion = Completion::ResourceEnvelopeExhausted;
     }
+    let consolidation_resident = worker_resident_bytes
+        .saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &experience,
+            &consequences,
+            &measurement_observations,
+            &knowledge,
+            &learning,
+        ))
+        .saturating_add(durability.pending_bytes())
+        .saturating_add((experience.len() as u64).saturating_mul(
+            (std::mem::size_of::<DerivationObservation>() as u64).saturating_add(512),
+        ))
+        .saturating_add(4_096 * 64)
+        .saturating_add(experience.iter().fold(0_u64, |bytes, entry| {
+            bytes.saturating_add((entry.operator_symbol.capacity() as u64).saturating_mul(2))
+        }));
+    let can_consolidate = completion != Completion::StoppedByObserver
+        && !resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        && resource_meter.observe_resident(consolidation_resident);
+    if can_consolidate {
+        let primitive_symbols = domain
+            .operators()
+            .catalog()
+            .iter()
+            .map(|descriptor| descriptor.symbol().as_str().as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+        let observations =
+            derivation_observations(&experience, &pinned_knowledge, &primitive_symbols)?;
+        let prior_operators = knowledge
+            .pinned_revision()
+            .operators()
+            .iter()
+            .map(crate::knowledge::DerivedOperator::id)
+            .collect::<BTreeSet<_>>();
+        let mut proposed_knowledge = knowledge.clone();
+        let _decision = proposed_knowledge.consolidate(
+            &observations,
+            roots.iter().map(|artifact| artifact.key().0),
+            pareto.iter().map(|artifact| artifact.key().0),
+        );
+        let compressed_attempts = proposed_knowledge
+            .pinned_revision()
+            .operators()
+            .iter()
+            .filter(|operator| !prior_operators.contains(&operator.id()))
+            .flat_map(|operator| operator.support().iter().copied())
+            .collect::<Vec<_>>();
+        let mut proposed_consequences = consequences.clone();
+        for subject in compressed_attempts {
+            let consequence = ConsequenceObservation {
+                subject,
+                kind: ConsequenceKind::Compression,
+            };
+            if !proposed_consequences.contains(&consequence) {
+                proposed_consequences.push(consequence);
+            }
+        }
+        let promoted_resident = worker_resident_bytes
+            .saturating_add(resident_state_bytes(
+                &known,
+                &roots,
+                &pareto,
+                &frontier,
+                &recovered_keys,
+                &operators,
+                &checkpoint,
+                &experience,
+                &proposed_consequences,
+                &measurement_observations,
+                &proposed_knowledge,
+                &learning,
+            ))
+            .saturating_add(knowledge.resident_bytes())
+            .saturating_add(durability.pending_bytes())
+            .saturating_add(
+                (observations.len() as u64)
+                    .saturating_mul(std::mem::size_of::<DerivationObservation>() as u64),
+            );
+        if resource_meter.observe_resident(promoted_resident) {
+            knowledge = proposed_knowledge;
+            consequences = proposed_consequences;
+        } else {
+            completion = Completion::ResourceEnvelopeExhausted;
+        }
+    } else if completion != Completion::StoppedByObserver {
+        completion = Completion::ResourceEnvelopeExhausted;
+    }
     let learning_resident = worker_resident_bytes
         .saturating_add(resident_state_bytes(
             &known,
@@ -731,6 +855,7 @@ where
             &experience,
             &consequences,
             &measurement_observations,
+            &knowledge,
             &learning,
         ))
         .saturating_add(durability.pending_bytes())
@@ -776,6 +901,7 @@ where
         &experience,
         &consequences,
         &measurement_observations,
+        &knowledge,
         &learning,
         SessionSeal::Completed(completion, provisional_usage),
     )?;
@@ -791,6 +917,7 @@ where
         &experience,
         &consequences,
         &measurement_observations,
+        &knowledge,
         &learning,
         SessionSeal::Completed(completion, usage),
     )?;
@@ -809,6 +936,7 @@ where
             &experience,
             &consequences,
             &measurement_observations,
+            &knowledge,
             &learning,
         ))
         .saturating_add(checkpoint.capacity() as u64)
@@ -844,6 +972,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
     experience: &Vec<ExperienceEntry>,
     consequences: &Vec<ConsequenceObservation>,
     measurements: &Vec<MeasurementObservation>,
+    knowledge: &KnowledgeState,
     learning: &LearningState,
 ) -> u64 {
     let records = known.iter().fold(0_u64, |bytes, artifact| {
@@ -881,6 +1010,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
         .saturating_add(vector_bytes(consequences))
         .saturating_add(vector_bytes(measurements))
         .saturating_add(measurement_payloads)
+        .saturating_add(knowledge.resident_bytes())
         .saturating_add(learning.resident_bytes())
 }
 
@@ -934,39 +1064,166 @@ fn opportunity_features<D: DomainDefinition>(
     Features(values)
 }
 
+fn append_derived_candidates<D: DomainDefinition>(
+    domain: &D,
+    parents: &[&D::Artifact],
+    knowledge: &KnowledgeRevision,
+    scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
+    remaining_verifications: usize,
+    epoch: u64,
+    output: &mut Vec<ProposedCandidate<D>>,
+) -> Result<u64, SessionError<D::Error>> {
+    const MAX_DERIVED_CANDIDATES_PER_OPERATOR: usize = 1_024;
+
+    let mut application_bytes = 0_u64;
+    let limit = remaining_verifications.min(MAX_DERIVED_CANDIDATES_PER_OPERATOR);
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut emitted = 0_usize;
+    for derived in knowledge
+        .operators()
+        .iter()
+        .filter(|operator| operator.active())
+    {
+        let operator_limit = limit.saturating_sub(emitted);
+        if operator_limit == 0 {
+            break;
+        }
+        let mut current = Vec::<Candidate<D>>::new();
+        for (step_index, step) in derived.steps().iter().enumerate() {
+            let Some(descriptor) = domain
+                .operators()
+                .catalog()
+                .iter()
+                .find(|descriptor| descriptor.symbol().as_str().as_bytes() == step)
+            else {
+                return Err(SessionError::CorruptBundle);
+            };
+            let stage_parents = if step_index == 0 {
+                parents[..parents.len().min(operator_limit)].to_vec()
+            } else {
+                current
+                    .iter()
+                    .map(|candidate| &candidate.artifact)
+                    .collect()
+            };
+            let mut applications = Vec::new();
+            domain
+                .operators()
+                .enumerate_legal(
+                    OperatorEnumerationBatch::new(
+                        &stage_parents,
+                        std::slice::from_ref(&descriptor.operator()),
+                    ),
+                    &mut ApplicationWriter::new(&mut applications),
+                    scratch,
+                )
+                .map_err(SessionError::Domain)?;
+            application_bytes = application_bytes.saturating_add(vector_bytes(&applications));
+            let mut next = Vec::new();
+            domain
+                .operators()
+                .apply_batch(&applications, &mut CandidateWriter::new(&mut next), scratch)
+                .map_err(SessionError::Domain)?;
+            if next.len() > operator_limit {
+                next.truncate(operator_limit);
+            }
+            if step_index > 0 {
+                for candidate in &mut next {
+                    let Some(parent) = current.get(candidate.source_index) else {
+                        return Err(SessionError::CorruptBundle);
+                    };
+                    candidate.source_index = parent.source_index;
+                }
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
+        }
+        let symbol = std::str::from_utf8(derived.symbol())
+            .expect("canonical Derived Operator symbols are UTF-8");
+        emitted = emitted.saturating_add(current.len());
+        for candidate in current {
+            let parent = parents
+                .get(candidate.source_index)
+                .ok_or(SessionError::CorruptBundle)?;
+            output.push(ProposedCandidate {
+                features: opportunity_features(domain, parent, &candidate.artifact, symbol, epoch),
+                candidate,
+                operator_symbol: derived.symbol().to_vec(),
+                epoch,
+                protected_derived: derived.protected_exploration(),
+            });
+        }
+    }
+    Ok(application_bytes)
+}
+
 fn order_by_learned_potential<D: DomainDefinition>(
-    model: &FtrlModel,
+    model: Option<&FtrlModel>,
     candidates: &mut Vec<ProposedCandidate<D>>,
 ) {
+    if model.is_none() {
+        let (derived, ordinary): (Vec<_>, Vec<_>) = std::mem::take(candidates)
+            .into_iter()
+            .partition(|candidate| candidate.protected_derived);
+        let mut derived = derived.into_iter();
+        let mut ordinary = ordinary.into_iter();
+        loop {
+            let before = candidates.len();
+            if let Some(candidate) = derived.next() {
+                candidates.push(candidate);
+            }
+            candidates.extend(ordinary.by_ref().take(7));
+            if candidates.len() == before {
+                break;
+            }
+        }
+        return;
+    }
+    let mut derived_exploration = Vec::new();
     let mut ranked = Vec::new();
     let mut exploration = Vec::new();
     for (index, candidate) in std::mem::take(candidates).into_iter().enumerate() {
-        if index.is_multiple_of(8) {
+        if candidate.protected_derived {
+            derived_exploration.push(candidate);
+        } else if index.is_multiple_of(8) {
             exploration.push(candidate);
         } else {
-            let forecast = model.forecast(candidate.features);
+            let forecast = model.map(|model| model.forecast(candidate.features));
             ranked.push((candidate, forecast));
         }
     }
     ranked.sort_by(|(left, left_forecast), (right, right_forecast)| {
-        compare_forecasts(*left_forecast, *right_forecast).then_with(|| {
-            left.operator_symbol
-                .cmp(&right.operator_symbol)
-                .then_with(|| {
-                    left.candidate
-                        .source_index
-                        .cmp(&right.candidate.source_index)
-                })
-        })
+        left_forecast
+            .zip(*right_forecast)
+            .map_or(Ordering::Equal, |(left, right)| {
+                compare_forecasts(left, right)
+            })
+            .then_with(|| {
+                left.operator_symbol
+                    .cmp(&right.operator_symbol)
+                    .then_with(|| {
+                        left.candidate
+                            .source_index
+                            .cmp(&right.candidate.source_index)
+                    })
+            })
     });
     let mut ranked = ranked.into_iter().map(|(candidate, _)| candidate);
     let mut exploration = exploration.into_iter();
+    let mut derived_exploration = derived_exploration.into_iter();
     loop {
         let before = candidates.len();
+        if let Some(candidate) = derived_exploration.next() {
+            candidates.push(candidate);
+        }
         if let Some(candidate) = exploration.next() {
             candidates.push(candidate);
         }
-        candidates.extend(ranked.by_ref().take(7));
+        candidates.extend(ranked.by_ref().take(6));
         if candidates.len() == before {
             break;
         }
@@ -999,6 +1256,35 @@ fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Order
         }
     }
     Ordering::Equal
+}
+
+fn derivation_observations<E>(
+    experience: &[ExperienceEntry],
+    knowledge: &KnowledgeRevision,
+    primitive_symbols: &BTreeSet<Vec<u8>>,
+) -> Result<Vec<DerivationObservation>, SessionError<E>> {
+    experience
+        .iter()
+        .map(|entry| {
+            let operator_steps = if primitive_symbols.contains(&entry.operator_symbol) {
+                vec![entry.operator_symbol.clone()]
+            } else {
+                knowledge
+                    .resolve_operator(&entry.operator_symbol)
+                    .map(|operator| operator.steps().to_vec())
+                    .ok_or(SessionError::CorruptBundle)?
+            };
+            Ok(DerivationObservation {
+                id: entry.attempt_id,
+                artifact: entry.candidate_key.0,
+                parent: entry.parent_key.0,
+                claim: entry.claim_digest,
+                operator_identity: entry.operator_symbol.clone(),
+                operator_steps,
+                accepted: entry.verdict == ExperienceVerdict::Accepted,
+            })
+        })
+        .collect()
 }
 
 fn claim_digest<D: DomainDefinition>(
@@ -1393,7 +1679,7 @@ fn decode_bundle<D: DomainDefinition>(
     let encoded_revisions = decoded
         .segment(SegmentKind::Revisions)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if encoded_revisions.len() < 72 {
+    if encoded_revisions.len() < 80 {
         return Err(SessionError::CorruptBundle);
     }
     let revisions = RevisionIds {
@@ -1405,6 +1691,8 @@ fn decode_bundle<D: DomainDefinition>(
             .expect("Model Revision ID is exactly 32 bytes"),
     };
     let mut encoded_learning = &encoded_revisions[64..];
+    let knowledge = KnowledgeState::decode(take_sized(&mut encoded_learning)?)
+        .map_err(|()| SessionError::CorruptBundle)?;
     let learning = LearningState::decode(take_sized(&mut encoded_learning)?)
         .map_err(|()| SessionError::CorruptBundle)?;
     if !encoded_learning.is_empty()
@@ -1548,6 +1836,10 @@ fn decode_bundle<D: DomainDefinition>(
             .catalog()
             .iter()
             .any(|descriptor| descriptor.symbol().as_str() == operator)
+            && knowledge
+                .pinned_revision()
+                .resolve_operator(&operator_symbol)
+                .is_none()
         {
             return Err(SessionError::CorruptBundle);
         }
@@ -1712,7 +2004,22 @@ fn decode_bundle<D: DomainDefinition>(
         .iter()
         .map(|entry| (entry.attempt_id, entry.claim_digest))
         .collect::<Vec<_>>();
-    if !encoded_experience.is_empty() || !learning.corpus_is_valid(&corpus_assignments) {
+    let artifact_keys = recovered_index
+        .keys()
+        .map(|key| key.0)
+        .collect::<BTreeSet<_>>();
+    let primitive_symbols = domain
+        .operators()
+        .catalog()
+        .iter()
+        .map(|descriptor| descriptor.symbol().as_str().as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let derivations =
+        derivation_observations(&experience, knowledge.pinned_revision(), &primitive_symbols)?;
+    if !encoded_experience.is_empty()
+        || !learning.corpus_is_valid(&corpus_assignments)
+        || !knowledge.validate(&artifact_keys, &derivations, &primitive_symbols)
+    {
         return Err(SessionError::CorruptBundle);
     }
     Ok(RecoveredBundle {
@@ -1721,6 +2028,7 @@ fn decode_bundle<D: DomainDefinition>(
         experience,
         revisions: Some(revisions),
         interrupted_usage,
+        knowledge,
         learning,
         consequences,
         measurements,
@@ -2335,6 +2643,7 @@ fn encode_bundle<D: DomainDefinition>(
     experience: &[ExperienceEntry],
     consequences: &[ConsequenceObservation],
     measurements: &[MeasurementObservation],
+    knowledge: &KnowledgeState,
     learning: &LearningState,
     session_seal: SessionSeal,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
@@ -2380,11 +2689,13 @@ fn encode_bundle<D: DomainDefinition>(
         }
     }
     let identity = domain.semantic_identity();
-    let revision_ids = revision_ids(identity.as_str(), artifacts, learning);
+    let revision_ids = revision_ids(identity.as_str(), artifacts, knowledge, learning);
+    let encoded_knowledge = knowledge.encode();
     let encoded_learning = learning.encode();
-    let mut revisions = Vec::with_capacity(72 + encoded_learning.len());
+    let mut revisions = Vec::with_capacity(80 + encoded_knowledge.len() + encoded_learning.len());
     revisions.extend_from_slice(&revision_ids.knowledge);
     revisions.extend_from_slice(&revision_ids.model);
+    push_bytes(&mut revisions, &encoded_knowledge);
     push_bytes(&mut revisions, &encoded_learning);
     test_fault_point("revision-sealed");
     let mut recovery = Vec::with_capacity(8 + pareto.len() * 32);
@@ -2466,6 +2777,7 @@ fn encode_bundle<D: DomainDefinition>(
 fn revision_ids<D: DomainDefinition>(
     semantic_identity: &str,
     artifacts: &[VerifiedArtifact<D>],
+    state: &KnowledgeState,
     learning: &LearningState,
 ) -> RevisionIds {
     let mut canonical = artifacts.iter().collect::<Vec<_>>();
@@ -2485,6 +2797,7 @@ fn revision_ids<D: DomainDefinition>(
             None => knowledge.update([0]),
         }
     }
+    knowledge.update(state.revision_digest(semantic_identity));
     RevisionIds {
         knowledge: knowledge.finalize().into(),
         model: learning.revision_digest(semantic_identity),

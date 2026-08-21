@@ -61,7 +61,7 @@ fn v3_bundle_segments_preserve_refuted_experience() {
             && segments
                 .iter()
                 .map(|(_, version, _)| *version)
-                .eq([1, 2, 1, 2, 1])
+                .eq([1, 3, 1, 2, 1])
             && count == 1
             && verdict == 2
             && outcome.usage().verification_requests == 2,

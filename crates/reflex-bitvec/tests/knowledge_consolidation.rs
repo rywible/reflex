@@ -13,11 +13,11 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 #[test]
 #[expect(
     clippy::too_many_lines,
-    reason = "one public-path scenario compares training, constrained allocation, and sufficient-budget semantics"
+    reason = "one public-path gate proves extraction, constrained reuse, and semantic equivalence"
 )]
-fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics() {
+fn verified_chains_become_bounded_macros_for_later_sessions() {
     let directory = std::env::temp_dir().join(format!(
-        "reflex-online-learning-{}-{}",
+        "reflex-knowledge-consolidation-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("unnamed")
     ));
@@ -31,7 +31,7 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     improve(
         BitVecDomain::unary_u8(),
         request(
-            training_seeds(),
+            nested_seeds(1..=8),
             10_000,
             BundlePlan::Fresh {
                 target: trained.clone(),
@@ -41,18 +41,25 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     )
     .unwrap();
     let trained_snapshot = snapshot(&trained);
-    assert!(trained_snapshot.model_generation >= 1);
+    assert!(
+        trained_snapshot.knowledge_generation >= 1
+            && trained_snapshot
+                .derived
+                .iter()
+                .any(|operator| operator.active && operator.steps == 2 && operator.support >= 8),
+        "eight distinct verified claims must consolidate the repeated two-step chain"
+    );
 
     std::fs::copy(&trained, &constrained).unwrap();
     std::fs::copy(&trained, &learned_full).unwrap();
-    let heldout = heldout_seeds();
+    let heldout = nested_seeds(9..=16);
     let replay_count =
         trained_snapshot.artifact_count + trained_snapshot.attempts.len() + heldout.len();
     improve(
         BitVecDomain::unary_u8(),
         request(
             heldout.clone(),
-            u64::try_from(replay_count + 10).unwrap(),
+            u64::try_from(replay_count + heldout.len()).unwrap(),
             BundlePlan::Resume {
                 source: constrained.clone(),
                 target: constrained.clone(),
@@ -65,7 +72,7 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         BitVecDomain::unary_u8(),
         request(
             heldout.clone(),
-            u64::try_from(heldout.len() + 10).unwrap(),
+            u64::try_from(heldout.len() * 2).unwrap(),
             BundlePlan::Fresh {
                 target: bootstrap_constrained.clone(),
             },
@@ -73,24 +80,18 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         |_| ControlFlow::Continue(()),
     )
     .unwrap();
-    let learned_constrained = snapshot(&constrained);
-    let bootstrap_constrained = snapshot(&bootstrap_constrained);
-    let learned_new = &learned_constrained.attempts[trained_snapshot.attempts.len()..];
-
-    let learned_accepted = learned_new
-        .iter()
-        .filter(|attempt| attempt.accepted)
-        .count();
-    let bootstrap_accepted = bootstrap_constrained
-        .attempts
-        .iter()
-        .filter(|attempt| attempt.accepted)
-        .count();
+    let learned = snapshot(&constrained);
+    let bootstrap = snapshot(&bootstrap_constrained);
+    let learned_new = &learned.attempts[trained_snapshot.attempts.len()..];
     assert!(
-        learned_accepted > 0
-            && learned_new.iter().any(|attempt| !attempt.accepted)
-            && bootstrap_accepted == 0,
-        "the learned allocator must prefer useful work while retaining protected exploration; learned accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
+        learned_new.iter().any(|attempt| {
+            attempt.accepted && attempt.nodes == 3 && attempt.operator.starts_with(b"derived:")
+        }) && bootstrap
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted)
+            .all(|attempt| attempt.nodes == 5),
+        "protected Derived Operator exploration must reach a two-step result inside a budget where Bootstrap reaches only intermediates"
     );
 
     improve(
@@ -118,14 +119,14 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         |_| ControlFlow::Continue(()),
     )
     .unwrap();
-    let learned_full = snapshot(&learned_full);
-    let bootstrap_full = snapshot(&bootstrap_full);
-    let learned_semantics = learned_full.attempts[trained_snapshot.attempts.len()..]
+    let learned_full_snapshot = snapshot(&learned_full);
+    let bootstrap_full_snapshot = snapshot(&bootstrap_full);
+    let learned_semantics = learned_full_snapshot.attempts[trained_snapshot.attempts.len()..]
         .iter()
         .filter(|attempt| attempt.accepted)
         .map(|attempt| attempt.canonical.clone())
         .collect::<BTreeSet<_>>();
-    let bootstrap_semantics = bootstrap_full
+    let bootstrap_semantics = bootstrap_full_snapshot
         .attempts
         .iter()
         .filter(|attempt| attempt.accepted)
@@ -136,28 +137,19 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     std::fs::remove_dir_all(directory).ok();
 }
 
-fn training_seeds() -> Vec<Expression> {
-    let refuted = (1..=96)
-        .map(|constant| Expression::xor(Expression::input(), Expression::constant(constant)));
-    let useful = (97..=192).map(|constant| {
-        Expression::xor(
-            Expression::xor(Expression::input(), Expression::constant(constant)),
-            Expression::constant(0),
-        )
-    });
-    refuted.chain(useful).collect()
-}
-
-fn heldout_seeds() -> Vec<Expression> {
-    let refuted = (193..=224)
-        .map(|constant| Expression::xor(Expression::input(), Expression::constant(constant)));
-    let useful = (225..=255).map(|constant| {
-        Expression::xor(
-            Expression::xor(Expression::input(), Expression::constant(constant)),
-            Expression::constant(0),
-        )
-    });
-    refuted.chain(useful).collect()
+fn nested_seeds(constants: impl IntoIterator<Item = u8>) -> Vec<Expression> {
+    constants
+        .into_iter()
+        .map(|constant| {
+            Expression::xor(
+                Expression::xor(
+                    Expression::xor(Expression::input(), Expression::constant(constant)),
+                    Expression::constant(0),
+                ),
+                Expression::constant(0),
+            )
+        })
+        .collect()
 }
 
 fn request(
@@ -186,12 +178,21 @@ fn request(
 
 struct Snapshot {
     artifact_count: usize,
-    model_generation: u64,
+    knowledge_generation: u64,
+    derived: Vec<Derived>,
     attempts: Vec<Attempt>,
+}
+
+struct Derived {
+    active: bool,
+    steps: usize,
+    support: usize,
 }
 
 struct Attempt {
     canonical: Vec<u8>,
+    operator: Vec<u8>,
+    nodes: u32,
     accepted: bool,
 }
 
@@ -205,36 +206,60 @@ fn snapshot(path: &Path) -> Snapshot {
         usize::try_from(u64::from_le_bytes(artifacts[..8].try_into().unwrap())).unwrap();
     let knowledge_length =
         usize::try_from(u64::from_le_bytes(revisions[64..72].try_into().unwrap())).unwrap();
-    let learning_offset = 72 + knowledge_length;
-    let learning_length = usize::try_from(u64::from_le_bytes(
-        revisions[learning_offset..learning_offset + 8]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    let learning = &revisions[learning_offset + 8..learning_offset + 8 + learning_length];
-    assert_eq!(&learning[..5], b"RFLS\x02");
-    let model_generation = u64::from_le_bytes(learning[5..13].try_into().unwrap());
+    let mut knowledge = &revisions[72..72 + knowledge_length];
+    assert_eq!(take(&mut knowledge, 5), b"RFKS\x01");
+    let knowledge_generation = read_u64(&mut knowledge);
+    let champion_length = usize::try_from(read_u64(&mut knowledge)).unwrap();
+    let mut champion = take(&mut knowledge, champion_length);
+    assert_eq!(take(&mut champion, 5), b"RFKR\x01");
+    let active_count = usize::try_from(read_u64(&mut champion)).unwrap();
+    take(&mut champion, active_count * 32);
+    let operator_count = usize::try_from(read_u64(&mut champion)).unwrap();
+    let mut derived = Vec::with_capacity(operator_count);
+    for _ in 0..operator_count {
+        take(&mut champion, 32);
+        let symbol_length = usize::try_from(read_u64(&mut champion)).unwrap();
+        take(&mut champion, symbol_length);
+        let active = take(&mut champion, 1)[0] == 1;
+        read_u64(&mut champion);
+        read_u64(&mut champion);
+        let step_count = usize::try_from(read_u64(&mut champion)).unwrap();
+        for _ in 0..step_count {
+            let length = usize::try_from(read_u64(&mut champion)).unwrap();
+            take(&mut champion, length);
+        }
+        let support_count = usize::try_from(read_u64(&mut champion)).unwrap();
+        take(&mut champion, support_count * 32);
+        derived.push(Derived {
+            active,
+            steps: step_count,
+            support: support_count,
+        });
+    }
+
     let mut input = experience;
     let count = usize::try_from(read_u64(&mut input)).unwrap();
     let mut attempts = Vec::with_capacity(count);
     for _ in 0..count {
         input = &input[160..];
         let canonical_length = usize::try_from(read_u64(&mut input)).unwrap();
-        let canonical = input[..canonical_length].to_vec();
-        input = &input[canonical_length..];
-        let accepted = input[0] == 1;
-        input = &input[1..];
+        let canonical = take(&mut input, canonical_length).to_vec();
+        let nodes = u32::from_le_bytes(canonical[..4].try_into().unwrap());
+        let accepted = take(&mut input, 1)[0] == 1;
         let operator_length = usize::try_from(read_u64(&mut input)).unwrap();
-        input = &input[operator_length + 16 * 4 + 4 + 8..];
+        let operator = take(&mut input, operator_length).to_vec();
+        input = &input[16 * 4 + 4 + 8..];
         attempts.push(Attempt {
             canonical,
+            operator,
+            nodes,
             accepted,
         });
     }
     Snapshot {
         artifact_count,
-        model_generation,
+        knowledge_generation,
+        derived,
         attempts,
     }
 }
@@ -243,22 +268,25 @@ fn segments(mut bytes: &[u8]) -> Vec<(u8, &[u8])> {
     bytes = &bytes[8..];
     let identity_length = usize::try_from(read_u64(&mut bytes)).unwrap();
     bytes = &bytes[identity_length..];
-    let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    bytes = &bytes[4..];
+    let count = u32::from_le_bytes(take(&mut bytes, 4).try_into().unwrap()) as usize;
     let mut segments = Vec::with_capacity(count);
     for _ in 0..count {
-        let kind = bytes[0];
-        bytes = &bytes[5..];
+        let kind = take(&mut bytes, 1)[0];
+        take(&mut bytes, 4);
         let length = usize::try_from(read_u64(&mut bytes)).unwrap();
-        let (payload, remainder) = bytes.split_at(length);
+        let payload = take(&mut bytes, length);
         segments.push((kind, payload));
-        bytes = &remainder[32..];
+        take(&mut bytes, 32);
     }
     segments
 }
 
 fn read_u64(bytes: &mut &[u8]) -> u64 {
-    let (value, remainder) = bytes.split_at(8);
+    u64::from_le_bytes(take(bytes, 8).try_into().unwrap())
+}
+
+fn take<'a>(bytes: &mut &'a [u8], count: usize) -> &'a [u8] {
+    let (value, remainder) = bytes.split_at(count);
     *bytes = remainder;
-    u64::from_le_bytes(value.try_into().unwrap())
+    value
 }

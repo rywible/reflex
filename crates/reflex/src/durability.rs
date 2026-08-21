@@ -33,7 +33,8 @@ impl SegmentKind {
     const fn current_version(self) -> u32 {
         match self {
             Self::Session | Self::Artifacts | Self::Recovery => 1,
-            Self::Revisions | Self::Experience => 2,
+            Self::Revisions => 3,
+            Self::Experience => 2,
         }
     }
 }
