@@ -58,6 +58,7 @@ impl DerivedOperator {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct KnowledgeRevision {
+    summarized_attempts: u64,
     active_artifacts: Vec<[u8; 32]>,
     operators: Vec<DerivedOperator>,
 }
@@ -79,7 +80,8 @@ impl KnowledgeRevision {
 
     fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
-        output.extend_from_slice(b"RFKR\x01");
+        output.extend_from_slice(b"RFKR\x02");
+        push_u64(&mut output, self.summarized_attempts);
         push_u64(&mut output, self.active_artifacts.len() as u64);
         for key in &self.active_artifacts {
             output.extend_from_slice(key);
@@ -105,9 +107,10 @@ impl KnowledgeRevision {
 
     fn decode(bytes: &[u8]) -> Result<Self, ()> {
         let mut input = bytes;
-        if take(&mut input, 5)? != b"RFKR\x01" {
+        if take(&mut input, 5)? != b"RFKR\x02" {
             return Err(());
         }
+        let summarized_attempts = read_u64(&mut input)?;
         let active_count = usize::try_from(read_u64(&mut input)?).map_err(|_| ())?;
         if active_count > input.len().saturating_div(32) || active_count > MAX_ACTIVE_ARTIFACTS {
             return Err(());
@@ -184,6 +187,7 @@ impl KnowledgeRevision {
             return Err(());
         }
         Ok(Self {
+            summarized_attempts,
             active_artifacts,
             operators,
         })
@@ -242,7 +246,7 @@ impl KnowledgeState {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
-        output.extend_from_slice(b"RFKS\x01");
+        output.extend_from_slice(b"RFKS\x02");
         push_u64(&mut output, self.generation);
         push_bytes(&mut output, &self.champion.encode());
         match &self.predecessor {
@@ -257,7 +261,7 @@ impl KnowledgeState {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ()> {
         let mut input = bytes;
-        if take(&mut input, 5)? != b"RFKS\x01" {
+        if take(&mut input, 5)? != b"RFKS\x02" {
             return Err(());
         }
         let generation = read_u64(&mut input)?;
@@ -272,6 +276,9 @@ impl KnowledgeState {
                 && (champion != KnowledgeRevision::default() || predecessor.is_some())
             || generation > 0 && predecessor.is_none()
             || predecessor.as_ref().is_some_and(|prior| prior == &champion)
+            || predecessor
+                .as_ref()
+                .is_some_and(|prior| prior.summarized_attempts > champion.summarized_attempts)
         {
             return Err(());
         }
@@ -288,76 +295,79 @@ impl KnowledgeState {
         observations: &[DerivationObservation],
         primitive_symbols: &BTreeSet<Vec<u8>>,
     ) -> bool {
-        let accepted = observations
-            .iter()
-            .filter(|observation| observation.accepted)
-            .map(|observation| ((observation.artifact, observation.claim), observation))
-            .collect::<BTreeMap<_, _>>();
-        std::iter::once((&self.champion, true))
-            .chain(self.predecessor.iter().map(|revision| (revision, false)))
-            .all(|(revision, is_champion)| {
-                revision
-                    .active_artifacts
+        for revision in std::iter::once(&self.champion).chain(self.predecessor.iter()) {
+            let Ok(summarized_count) = usize::try_from(revision.summarized_attempts) else {
+                return false;
+            };
+            let Some(summarized) = observations.get(..summarized_count) else {
+                return false;
+            };
+            let mut accepted = BTreeMap::<_, Vec<_>>::new();
+            for observation in summarized.iter().filter(|observation| observation.accepted) {
+                accepted
+                    .entry((observation.artifact, observation.claim))
+                    .or_default()
+                    .push(observation);
+            }
+            if revision
+                .active_artifacts
+                .iter()
+                .any(|key| !artifact_keys.contains(key))
+            {
+                return false;
+            }
+            for operator in &revision.operators {
+                if operator
+                    .steps
                     .iter()
-                    .all(|key| artifact_keys.contains(key))
-                    && revision.operators.iter().all(|operator| {
-                        operator
-                            .steps
-                            .iter()
-                            .all(|step| primitive_symbols.contains(step))
-                            && operator.support.iter().all(|attempt| {
-                                let Some(child) = observations
-                                    .iter()
-                                    .find(|item| item.id == *attempt && item.accepted)
-                                else {
-                                    return false;
-                                };
-                                let Some(parent) = accepted.get(&(child.parent, child.claim))
-                                else {
-                                    return false;
-                                };
+                    .any(|step| !primitive_symbols.contains(step))
+                {
+                    return false;
+                }
+                let mut support_claims = BTreeSet::new();
+                for attempt in &operator.support {
+                    let Some(child) = summarized
+                        .iter()
+                        .find(|item| item.id == *attempt && item.accepted)
+                    else {
+                        return false;
+                    };
+                    support_claims.insert(child.claim);
+                    if !accepted
+                        .get(&(child.parent, child.claim))
+                        .is_some_and(|parents| {
+                            parents.iter().any(|parent| {
                                 let mut steps = parent.operator_steps.clone();
                                 steps.extend(child.operator_steps.clone());
                                 steps == operator.steps
                             })
-                            && operator
-                                .support
-                                .iter()
-                                .filter_map(|attempt| {
-                                    observations
-                                        .iter()
-                                        .find(|item| item.id == *attempt)
-                                        .map(|item| item.claim)
-                                })
-                                .collect::<BTreeSet<_>>()
-                                .len()
-                                >= MIN_SEMANTIC_SUPPORT
-                            && {
-                                let observed_trials = observations
-                                    .iter()
-                                    .filter(|item| item.operator_identity == operator.symbol)
-                                    .count()
-                                    as u64;
-                                let observed_accepted = observations
-                                    .iter()
-                                    .filter(|item| {
-                                        item.operator_identity == operator.symbol && item.accepted
-                                    })
-                                    .count()
-                                    as u64;
-                                if is_champion {
-                                    operator.trials == observed_trials
-                                        && operator.accepted == observed_accepted
-                                } else {
-                                    operator.trials <= observed_trials
-                                        && operator.accepted <= observed_accepted
-                                }
-                            }
-                            && (operator.trials < MIN_DEACTIVATION_TRIALS
-                                || operator.active
-                                    == (operator.accepted.saturating_mul(4) >= operator.trials))
-                    })
-            })
+                        })
+                    {
+                        return false;
+                    }
+                }
+                if support_claims.len() < MIN_SEMANTIC_SUPPORT {
+                    return false;
+                }
+                let observed_trials = summarized
+                    .iter()
+                    .filter(|item| item.operator_identity == operator.symbol)
+                    .count() as u64;
+                let observed_accepted = summarized
+                    .iter()
+                    .filter(|item| item.operator_identity == operator.symbol && item.accepted)
+                    .count() as u64;
+                if operator.trials != observed_trials || operator.accepted != observed_accepted {
+                    return false;
+                }
+                if operator.trials >= MIN_DEACTIVATION_TRIALS
+                    && operator.active != (operator.accepted.saturating_mul(4) >= operator.trials)
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -457,6 +467,7 @@ fn build_revision(
         active.insert(key);
     }
     Some(KnowledgeRevision {
+        summarized_attempts: u64::try_from(observations.len()).unwrap_or(u64::MAX),
         active_artifacts: active.into_iter().collect(),
         operators,
     })
@@ -602,6 +613,13 @@ mod tests {
         let mut bad_ancestry = KnowledgeState::default().encode();
         bad_ancestry[5..13].copy_from_slice(&1_u64.to_le_bytes());
         assert!(KnowledgeState::decode(&bad_ancestry).is_err());
+        let mut bad_watermark = state.clone();
+        bad_watermark
+            .predecessor
+            .as_mut()
+            .unwrap()
+            .summarized_attempts = bad_watermark.champion.summarized_attempts.saturating_add(1);
+        assert!(KnowledgeState::decode(&bad_watermark.encode()).is_err());
         let mut malformed = state.pinned_revision().encode();
         let step = malformed
             .windows(8)
@@ -645,6 +663,31 @@ mod tests {
                 && retained.accepted == 0
                 && state.validate(&artifact_keys, &complete_ledger, &primitive_symbols)
         );
+    }
+
+    #[test]
+    fn historical_support_survives_an_alternative_parent_derivation() {
+        let support = (1..=8)
+            .flat_map(|case| chain(case, true))
+            .collect::<Vec<_>>();
+        let mut state = KnowledgeState::default();
+        state.consolidate(&support, [], []);
+        let mut complete_ledger = support;
+        complete_ledger.push(DerivationObservation {
+            id: [240; 32],
+            artifact: [2; 32],
+            parent: [241; 32],
+            claim: [1; 32],
+            operator_identity: b"alternate".to_vec(),
+            operator_steps: vec![b"alternate".to_vec()],
+            accepted: true,
+        });
+        let artifact_keys = complete_ledger
+            .iter()
+            .flat_map(|observation| [observation.artifact, observation.parent])
+            .collect();
+        let primitive_symbols = BTreeSet::from([b"simplify".to_vec(), b"alternate".to_vec()]);
+        assert!(state.validate(&artifact_keys, &complete_ledger, &primitive_symbols));
     }
 
     #[test]

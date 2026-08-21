@@ -34,7 +34,7 @@ impl SegmentKind {
         match self {
             Self::Artifacts | Self::Experience => 2,
             Self::Session | Self::Recovery => 1,
-            Self::Revisions => 3,
+            Self::Revisions => 4,
         }
     }
 }

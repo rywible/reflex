@@ -220,11 +220,12 @@ fn snapshot(path: &Path) -> Snapshot {
     let knowledge_length =
         usize::try_from(u64::from_le_bytes(revisions[64..72].try_into().unwrap())).unwrap();
     let mut knowledge = &revisions[72..72 + knowledge_length];
-    assert_eq!(take(&mut knowledge, 5), b"RFKS\x01");
+    assert_eq!(take(&mut knowledge, 5), b"RFKS\x02");
     let knowledge_generation = read_u64(&mut knowledge);
     let champion_length = usize::try_from(read_u64(&mut knowledge)).unwrap();
     let mut champion = take(&mut knowledge, champion_length);
-    assert_eq!(take(&mut champion, 5), b"RFKR\x01");
+    assert_eq!(take(&mut champion, 5), b"RFKR\x02");
+    read_u64(&mut champion);
     let active_count = usize::try_from(read_u64(&mut champion)).unwrap();
     take(&mut champion, active_count * 32);
     let operator_count = usize::try_from(read_u64(&mut champion)).unwrap();

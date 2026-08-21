@@ -40,6 +40,11 @@ const CONSUMED_V2_AUDIT_SHA256: &str =
 const CONSUMED_V3_REPORT: &str = "docs/experiments/u8-causal-confirmation-v3-consumed-audit.json";
 const CONSUMED_V3_AUDIT_SHA256: &str =
     "585c9e7ec1f2c64fb34fb2d9a300e72d5d29c2ea3ff34fca250807c4d990aaaf";
+#[cfg(test)]
+const CONSUMED_V4_REPORT: &str = "docs/experiments/u8-causal-confirmation-v4-consumed-audit.json";
+#[cfg(test)]
+const CONSUMED_V4_AUDIT_SHA256: &str =
+    "0eae44e4ca7a2ba050f02ab87c0e2de27fecde457d8744636e29afdd6d404787";
 const CASES_PER_REPLICATE: usize = 8_190;
 const REPLICATES: usize = 10;
 const VERIFICATION_REQUESTS: u64 = 10_500;
@@ -1460,27 +1465,30 @@ fn ablate_bundle(
 
 fn knowledge_without_operators(state: &[u8]) -> Result<Vec<u8>, AnyError> {
     let mut input = state;
-    if take(&mut input, 5)? != b"RFKS\x01" {
+    if take(&mut input, 5)? != b"RFKS\x02" {
         return Err("invalid Knowledge State".into());
     }
     read_u64(&mut input)?;
     let mut champion = take_sized(&mut input)?;
-    if take(&mut champion, 5)? != b"RFKR\x01" {
+    if take(&mut champion, 5)? != b"RFKR\x02" {
         return Err("invalid Knowledge Revision".into());
     }
+    let summarized_attempts = read_u64(&mut champion)?;
     let active_count = read_u64(&mut champion)?;
     let active = take(&mut champion, usize::try_from(active_count)? * 32)?;
-    let mut revision = b"RFKR\x01".to_vec();
+    let mut revision = b"RFKR\x02".to_vec();
+    revision.extend_from_slice(&summarized_attempts.to_le_bytes());
     revision.extend_from_slice(&active_count.to_le_bytes());
     revision.extend_from_slice(active);
     revision.extend_from_slice(&0_u64.to_le_bytes());
     let default_revision = [
-        b"RFKR\x01".as_slice(),
+        b"RFKR\x02".as_slice(),
+        &0_u64.to_le_bytes(),
         &0_u64.to_le_bytes(),
         &0_u64.to_le_bytes(),
     ]
     .concat();
-    let mut output = b"RFKS\x01".to_vec();
+    let mut output = b"RFKS\x02".to_vec();
     output.extend_from_slice(&1_u64.to_le_bytes());
     push_sized(&mut output, &revision);
     output.push(1);
@@ -1802,6 +1810,50 @@ mod tests {
             revision_ids(&std::fs::read(&no_model).unwrap()).unwrap().1,
             bootstrap_revision
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "full consumed-corpus recovery gate; run explicitly before successor confirmation"]
+    fn consumed_v4_full_treatment_recovers_with_derived_operators() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let report: ConsumedReport =
+            serde_json::from_slice(&std::fs::read(workspace.join(CONSUMED_V4_REPORT)).unwrap())
+                .unwrap();
+        assert_eq!(report.audit_corpus_sha256, CONSUMED_V4_AUDIT_SHA256);
+        let directory = std::env::temp_dir().join(format!(
+            "reflex-causal-derived-recovery-development-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let full = directory.join("full.bundle");
+        let bootstrap = directory.join("bootstrap.bundle");
+        build_training_bundles(&full, &bootstrap).unwrap();
+        let seeds = report.audit_corpora[0]
+            .iter()
+            .map(expression)
+            .collect::<Vec<_>>();
+        let origins = seeds
+            .iter()
+            .map(artifact_key)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap();
+        let evaluated = improve(
+            BitVecDomain::unary_u8(),
+            request(
+                seeds.clone(),
+                VERIFICATION_REQUESTS,
+                BundlePlan::Resume {
+                    source: full.clone(),
+                    target: full.clone(),
+                },
+            )
+            .unwrap(),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        let (count, aggregates, digest, _) = audit_outcome(&evaluated, &origins);
+        recover_child(seeds, &full, &origins, count, aggregates, &digest).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
