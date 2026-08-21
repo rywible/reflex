@@ -293,10 +293,9 @@ impl KnowledgeState {
             .filter(|observation| observation.accepted)
             .map(|observation| ((observation.artifact, observation.claim), observation))
             .collect::<BTreeMap<_, _>>();
-        [&self.champion]
-            .into_iter()
-            .chain(self.predecessor.iter())
-            .all(|revision| {
+        std::iter::once((&self.champion, true))
+            .chain(self.predecessor.iter().map(|revision| (revision, false)))
+            .all(|(revision, is_champion)| {
                 revision
                     .active_artifacts
                     .iter()
@@ -333,18 +332,27 @@ impl KnowledgeState {
                                 .collect::<BTreeSet<_>>()
                                 .len()
                                 >= MIN_SEMANTIC_SUPPORT
-                            && operator.trials
-                                == observations
+                            && {
+                                let observed_trials = observations
                                     .iter()
                                     .filter(|item| item.operator_identity == operator.symbol)
-                                    .count() as u64
-                            && operator.accepted
-                                == observations
+                                    .count()
+                                    as u64;
+                                let observed_accepted = observations
                                     .iter()
                                     .filter(|item| {
                                         item.operator_identity == operator.symbol && item.accepted
                                     })
-                                    .count() as u64
+                                    .count()
+                                    as u64;
+                                if is_champion {
+                                    operator.trials == observed_trials
+                                        && operator.accepted == observed_accepted
+                                } else {
+                                    operator.trials <= observed_trials
+                                        && operator.accepted <= observed_accepted
+                                }
+                            }
                             && (operator.trials < MIN_DEACTIVATION_TRIALS
                                 || operator.active
                                     == (operator.accepted.saturating_mul(4) >= operator.trials))
@@ -622,9 +630,21 @@ mod tests {
                 accepted: false,
             })
             .collect::<Vec<_>>();
-        state.consolidate(&failures, [], []);
+        let mut complete_ledger = support;
+        complete_ledger.extend(failures);
+        state.consolidate(&complete_ledger, [], []);
         let retained = &state.pinned_revision().operators()[0];
-        assert!(!retained.active() && retained.trials == 16 && retained.accepted == 0);
+        let primitive_symbols = BTreeSet::from([b"simplify".to_vec()]);
+        let artifact_keys = complete_ledger
+            .iter()
+            .flat_map(|observation| [observation.artifact, observation.parent])
+            .collect();
+        assert!(
+            !retained.active()
+                && retained.trials == 16
+                && retained.accepted == 0
+                && state.validate(&artifact_keys, &complete_ledger, &primitive_symbols)
+        );
     }
 
     #[test]

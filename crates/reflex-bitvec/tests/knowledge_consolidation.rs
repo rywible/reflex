@@ -72,6 +72,19 @@ fn verified_chains_become_bounded_macros_for_later_sessions() {
         BitVecDomain::unary_u8(),
         request(
             heldout.clone(),
+            10_000,
+            BundlePlan::Resume {
+                source: learned_full.clone(),
+                target: learned_full.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+    improve(
+        BitVecDomain::unary_u8(),
+        request(
+            heldout.clone(),
             u64::try_from(heldout.len() * 2).unwrap(),
             BundlePlan::Fresh {
                 target: bootstrap_constrained.clone(),
@@ -106,7 +119,7 @@ fn verified_chains_become_bounded_macros_for_later_sessions() {
         ),
         |_| ControlFlow::Continue(()),
     )
-    .unwrap();
+    .expect("a completed bundle containing exercised Derived Operators must recover");
     improve(
         BitVecDomain::unary_u8(),
         request(
