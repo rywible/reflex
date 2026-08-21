@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 mod causal;
 
-const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v6";
+const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v7";
 const CORPUS_NAME: &str = "unary-u8-full-ops-development-v2";
 const EXPECTED_SEMANTIC_OUTCOME: &str =
     "ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582";
@@ -171,7 +171,7 @@ fn run() -> Result<(), AnyError> {
 fn parse_output(arguments: &[String]) -> Result<PathBuf, AnyError> {
     match arguments {
         [] => Ok(PathBuf::from(
-            "docs/baselines/bootstrap-reference-domain-v6.json",
+            "docs/baselines/bootstrap-reference-domain-v7.json",
         )),
         [flag, path] if flag == "--output" => Ok(PathBuf::from(path)),
         _ => Err("baseline accepts only an optional --output PATH".into()),
@@ -734,7 +734,7 @@ mod tests {
         };
         assert_eq!(
             hash_json(&protocol).unwrap(),
-            "64c4b2a3eab20845cdba4ce267f673330a12d656f4bb9595200ad869bde4e2a1"
+            "14b108b35f336c134fa94139de5430adba0904f8471ffa44de4fb7c55fc0b880"
         );
     }
 
