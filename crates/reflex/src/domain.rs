@@ -63,12 +63,82 @@ pub trait StructuralView {
 
     fn root_sort(&self) -> Self::Sort;
     fn node_count(&self) -> usize;
+    fn node_sort(&self, node: usize) -> Option<Self::Sort>;
+    fn node_constructor(&self, node: usize) -> Option<Self::Constructor>;
+    /// Replaces `output` with the child node indexes for `node`.
+    fn write_children(&self, node: usize, output: &mut Vec<usize>) -> bool;
+    /// Replaces `output` with the canonical unsigned immediates for `node`.
+    fn write_immediates(&self, node: usize, output: &mut Vec<u64>) -> bool;
+    /// Heap storage owned by the artifact but not included in its inline size.
+    fn dynamic_resident_bytes(&self) -> u64;
+}
+
+#[derive(Clone, Debug)]
+pub struct ConstructorDescriptor<S, C> {
+    constructor: C,
+    symbol: SymbolId,
+    result_sort: S,
+    child_sorts: Vec<S>,
+    immediate_count: usize,
+    child_binding_depths: Vec<u32>,
+}
+
+impl<S, C> ConstructorDescriptor<S, C> {
+    /// Creates a structural constructor descriptor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `child_sorts` and `child_binding_depths` do not describe the
+    /// same number of child positions.
+    #[must_use]
+    pub fn new(
+        constructor: C,
+        symbol: SymbolId,
+        result_sort: S,
+        child_sorts: Vec<S>,
+        immediate_count: usize,
+        child_binding_depths: Vec<u32>,
+    ) -> Self {
+        assert_eq!(child_sorts.len(), child_binding_depths.len());
+        Self {
+            constructor,
+            symbol,
+            result_sort,
+            child_sorts,
+            immediate_count,
+            child_binding_depths,
+        }
+    }
+
+    pub fn constructor(&self) -> &C {
+        &self.constructor
+    }
+
+    pub fn symbol(&self) -> &SymbolId {
+        &self.symbol
+    }
+
+    pub fn result_sort(&self) -> &S {
+        &self.result_sort
+    }
+
+    pub fn child_sorts(&self) -> &[S] {
+        &self.child_sorts
+    }
+
+    pub fn immediate_count(&self) -> usize {
+        self.immediate_count
+    }
+
+    pub fn child_binding_depths(&self) -> &[u32] {
+        &self.child_binding_depths
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct StructuralSchema<S, C> {
     pub sorts: Vec<(S, SymbolId)>,
-    pub constructors: Vec<(C, SymbolId)>,
+    pub constructors: Vec<ConstructorDescriptor<S, C>>,
 }
 
 pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
@@ -82,6 +152,26 @@ pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
 
     fn schema(&self) -> &StructuralSchema<Self::Sort, Self::Constructor>;
     fn view<'a>(&'a self, artifact: &'a D::Artifact) -> Self::View<'a>;
+    fn compose(
+        &self,
+        constructor: Self::Constructor,
+        children: &[&D::Artifact],
+        immediates: &[u64],
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
+    fn extract(
+        &self,
+        artifact: &D::Artifact,
+        node: usize,
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
+    fn replace(
+        &self,
+        artifact: &D::Artifact,
+        node: usize,
+        replacement: &D::Artifact,
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
     fn encode_canonical(
         &self,
         artifact: &D::Artifact,
@@ -112,15 +202,38 @@ pub struct Seed<D: DomainDefinition> {
 
 pub struct SeedWriter<'a, D: DomainDefinition> {
     output: &'a mut Vec<Seed<D>>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a, D: DomainDefinition> SeedWriter<'a, D> {
     pub fn new(output: &'a mut Vec<Seed<D>>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<Seed<D>>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, seed: Seed<D>) {
-        self.output.push(seed);
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(seed);
+        }
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 
@@ -173,14 +286,46 @@ impl<O: Copy> OperatorDescriptor<O> {
 
 pub struct OperatorEnumerationBatch<'a, D: DomainDefinition, O> {
     artifacts: &'a [&'a D::Artifact],
+    locations: &'a [StructuralLocation],
     operators: &'a [O],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StructuralLocation {
+    artifact_index: usize,
+    node_index: usize,
+}
+
+impl StructuralLocation {
+    #[must_use]
+    pub fn new(artifact_index: usize, node_index: usize) -> Self {
+        Self {
+            artifact_index,
+            node_index,
+        }
+    }
+
+    #[must_use]
+    pub fn artifact_index(self) -> usize {
+        self.artifact_index
+    }
+
+    #[must_use]
+    pub fn node_index(self) -> usize {
+        self.node_index
+    }
 }
 
 impl<'a, D: DomainDefinition, O> OperatorEnumerationBatch<'a, D, O> {
     #[must_use]
-    pub fn new(artifacts: &'a [&'a D::Artifact], operators: &'a [O]) -> Self {
+    pub fn new(
+        artifacts: &'a [&'a D::Artifact],
+        locations: &'a [StructuralLocation],
+        operators: &'a [O],
+    ) -> Self {
         Self {
             artifacts,
+            locations,
             operators,
         }
     }
@@ -191,6 +336,11 @@ impl<'a, D: DomainDefinition, O> OperatorEnumerationBatch<'a, D, O> {
     }
 
     #[must_use]
+    pub fn locations(&self) -> &'a [StructuralLocation] {
+        self.locations
+    }
+
+    #[must_use]
     pub fn operators(&self) -> &'a [O] {
         self.operators
     }
@@ -198,15 +348,43 @@ impl<'a, D: DomainDefinition, O> OperatorEnumerationBatch<'a, D, O> {
 
 pub struct ApplicationWriter<'a, A> {
     output: &'a mut Vec<A>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a, A> ApplicationWriter<'a, A> {
     pub fn new(output: &'a mut Vec<A>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<A>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, application: A) {
-        self.output.push(application);
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(application);
+        }
+    }
+
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.remaining == 0
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 
@@ -217,18 +395,41 @@ pub struct Candidate<D: DomainDefinition> {
 
 pub struct CandidateWriter<'a, D: DomainDefinition> {
     output: &'a mut Vec<Candidate<D>>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
     pub fn new(output: &'a mut Vec<Candidate<D>>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<Candidate<D>>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, source_index: usize, artifact: D::Artifact) {
-        self.output.push(Candidate {
-            source_index,
-            artifact,
-        });
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(Candidate {
+                source_index,
+                artifact,
+            });
+        }
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 
@@ -305,29 +506,75 @@ pub enum Verdict<E> {
 
 pub struct VerdictWriter<'a, E> {
     output: &'a mut Vec<Verdict<E>>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a, E> VerdictWriter<'a, E> {
     pub fn new(output: &'a mut Vec<Verdict<E>>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<Verdict<E>>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, verdict: Verdict<E>) {
-        self.output.push(verdict);
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(verdict);
+        }
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 
 pub struct ReplayVerdictWriter<'a> {
     output: &'a mut Vec<bool>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a> ReplayVerdictWriter<'a> {
     pub fn new(output: &'a mut Vec<bool>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<bool>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, accepted: bool) {
-        self.output.push(accepted);
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(accepted);
+        }
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 

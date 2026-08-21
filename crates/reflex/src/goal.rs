@@ -204,6 +204,16 @@ impl<D: DomainDefinition> OptimizationGoal<D> {
         if preferred.len() != seen.len() || seen.iter().any(|metric| !preferred.contains(metric)) {
             return Err(GoalError::PreferenceDoesNotCoverObjectives);
         }
+        let mut tolerance_metrics = Vec::new();
+        for tolerance in &preference.tolerances {
+            if !seen.contains(&tolerance.metric) {
+                return Err(GoalError::ToleranceDoesNotReferenceObjective);
+            }
+            if tolerance_metrics.contains(&tolerance.metric) {
+                return Err(GoalError::DuplicateTolerance);
+            }
+            tolerance_metrics.push(tolerance.metric);
+        }
         Ok(Self {
             constraints: constraints.into_iter().collect(),
             objectives,
@@ -266,6 +276,10 @@ pub enum GoalError {
     PreferenceDoesNotCoverObjectives,
     UnknownMetric,
     InvalidObservation,
+    DuplicateTolerance,
+    ToleranceDoesNotReferenceObjective,
+    IncompatibleConstraints,
+    IncompatibleSuccessCondition,
 }
 
 impl fmt::Display for GoalError {

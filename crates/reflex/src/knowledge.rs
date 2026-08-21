@@ -334,12 +334,12 @@ impl KnowledgeState {
                                 .len()
                                 >= MIN_SEMANTIC_SUPPORT
                             && operator.trials
-                                <= observations
+                                == observations
                                     .iter()
                                     .filter(|item| item.operator_identity == operator.symbol)
                                     .count() as u64
                             && operator.accepted
-                                <= observations
+                                == observations
                                     .iter()
                                     .filter(|item| {
                                         item.operator_identity == operator.symbol && item.accepted

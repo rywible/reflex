@@ -3,9 +3,10 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use reflex::{
-    BundlePlan, Completion, Direction, GoalSet, ImprovementRequest, MeasurementConstraint,
-    NonEmpty, NonZeroDuration, Objective, OptimizationGoal, Preference, ResourceEnvelope,
-    SuccessCondition, ThresholdRelation, improve,
+    BundlePlan, Completion, Direction, GoalError, GoalSet, ImprovementRequest,
+    MeasurementConstraint, MeasurementTolerance, NonEmpty, NonZeroDuration, Objective,
+    OptimizationGoal, Preference, ResourceEnvelope, SessionError, SuccessCondition,
+    ThresholdRelation, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 
@@ -53,6 +54,46 @@ fn verification_budget_exhaustion_is_a_successful_completion() {
         "Seed replay consumes the budget, preserves the verified Seed, and publishes it"
     );
     std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn seed_ingestion_cannot_spend_candidate_verifications() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-seed-budget-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(
+            NonEmpty::try_from_iter([Expression::input(), Expression::constant(0)]).unwrap(),
+        ),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(1).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            request,
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::Resource)
+    ));
+    assert!(!bundle_path.exists());
 }
 
 #[test]
@@ -545,4 +586,160 @@ fn each_goal_retains_its_own_pareto_frontier() {
 
     assert_eq!(node_counts, [1, 3]);
     std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn incompatible_success_condition_is_rejected_before_search() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-invalid-success-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let constraints = [MeasurementConstraint::new(
+        Metric::NodeCount,
+        ThresholdRelation::AtMost,
+        1,
+    )];
+    let success = SuccessCondition::all(NonEmpty::one(MeasurementConstraint::new(
+        Metric::NodeCount,
+        ThresholdRelation::AtLeast,
+        2,
+    )));
+    let request = ImprovementRequest::new(
+        GoalSet::one(
+            OptimizationGoal::new(constraints, objectives, preference, Some(success)).unwrap(),
+        ),
+        SeedScope::one(Expression::input()),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            request,
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::InvalidGoal(
+            GoalError::IncompatibleSuccessCondition
+        ))
+    ));
+    assert!(!bundle_path.exists());
+}
+
+#[test]
+fn tolerances_must_uniquely_reference_objectives() {
+    let objective: NonEmpty<Objective<BitVecDomain>> =
+        NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let unrelated = Preference::tiered(
+        NonEmpty::one(NonEmpty::one(Metric::NodeCount)),
+        [MeasurementTolerance::new(Metric::Depth, 1)],
+    )
+    .unwrap();
+    assert!(matches!(
+        OptimizationGoal::new([], objective, unrelated, None),
+        Err(GoalError::ToleranceDoesNotReferenceObjective)
+    ));
+
+    let objective: NonEmpty<Objective<BitVecDomain>> =
+        NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let duplicate = Preference::tiered(
+        NonEmpty::one(NonEmpty::one(Metric::NodeCount)),
+        [
+            MeasurementTolerance::new(Metric::NodeCount, 1),
+            MeasurementTolerance::new(Metric::NodeCount, 2),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        OptimizationGoal::new([], objective, duplicate, None),
+        Err(GoalError::DuplicateTolerance)
+    ));
+}
+
+#[test]
+fn preference_tiers_steer_bootstrap_allocation_without_scalarizing_the_frontier() {
+    fn run(first: Metric, second: Metric, suffix: &str) -> Vec<usize> {
+        let bundle_path = std::env::temp_dir().join(format!(
+            "reflex-preference-{suffix}-{}-{}.bundle",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let deep = Expression::xor(
+            Expression::rotate_left(
+                Expression::rotate_left(Expression::rotate_left(Expression::input(), 1), 1),
+                1,
+            ),
+            Expression::constant(0),
+        );
+        let wide = Expression::xor(
+            Expression::xor(
+                Expression::wrapping_add(Expression::input(), Expression::constant(1)),
+                Expression::wrapping_add(Expression::input(), Expression::constant(2)),
+            ),
+            Expression::constant(0),
+        );
+        let objectives = NonEmpty::try_from_iter([
+            Objective::new(Metric::NodeCount, Direction::Minimize),
+            Objective::new(Metric::Depth, Direction::Minimize),
+        ])
+        .unwrap();
+        let tiers = NonEmpty::try_from_iter([NonEmpty::one(first), NonEmpty::one(second)]).unwrap();
+        let preference = Preference::tiered(
+            tiers,
+            [
+                MeasurementTolerance::new(Metric::NodeCount, 0),
+                MeasurementTolerance::new(Metric::Depth, 0),
+            ],
+        )
+        .unwrap();
+        let request = ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::new(NonEmpty::try_from_iter([deep, wide]).unwrap()),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            BundlePlan::Fresh {
+                target: bundle_path.clone(),
+            },
+        )
+        .unwrap();
+        let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        let counts = outcome
+            .pareto()
+            .artifacts()
+            .iter()
+            .map(|artifact| artifact.artifact().node_count())
+            .collect();
+        std::fs::remove_file(bundle_path).ok();
+        counts
+    }
+
+    let node_first = run(Metric::NodeCount, Metric::Depth, "node");
+    let depth_first = run(Metric::Depth, Metric::NodeCount, "depth");
+    assert!(
+        node_first.contains(&4) && !depth_first.contains(&4),
+        "changing only tier order must change which affordable opportunity is explored"
+    );
 }

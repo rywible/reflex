@@ -14,10 +14,11 @@ mod runtime;
 
 pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
-    ApplicationWriter, CandidateWriter, DomainDefinition, KernelRevision, OperatorAlgebra,
-    OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter,
-    SemanticIdentity, StructuralProtocol, Verdict, VerdictWriter, VerificationBatch,
-    VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, KernelRevision,
+    OperatorAlgebra, OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage, SeedSource,
+    SeedWriter, SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
+    VerdictWriter, VerificationBatch, VerificationKernel, VerificationRecord,
+    VerificationReplayBatch,
 };
 pub use goal::{
     Direction, EmptyGoalSet, GoalError, GoalSet, MeasurementConstraint, MeasurementTolerance,
@@ -28,7 +29,7 @@ pub use measurement::{
     MeasurementWriter, MetricOrdering, VerifiedBatch,
 };
 pub use session::{
-    ArtifactKey, Completion, ImprovementRequest, NonZeroDuration, ParetoSnapshot, ParetoUpdate,
-    RequestError, ResourceEnvelope, ResourceUsage, SessionError, SessionOutcome, VerifiedArtifact,
-    improve,
+    ArtifactKey, Completion, GoalId, ImprovementRequest, NonZeroDuration, ParetoSnapshot,
+    ParetoUpdate, RequestError, ResourceEnvelope, ResourceUsage, SessionError, SessionOutcome,
+    VerifiedArtifact, improve,
 };

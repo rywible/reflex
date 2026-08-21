@@ -278,10 +278,11 @@ impl LearningState {
             _ => return Err(()),
         };
         let specialist_count = usize::try_from(read_u64(&mut input)?).map_err(|_| ())?;
-        if specialist_count
-            > input
-                .len()
-                .saturating_div(5 + HEAD_COUNT * FEATURE_COUNT * 8 + 8)
+        if specialist_count > MAX_SPECIALISTS
+            || specialist_count
+                > input
+                    .len()
+                    .saturating_div(5 + HEAD_COUNT * FEATURE_COUNT * 8 + 8)
         {
             return Err(());
         }
@@ -1019,5 +1020,20 @@ mod tests {
         let mut invalid_ancestry = LearningState::default().encode();
         invalid_ancestry[14] = 1;
         assert!(LearningState::decode(&invalid_ancestry).is_err());
+    }
+
+    #[test]
+    fn learning_state_rejects_more_specialists_than_the_runtime_can_retain() {
+        let specialist = FtrlModel::zero();
+        let state = LearningState {
+            generation: 1,
+            champion: Some(FtrlModel::zero()),
+            predecessor: None,
+            predecessor_is_bootstrap: true,
+            specialists: vec![specialist; MAX_SPECIALISTS + 1],
+            roles: BTreeMap::new(),
+        };
+
+        assert!(LearningState::decode(&state.encode()).is_err());
     }
 }

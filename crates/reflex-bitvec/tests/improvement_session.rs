@@ -58,6 +58,7 @@ fn session_returns_a_smaller_verified_equivalent() {
             && outcome.usage().verification_requests == 2
             && outcome.pareto().artifacts().iter().any(|artifact| {
                 artifact.artifact().node_count() == 1
+                    && artifact.provenance() == b"simplify-known-identity"
                     && (0..=u8::MAX).all(|input| artifact.artifact().evaluate(input) == input)
             })
             && bundle_path.is_file(),

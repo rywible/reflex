@@ -137,8 +137,10 @@ fn observer_receives_one_monotonic_delta_per_completed_epoch() {
     )
     .unwrap();
     let mut deltas = Vec::new();
+    let mut affected_goals = Vec::new();
 
     improve(BitVecDomain::unary_u8(), request, |update| {
+        affected_goals.push(update.affected_goals().to_vec());
         deltas.push((
             update.sequence(),
             update
@@ -156,6 +158,13 @@ fn observer_receives_one_monotonic_delta_per_completed_epoch() {
         deltas,
         vec![(1, vec![4], 0), (2, vec![3], 1), (3, vec![1], 1)],
         "each update must atomically describe one committed Pareto transition"
+    );
+    assert!(
+        affected_goals.iter().all(|ids| ids.len() == 1)
+            && affected_goals
+                .windows(2)
+                .all(|pair| pair[0][0] == pair[1][0]),
+        "each delta names the same stable canonical Goal ID"
     );
     std::fs::remove_file(bundle_path).ok();
 }

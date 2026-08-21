@@ -17,10 +17,10 @@ use sha2::{Digest, Sha256};
 
 mod causal;
 
-const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v4";
-const CORPUS_NAME: &str = "unary-u8-xor-development-v1";
+const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v5";
+const CORPUS_NAME: &str = "unary-u8-full-ops-development-v2";
 const EXPECTED_SEMANTIC_OUTCOME: &str =
-    "339c0c6d5e20b4c8af292e7b32699576e474bc7828e451481d36e31d1bdb070f";
+    "ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582";
 const WARMUPS: u32 = 2;
 const REPLICATES: u32 = 10;
 const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -53,10 +53,12 @@ struct ChildResult {
     pareto_artifacts: usize,
     observer_additions: u64,
     semantic_outcome_sha256: String,
-    recovery_wall_ns: u64,
-    recovery_process_cpu_ns: u64,
-    recovery_verification_requests: u64,
-    recovery_semantic_outcome_sha256: String,
+    recovery_valid: bool,
+    recovery_failure: Option<String>,
+    recovery_wall_ns: Option<u64>,
+    recovery_process_cpu_ns: Option<u64>,
+    recovery_verification_requests: Option<u64>,
+    recovery_semantic_outcome_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,8 +157,12 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             causal::run_child(&arguments)
         }
+        Some("causal-materialize-audit") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            causal::materialize_audit(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm> [--output PATH]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit> [--output PATH]"
                 .into(),
         ),
     }
@@ -165,7 +171,7 @@ fn run() -> Result<(), AnyError> {
 fn parse_output(arguments: &[String]) -> Result<PathBuf, AnyError> {
     match arguments {
         [] => Ok(PathBuf::from(
-            "docs/baselines/bootstrap-reference-domain-v4.json",
+            "docs/baselines/bootstrap-reference-domain-v5.json",
         )),
         [flag, path] if flag == "--output" => Ok(PathBuf::from(path)),
         _ => Err("baseline accepts only an optional --output PATH".into()),
@@ -204,6 +210,16 @@ fn run_baseline(output: &Path) -> Result<(), AnyError> {
     };
     let protocol_sha256 = hash_json(&protocol)?;
     let environment = environment()?;
+    if environment.git_dirty {
+        return Err("baseline execution requires a clean committed worktree".into());
+    }
+    if output.exists() {
+        return Err(format!(
+            "refusing to replace an existing baseline report: {}",
+            output.display()
+        )
+        .into());
+    }
     let filesystem_root = std::env::current_dir()?.join("target/reflex-baseline-work");
     std::fs::create_dir_all(&filesystem_root)?;
     let ramfs_root =
@@ -272,6 +288,7 @@ fn run_baseline(output: &Path) -> Result<(), AnyError> {
     }
     let summaries = summarize(&runs);
     let failures = runs.iter().filter(|run| run.failure.is_some()).count();
+    let deviation_count = deviations.len();
     let mut report = Report {
         schema: "reflex-performance-report-v1",
         protocol_sha256,
@@ -290,10 +307,13 @@ fn run_baseline(output: &Path) -> Result<(), AnyError> {
     }
     std::fs::write(output, bytes)?;
     println!("wrote {} ({failures} failed assignments)", output.display());
-    if failures == 0 {
+    if failures == 0 && deviation_count == 0 {
         Ok(())
     } else {
-        Err(format!("{failures} baseline assignments failed; raw failures were retained").into())
+        Err(format!(
+            "{failures} baseline assignments failed and {deviation_count} protocol deviations occurred; raw evidence was retained"
+        )
+        .into())
     }
 }
 
@@ -336,8 +356,16 @@ fn parse_child_output(
     if !success {
         return (None, Some(format!("child failed: {stderr}")));
     }
-    match serde_json::from_str(stdout.trim()) {
-        Ok(result) => (Some(result), None),
+    match serde_json::from_str::<ChildResult>(stdout.trim()) {
+        Ok(result) => {
+            let failure = (!result.recovery_valid).then(|| {
+                format!(
+                    "recovery failed: {}",
+                    result.recovery_failure.as_deref().unwrap_or("unspecified")
+                )
+            });
+            (Some(result), failure)
+        }
         Err(error) => (None, Some(format!("malformed child output: {error}"))),
     }
 }
@@ -387,23 +415,54 @@ fn measure_assignment(assignment: Assignment, target: &Path) -> Result<ChildResu
     let usage = outcome.usage();
     let bundle_bytes = std::fs::metadata(target)?.len();
 
-    let recovery_wall_started = Instant::now();
-    let recovery_cpu_started = ProcessTime::try_now()?;
-    let recovered = improve(
-        BitVecDomain::unary_u8(),
-        request(
-            assignment.worker_threads,
-            corpus(),
-            BundlePlan::Resume {
-                source: target.to_path_buf(),
-                target: target.to_path_buf(),
-            },
-        )?,
-        |_| ControlFlow::Continue(()),
-    )?;
-    let recovery_wall_ns = duration_ns(recovery_wall_started.elapsed());
-    let recovery_process_cpu_ns = duration_ns(recovery_cpu_started.try_elapsed()?);
-    let recovery_semantic_outcome_sha256 = outcome_digest(recovered.pareto().artifacts());
+    let recovery = (|| -> Result<(u64, u64, u64, String), AnyError> {
+        let recovery_wall_started = Instant::now();
+        let recovery_cpu_started = ProcessTime::try_now()?;
+        let recovered = improve(
+            BitVecDomain::unary_u8(),
+            request(
+                assignment.worker_threads,
+                corpus(),
+                BundlePlan::Resume {
+                    source: target.to_path_buf(),
+                    target: target.to_path_buf(),
+                },
+            )?,
+            |_| ControlFlow::Continue(()),
+        )?;
+        Ok((
+            duration_ns(recovery_wall_started.elapsed()),
+            duration_ns(recovery_cpu_started.try_elapsed()?),
+            recovered.usage().verification_requests,
+            outcome_digest(recovered.pareto().artifacts()),
+        ))
+    })();
+    let (
+        recovery_valid,
+        recovery_failure,
+        recovery_wall_ns,
+        recovery_process_cpu_ns,
+        recovery_verification_requests,
+        recovery_semantic_outcome_sha256,
+    ) = match recovery {
+        Ok((wall, cpu, requests, digest)) if digest == semantic_outcome_sha256 => (
+            true,
+            None,
+            Some(wall),
+            Some(cpu),
+            Some(requests),
+            Some(digest),
+        ),
+        Ok((wall, cpu, requests, digest)) => (
+            false,
+            Some("completed recovery changed the Pareto Artifact-key digest".into()),
+            Some(wall),
+            Some(cpu),
+            Some(requests),
+            Some(digest),
+        ),
+        Err(error) => (false, Some(error.to_string()), None, None, None, None),
+    };
     Ok(ChildResult {
         assignment,
         completion: completion_name(outcome.completion()).into(),
@@ -418,9 +477,11 @@ fn measure_assignment(assignment: Assignment, target: &Path) -> Result<ChildResu
         pareto_artifacts: outcome.pareto().artifacts().len(),
         observer_additions,
         semantic_outcome_sha256,
+        recovery_valid,
+        recovery_failure,
         recovery_wall_ns,
         recovery_process_cpu_ns,
-        recovery_verification_requests: recovered.usage().verification_requests,
+        recovery_verification_requests,
         recovery_semantic_outcome_sha256,
     })
 }
@@ -532,7 +593,7 @@ fn summarize(runs: &[RecordedRun]) -> Vec<Summary> {
                 .collect();
             let recovery = results
                 .iter()
-                .map(|result| result.recovery_wall_ns)
+                .filter_map(|result| result.recovery_wall_ns)
                 .collect();
             Summary {
                 worker_threads,
@@ -654,7 +715,7 @@ mod tests {
         let corpus = corpus_hash().unwrap();
         assert_eq!(
             corpus,
-            "653f5b41c219a3ce89d1d1358a84fbb12ec6cc2aaccc9c8976b2a89884d9726c"
+            "c5c962fcd9f8016d6b5e5dec31890af5f9d6e5067402ead17637086a21dde95c"
         );
         let protocol = Protocol {
             version: PROTOCOL_VERSION,
@@ -673,7 +734,7 @@ mod tests {
         };
         assert_eq!(
             hash_json(&protocol).unwrap(),
-            "406b68fe3e85deab4c2fa8456bbfdd47082b0edcaba1dc265407fb66b45dd68d"
+            "98bb32c2506224f908917ffe251926f2fafce5178430c5ceaf6a4ed8f0eaada4"
         );
     }
 

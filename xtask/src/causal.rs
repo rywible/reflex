@@ -19,12 +19,15 @@ use sha2::{Digest, Sha256};
 type AnyError = Box<dyn std::error::Error>;
 type BundleSegment = (u8, u32, Vec<u8>);
 
-const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v2";
+const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v3";
 const EXPECTED_SPEC_SHA256: &str =
-    "1a5b592bdb7e74c98deebefa2a35ff5c196fcbfb94e9a1df86b1f6e906cfbb5e";
+    "aa95b69dc0940fdde4bc2087392764de597b08212f318745a19965c231b592b9";
 const CONSUMED_V1_REPORT: &str = "docs/experiments/u8-causal-confirmation-v1.json";
 const CONSUMED_V1_AUDIT_SHA256: &str =
     "7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c";
+const CONSUMED_V2_REPORT: &str = "docs/experiments/u8-causal-confirmation-v2-consumed-audit.json";
+const CONSUMED_V2_AUDIT_SHA256: &str =
+    "ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081";
 const CASES_PER_REPLICATE: usize = 8_190;
 const REPLICATES: usize = 10;
 const VERIFICATION_REQUESTS: u64 = 10_500;
@@ -38,16 +41,16 @@ const DERIVED_THRESHOLD: i64 = 200;
 const RESAMPLES: usize = 10_000;
 const PILOT_EXCLUSION_CASES: usize = 8_190;
 const AUDIT_SEEDS: [&str; REPLICATES] = [
-    "906d1974ccf1099f64d9e0639a5efce3d29384ae885593629578bc5835c8d104",
-    "00d3853231f26710ab9e306e8eb9d96ae591e7f8f027a0d6cdbaf952c9cc23e5",
-    "a9759234f7a951c34ed52b323252e6c371d95c244b25279826d86e37347f4865",
-    "c0b157a1c3be22935408d1dd179cbfe8a0e110bcbd307243372534bdab40802e",
-    "824c0b32a492a8e4f628f1c27d2846036e3c8b109d90c16845995280c6c152e3",
-    "489d2d972a34c72c1e983de6713d9bf73bf1dd9ec509867ea6c4326664e78830",
-    "a205f1c8633c6e4047403920ef6adc0847dc926ac6f90a8fd7b21dd44c3cd2ab",
-    "713402eae0bc27c693833426116783e5b41a2313ebd6db1c515d5aa3578c966e",
-    "7cd06e785070e1a57cb4c4ef9495fc789e7a1b15c11f8e09296b1ff7280bf8d7",
-    "e1e0603d17f9e955c0c09d2b9ac4644c94a39b48920017e05b7c5787c792cd6f",
+    "a0687f2adcf0fd2a34d6761c42d9c6c1619d02715138c663d4c42022cfb2132d",
+    "a80b9a65beba46ddeca2624db21043317aab1d1cfeebe8e1b1be58c9bede90e3",
+    "f11472a448c2bbeeafe8673c6e07bf169f6f96fd4a2278e4923bd547cc650b39",
+    "535fb3ca734393e84ed13dc80d8f36a3792149e48acec2048d490dbb7fc41ccf",
+    "4ec78f3889f50b73db8c8efcb11bef7a1ee96eb2c23edce81c37aa022ee3dbd4",
+    "7000b22c704e8c459f45fb6ed40d42bf8e78c5d52842c8b8fe633383c9c08f3e",
+    "e0c2f3d294006d111d9ef58cf3a5b5aa533e203d497a0575eb90adfc1edc432b",
+    "f620d2dae709d3520b294d0d3030e63bfea62fc865fd32124b3fde2d7cb2ea0a",
+    "0786d43ba8388e43174a646600fd126735e57c6b91039654a638ad3bcab8fbaf",
+    "61e2e198ae80182dbaf411ce91fa91bd78a1be882d8b7892761778731986e2ce",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -88,6 +91,14 @@ struct ConsumedReport {
     audit_corpora: Vec<Vec<CorpusRecord>>,
 }
 
+#[derive(Serialize)]
+struct AuditCorpusArtifact {
+    schema: &'static str,
+    specification_sha256: String,
+    audit_corpus_sha256: String,
+    audit_corpora: Vec<Vec<CorpusRecord>>,
+}
+
 #[derive(Debug, Serialize)]
 struct ExperimentSpec {
     version: &'static str,
@@ -119,6 +130,7 @@ struct ExperimentSpec {
     child_timeout_seconds: u64,
     primary_outcome: &'static str,
     protected_outcomes: Vec<&'static str>,
+    diagnostic_outcomes: Vec<&'static str>,
     practical_thresholds: BTreeMap<&'static str, i64>,
     uncertainty: &'static str,
     bootstrap_algorithm: &'static str,
@@ -136,8 +148,20 @@ struct ExperimentSpec {
 struct Aggregates {
     node_count: u64,
     depth: u64,
+    peak_live_temporaries: u64,
     encoded_bytes: u64,
     evaluator_operations: u64,
+    evaluation_nanoseconds: u64,
+}
+
+impl Aggregates {
+    fn same_deterministic_measurements(self, other: Self) -> bool {
+        self.node_count == other.node_count
+            && self.depth == other.depth
+            && self.peak_live_temporaries == other.peak_live_temporaries
+            && self.encoded_bytes == other.encoded_bytes
+            && self.evaluator_operations == other.evaluator_operations
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,6 +169,13 @@ struct AnytimePoint {
     observer_sequence: u64,
     pareto_artifacts: usize,
     aggregates: Aggregates,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ParetoArtifactResult {
+    artifact_key: String,
+    origin_key: String,
+    measurements: Aggregates,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,14 +191,19 @@ struct ChildResult {
     durable_bytes: u64,
     verification_requests: u64,
     pareto_artifacts: usize,
+    pareto_results: Vec<ParetoArtifactResult>,
     aggregates: Aggregates,
     anytime_curve: Vec<AnytimePoint>,
     audit_artifact_sha256: String,
     bundle_sha256: String,
     knowledge_revision: String,
     model_revision: String,
-    recovery_artifact_sha256: String,
-    recovery_verification_requests: u64,
+    evaluation_valid: bool,
+    evaluation_failure: Option<String>,
+    recovery_valid: bool,
+    recovery_failure: Option<String>,
+    recovery_artifact_sha256: Option<String>,
+    recovery_verification_requests: Option<u64>,
 }
 
 struct ChildAssignment {
@@ -237,7 +273,7 @@ struct Report {
 pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     let (output, specification, specification_sha256, environment) =
         confirm_configuration(arguments)?;
-    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v2");
+    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v3");
     if work.exists() {
         return Err(format!(
             "causal work directory already exists; preserve and inspect it before proceeding: {}",
@@ -258,11 +294,11 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
 
     let audit_corpora = generate_audit_corpora()?;
     let audit_corpus_sha256 = hash_json(&audit_corpora)?;
+    persist_audit_corpora(&work, &audit_corpora)?;
     let executable = std::env::current_exe()?;
     let mut runs = Vec::with_capacity(REPLICATES * Treatment::ALL.len());
-    for (replicate, corpus) in audit_corpora.iter().enumerate() {
+    for replicate in 0..audit_corpora.len() {
         let corpus_path = work.join(format!("audit-{replicate}.json"));
-        std::fs::write(&corpus_path, serde_json::to_vec(corpus)?)?;
         for order in 0..Treatment::ALL.len() {
             let treatment = Treatment::ALL[(order + replicate) % Treatment::ALL.len()];
             let template = match treatment {
@@ -338,6 +374,57 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     Ok(())
 }
 
+fn persist_audit_corpora(work: &Path, audit_corpora: &[Vec<CorpusRecord>]) -> Result<(), AnyError> {
+    std::fs::write(
+        work.join("audit-corpora.json"),
+        serde_json::to_vec_pretty(&audit_corpora)?,
+    )?;
+    for (replicate, corpus) in audit_corpora.iter().enumerate() {
+        std::fs::write(
+            work.join(format!("audit-{replicate}.json")),
+            serde_json::to_vec(corpus)?,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn materialize_audit(arguments: &[String]) -> Result<(), AnyError> {
+    if cfg!(debug_assertions) {
+        return Err("audit materialization must run with --release".into());
+    }
+    let output = match arguments {
+        [flag, path] if flag == "--output" => PathBuf::from(path),
+        _ => return Err("causal-materialize-audit requires --output PATH".into()),
+    };
+    let specification_sha256 = hash_json(&specification())?;
+    if specification_sha256 != EXPECTED_SPEC_SHA256 {
+        return Err("cannot materialize an audit corpus for a modified specification".into());
+    }
+    if environment()?.git_dirty {
+        return Err("audit materialization requires a clean committed worktree".into());
+    }
+    if output.exists() {
+        return Err(format!(
+            "refusing to replace an existing audit artifact: {}",
+            output.display()
+        )
+        .into());
+    }
+    let audit_corpora = generate_audit_corpora()?;
+    let artifact = AuditCorpusArtifact {
+        schema: "reflex-consumed-audit-corpus-v1",
+        specification_sha256,
+        audit_corpus_sha256: hash_json(&audit_corpora)?,
+        audit_corpora,
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
+    println!("wrote {}", output.display());
+    Ok(())
+}
+
 fn persist_raw_run(work: &Path, run: &RecordedRun) -> Result<(), AnyError> {
     std::fs::write(
         work.join(format!(
@@ -357,7 +444,7 @@ fn confirm_configuration(
         return Err("the causal harness must run with --release".into());
     }
     let output = match arguments {
-        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v2.json"),
+        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v3.json"),
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-confirm accepts only an optional --output PATH".into()),
     };
@@ -411,39 +498,37 @@ pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
     let wall_ns = duration_ns(wall.elapsed());
     let process_cpu_ns = duration_ns(cpu.try_elapsed()?);
     let usage = outcome.usage();
-    validate_evaluation(&outcome)?;
-    let (pareto_artifacts, aggregates, audit_artifact_sha256) =
+    let mut evaluation_failures = Vec::new();
+    if let Err(error) = validate_evaluation(&outcome) {
+        evaluation_failures.push(error.to_string());
+    }
+    let (pareto_artifacts, aggregates, audit_artifact_sha256, pareto_results) =
         audit_outcome(&outcome, &audit_origins);
     if pareto_artifacts != CASES_PER_REPLICATE {
-        return Err(format!(
+        evaluation_failures.push(format!(
             "expected {CASES_PER_REPLICATE} audit Pareto Artifacts, got {pareto_artifacts}"
-        )
-        .into());
+        ));
     }
-    trace.finish(aggregates, pareto_artifacts);
+    if let Err(error) = trace.finish(aggregates, pareto_artifacts) {
+        evaluation_failures.push(error);
+    }
     let bundle_sha256 = hash_file(&target)?;
     let revisions = revision_ids(&std::fs::read(&target)?)?;
-    let recovered = improve(
-        BitVecDomain::unary_u8(),
-        recovery_request(
-            seeds,
-            1_000_000,
-            BundlePlan::Resume {
-                source: target.clone(),
-                target: target.clone(),
-            },
-        )?,
-        |_| ControlFlow::Continue(()),
-    )?;
-    let (recovery_count, recovery_aggregates, recovery_artifact_sha256) =
-        audit_outcome(&recovered, &audit_origins);
-    if recovered.completion() != Completion::SuccessConditionsSatisfied
-        || recovery_count != pareto_artifacts
-        || recovery_aggregates != aggregates
-        || recovery_artifact_sha256 != audit_artifact_sha256
-    {
-        return Err("completed recovery changed the accepted audit Pareto result".into());
-    }
+    let recovery = recover_child(
+        seeds,
+        &target,
+        &audit_origins,
+        pareto_artifacts,
+        aggregates,
+        &audit_artifact_sha256,
+    );
+    let (recovery_valid, recovery_failure, recovery_artifact_sha256, recovery_requests) =
+        match recovery {
+            Ok((artifact, requests)) => (true, None, Some(artifact), Some(requests)),
+            Err(error) => (false, Some(error.to_string()), None, None),
+        };
+    let evaluation_valid = evaluation_failures.is_empty();
+    let evaluation_failure = (!evaluation_valid).then(|| evaluation_failures.join("; "));
     let result = ChildResult {
         replicate,
         treatment,
@@ -456,17 +541,53 @@ pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
         durable_bytes: usage.durable_bytes,
         verification_requests: usage.verification_requests,
         pareto_artifacts,
+        pareto_results,
         aggregates,
         anytime_curve: trace.points,
         audit_artifact_sha256,
         bundle_sha256,
         knowledge_revision: hex(&revisions.0),
         model_revision: hex(&revisions.1),
+        evaluation_valid,
+        evaluation_failure,
+        recovery_valid,
+        recovery_failure,
         recovery_artifact_sha256,
-        recovery_verification_requests: recovered.usage().verification_requests,
+        recovery_verification_requests: recovery_requests,
     };
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+fn recover_child(
+    seeds: Vec<Expression>,
+    target: &Path,
+    audit_origins: &BTreeSet<[u8; 32]>,
+    expected_count: usize,
+    expected_aggregates: Aggregates,
+    expected_artifact_sha256: &str,
+) -> Result<(String, u64), AnyError> {
+    let recovered = improve(
+        BitVecDomain::unary_u8(),
+        recovery_request(
+            seeds,
+            1_000_000,
+            BundlePlan::Resume {
+                source: target.to_path_buf(),
+                target: target.to_path_buf(),
+            },
+        )?,
+        |_| ControlFlow::Continue(()),
+    )?;
+    let (count, aggregates, artifact_sha256, _) = audit_outcome(&recovered, audit_origins);
+    if recovered.completion() != Completion::SuccessConditionsSatisfied
+        || count != expected_count
+        || !aggregates.same_deterministic_measurements(expected_aggregates)
+        || artifact_sha256 != expected_artifact_sha256
+    {
+        return Err("completed recovery changed the accepted audit Pareto result".into());
+    }
+    Ok((artifact_sha256, recovered.usage().verification_requests))
 }
 
 fn validate_evaluation(outcome: &reflex::SessionOutcome<BitVecDomain>) -> Result<(), AnyError> {
@@ -513,9 +634,9 @@ fn specification() -> ExperimentSpec {
     ExperimentSpec {
         version: SPEC_VERSION,
         hypothesis: "under equal evaluation envelopes, shared consolidated Reflex improves unseen unary u8 semantic Campaigns more than isolated Bootstrap",
-        domain_identity: "reflex-bitvec/u8/unary/xor-add-rotl/v2",
-        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, and every consumed v1 audit semantic group",
-        consumed_audit_corpus: "docs/experiments/u8-causal-confirmation-v1.json with audit corpus sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c",
+        domain_identity: "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v3",
+        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, every consumed v1 audit semantic group, and every consumed v2 audit semantic group",
+        consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c and v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081",
         training_generator: "96 refuted Seeds xor(input,c) for c=1..96 followed by 96 useful Seeds xor(xor(xor(input,c),0),0) for c=97..192",
         training_verification_requests: 100_000,
         pilot_exclusion_cases: PILOT_EXCLUSION_CASES,
@@ -523,8 +644,8 @@ fn specification() -> ExperimentSpec {
         audit_generator: "sha256(seed || little-endian counter) rejection sampling into globally unique add/rotate truth-table groups; ordinal-balanced surface categories",
         audit_surface_categories: "bytes map to c1=(b0 mod 255)+1,r1=(b1 mod 7)+1,c2=(b2 mod 255)+1,r2=(b3 mod 7)+1; accepted ordinal category cycles [xor(base,31),xor(base,0),xor(xor(base,0),0)] where base=rotl(add(rotl(add(input,c1),r1),c2),r2)",
         semantic_group_digest: "sha256('reflex-u8-semantic-function-v1\\0' || outputs for inputs 0..255 in ascending order)",
-        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1 audit truth-table group, and every v2 audit group accepted by an earlier replicate",
-        audit_exposure: "build and validate all training and ablation bundles before generating any audit corpus; execute immediately after generation and publish every record",
+        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1 and v2 audit truth-table group, and every v3 audit group accepted by an earlier replicate",
+        audit_exposure: "build and validate all training and ablation bundles before generating any audit corpus; persist the complete corpus artifact and every per-replicate corpus before the first assignment; execute immediately after generation and publish every record",
         audit_seeds: AUDIT_SEEDS.to_vec(),
         independent_replicates: REPLICATES,
         cases_per_replicate: CASES_PER_REPLICATE,
@@ -547,6 +668,10 @@ fn specification() -> ExperimentSpec {
             "aggregate encoded bytes",
             "aggregate evaluator operations",
         ],
+        diagnostic_outcomes: vec![
+            "aggregate peak live temporaries (reported, not a confirmation gate)",
+            "aggregate environment-pinned evaluation nanoseconds (reported, not a confirmation gate)",
+        ],
         practical_thresholds: BTreeMap::from([
             ("bootstrap-minus-full", BOOTSTRAP_THRESHOLD),
             ("no-model-minus-full", MODEL_THRESHOLD),
@@ -558,7 +683,7 @@ fn specification() -> ExperimentSpec {
         stopping: "execute every assigned process exactly once; no outcome-dependent stopping",
         exclusions: "none; crashes, timeouts, malformed results, and deviations are retained and prevent confirmation",
         decision: "confirm only if full beats Bootstrap and both one-factor ablations above practical thresholds, all protected aggregates do not regress pairwise, every assignment recovers identically, and no Protocol Deviation occurs",
-        mode: "frozen evaluation; post-audit adaptation is discarded",
+        mode: "online adaptation during each evaluation assignment; each treatment starts from its fixed pre-audit bundle and the post-audit bundle is discarded after recovery validation",
         pareto_scope: "analyze exactly final Pareto Artifacts whose origin key is one of the replicate's audit Seeds; training Artifacts are excluded from outcomes",
         anytime_trace: "record audit-origin Pareto aggregate totals at observer sequence 1, every 256th sequence, and the final sequence",
         recovery: "resume each completed output with the same Seeds, a 1000000-request replay envelope, and a trivially satisfied NodeCount<=u64::MAX Success Condition; require SuccessConditionsSatisfied before search plus identical audit count, aggregates, and Artifact-key digest",
@@ -608,6 +733,7 @@ fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
     let mut excluded = development_semantics();
     excluded.extend(pilot_semantics());
     excluded.extend(consumed_v1_semantics()?);
+    excluded.extend(consumed_v2_semantics()?);
     let mut global = excluded.clone();
     let mut corpora = Vec::with_capacity(REPLICATES);
     for seed in AUDIT_SEEDS {
@@ -644,26 +770,37 @@ fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
 }
 
 fn consumed_v1_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    consumed_semantics(CONSUMED_V1_REPORT, CONSUMED_V1_AUDIT_SHA256)
+}
+
+fn consumed_v2_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    consumed_semantics(CONSUMED_V2_REPORT, CONSUMED_V2_AUDIT_SHA256)
+}
+
+fn consumed_semantics(
+    report_path: &str,
+    expected_audit_sha256: &str,
+) -> Result<BTreeSet<[u8; 32]>, AnyError> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("xtask manifest must have a workspace parent")?;
     let report: ConsumedReport =
-        serde_json::from_slice(&std::fs::read(workspace.join(CONSUMED_V1_REPORT))?)?;
-    if report.audit_corpus_sha256 != CONSUMED_V1_AUDIT_SHA256
-        || hash_json(&report.audit_corpora)? != CONSUMED_V1_AUDIT_SHA256
+        serde_json::from_slice(&std::fs::read(workspace.join(report_path))?)?;
+    if report.audit_corpus_sha256 != expected_audit_sha256
+        || hash_json(&report.audit_corpora)? != expected_audit_sha256
         || report.audit_corpora.len() != REPLICATES
         || report
             .audit_corpora
             .iter()
             .any(|corpus| corpus.len() != CASES_PER_REPLICATE)
     {
-        return Err("consumed v1 audit corpus does not match its registered identity".into());
+        return Err("consumed audit corpus does not match its registered identity".into());
     }
     let mut semantics = BTreeSet::new();
     for record in report.audit_corpora.into_iter().flatten() {
         let registered = decode_hex_32(&record.semantic_sha256)?;
         if truth_digest(&expression(&record)) != registered || !semantics.insert(registered) {
-            return Err("consumed v1 audit corpus is invalid or semantically duplicated".into());
+            return Err("consumed audit corpus is invalid or semantically duplicated".into());
         }
     }
     Ok(semantics)
@@ -764,6 +901,7 @@ fn request_with_success(
     let metrics = NonEmpty::try_from_iter([
         Metric::NodeCount,
         Metric::Depth,
+        Metric::PeakLiveTemporaries,
         Metric::EncodedBytes,
         Metric::EvaluatorOperations,
     ])
@@ -819,13 +957,16 @@ fn artifact_key(expression: &Expression) -> Result<[u8; 32], AnyError> {
 fn audit_outcome(
     outcome: &reflex::SessionOutcome<BitVecDomain>,
     origins: &BTreeSet<[u8; 32]>,
-) -> (usize, Aggregates, String) {
+) -> (usize, Aggregates, String, Vec<ParetoArtifactResult>) {
     let mut keys = Vec::new();
+    let mut pareto_results = Vec::new();
     let mut aggregates = Aggregates {
         node_count: 0,
         depth: 0,
+        peak_live_temporaries: 0,
         encoded_bytes: 0,
         evaluator_operations: 0,
+        evaluation_nanoseconds: 0,
     };
     let artifacts = outcome
         .pareto()
@@ -835,23 +976,44 @@ fn audit_outcome(
         .collect::<Vec<_>>();
     for artifact in &artifacts {
         keys.push(artifact.key());
+        let mut artifact_measurements = Aggregates::default();
         for measurement in artifact.measurements() {
             match measurement.metric {
-                Metric::NodeCount => aggregates.node_count += measurement.observation,
-                Metric::Depth => aggregates.depth += measurement.observation,
-                Metric::EncodedBytes => aggregates.encoded_bytes += measurement.observation,
+                Metric::NodeCount => artifact_measurements.node_count = measurement.observation,
+                Metric::Depth => artifact_measurements.depth = measurement.observation,
+                Metric::PeakLiveTemporaries => {
+                    artifact_measurements.peak_live_temporaries = measurement.observation;
+                }
+                Metric::EncodedBytes => {
+                    artifact_measurements.encoded_bytes = measurement.observation;
+                }
                 Metric::EvaluatorOperations => {
-                    aggregates.evaluator_operations += measurement.observation;
+                    artifact_measurements.evaluator_operations = measurement.observation;
+                }
+                Metric::EvaluationNanoseconds => {
+                    artifact_measurements.evaluation_nanoseconds = measurement.observation;
                 }
             }
         }
+        add_aggregates(&mut aggregates, artifact_measurements);
+        pareto_results.push(ParetoArtifactResult {
+            artifact_key: hex(artifact.key().as_bytes()),
+            origin_key: hex(artifact.origin_key().as_bytes()),
+            measurements: artifact_measurements,
+        });
     }
     keys.sort_unstable();
+    pareto_results.sort_unstable_by(|left, right| left.artifact_key.cmp(&right.artifact_key));
     let mut digest = Sha256::new();
     for key in keys {
         digest.update(key.as_bytes());
     }
-    (artifacts.len(), aggregates, hex(&digest.finalize()))
+    (
+        artifacts.len(),
+        aggregates,
+        hex(&digest.finalize()),
+        pareto_results,
+    )
 }
 
 struct AuditTrace<'a> {
@@ -906,15 +1068,10 @@ impl<'a> AuditTrace<'a> {
         }
     }
 
-    fn finish(&mut self, aggregates: Aggregates, pareto_artifacts: usize) {
-        assert_eq!(
-            self.aggregates, aggregates,
-            "observer aggregate must match outcome"
-        );
-        assert_eq!(
-            self.pareto_artifacts, pareto_artifacts,
-            "observer frontier must match outcome"
-        );
+    fn finish(&mut self, aggregates: Aggregates, pareto_artifacts: usize) -> Result<(), String> {
+        if self.aggregates != aggregates || self.pareto_artifacts != pareto_artifacts {
+            return Err("observer trace did not match the completed outcome".into());
+        }
         if self
             .points
             .last()
@@ -922,6 +1079,7 @@ impl<'a> AuditTrace<'a> {
         {
             self.push_point();
         }
+        Ok(())
     }
 
     fn push_point(&mut self) {
@@ -939,9 +1097,15 @@ fn artifact_aggregates(artifact: &reflex::VerifiedArtifact<BitVecDomain>) -> Agg
         match measurement.metric {
             Metric::NodeCount => aggregates.node_count = measurement.observation,
             Metric::Depth => aggregates.depth = measurement.observation,
+            Metric::PeakLiveTemporaries => {
+                aggregates.peak_live_temporaries = measurement.observation;
+            }
             Metric::EncodedBytes => aggregates.encoded_bytes = measurement.observation,
             Metric::EvaluatorOperations => {
                 aggregates.evaluator_operations = measurement.observation;
+            }
+            Metric::EvaluationNanoseconds => {
+                aggregates.evaluation_nanoseconds = measurement.observation;
             }
         }
     }
@@ -951,15 +1115,19 @@ fn artifact_aggregates(artifact: &reflex::VerifiedArtifact<BitVecDomain>) -> Agg
 fn add_aggregates(total: &mut Aggregates, value: Aggregates) {
     total.node_count += value.node_count;
     total.depth += value.depth;
+    total.peak_live_temporaries += value.peak_live_temporaries;
     total.encoded_bytes += value.encoded_bytes;
     total.evaluator_operations += value.evaluator_operations;
+    total.evaluation_nanoseconds += value.evaluation_nanoseconds;
 }
 
 fn subtract_aggregates(total: &mut Aggregates, value: Aggregates) {
     total.node_count -= value.node_count;
     total.depth -= value.depth;
+    total.peak_live_temporaries -= value.peak_live_temporaries;
     total.encoded_bytes -= value.encoded_bytes;
     total.evaluator_operations -= value.evaluator_operations;
+    total.evaluation_nanoseconds -= value.evaluation_nanoseconds;
 }
 
 fn run_assignment(
@@ -970,6 +1138,10 @@ fn run_assignment(
     corpus: &Path,
     target: &Path,
 ) -> Result<RecordedRun, AnyError> {
+    let stdout_path = target.with_extension("child.stdout");
+    let stderr_path = target.with_extension("child.stderr");
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut child = Command::new(executable)
         .arg("causal-child")
         .arg("--replicate")
@@ -980,8 +1152,8 @@ fn run_assignment(
         .arg(corpus)
         .arg("--target")
         .arg(target)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()?;
     let started = Instant::now();
     let timed_out = loop {
@@ -994,9 +1166,11 @@ fn run_assignment(
         }
         thread::sleep(Duration::from_millis(25));
     };
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let status = child.wait()?;
+    let stdout = std::fs::read_to_string(&stdout_path)?;
+    let stderr = std::fs::read_to_string(&stderr_path)?;
+    std::fs::remove_file(stdout_path)?;
+    std::fs::remove_file(stderr_path)?;
     let (result, failure) = if timed_out {
         (
             None,
@@ -1004,10 +1178,26 @@ fn run_assignment(
                 "child exceeded the {CHILD_TIMEOUT_SECONDS}-second process timeout"
             )),
         )
-    } else if output.status.success() {
+    } else if status.success() {
         match serde_json::from_str::<ChildResult>(stdout.trim()) {
             Ok(result) if result.replicate == replicate && result.treatment == treatment => {
-                (Some(result), None)
+                let failure = if !result.evaluation_valid {
+                    Some(format!(
+                        "invalid evaluation: {}",
+                        result
+                            .evaluation_failure
+                            .as_deref()
+                            .unwrap_or("unspecified")
+                    ))
+                } else if !result.recovery_valid {
+                    Some(format!(
+                        "recovery failed: {}",
+                        result.recovery_failure.as_deref().unwrap_or("unspecified")
+                    ))
+                } else {
+                    None
+                };
+                (Some(result), failure)
             }
             Ok(_) => (None, Some("child assignment identity mismatch".into())),
             Err(error) => (None, Some(format!("malformed child output: {error}"))),
@@ -1019,7 +1209,7 @@ fn run_assignment(
         replicate,
         treatment,
         order,
-        exit_code: output.status.code(),
+        exit_code: status.code(),
         stdout,
         stderr,
         result,
@@ -1030,7 +1220,10 @@ fn run_assignment(
 fn analyze(runs: &[RecordedRun], deviations: &mut Vec<String>) -> Vec<Contrast> {
     let mut by_assignment = BTreeMap::new();
     for run in runs {
-        if let Some(result) = &run.result {
+        if let Some(result) = &run.result
+            && result.evaluation_valid
+            && result.recovery_valid
+        {
             by_assignment.insert((run.replicate, run.treatment), result);
         }
     }
@@ -1234,14 +1427,15 @@ fn knowledge_revision_id(
             1 => Some(take(&mut input, 32)?.try_into()?),
             _ => return Err("invalid parent marker".into()),
         };
-        records.push((<[u8; 32]>::from(key.finalize()), origin, parent));
+        let provenance = take_sized(&mut input)?.to_vec();
+        records.push((<[u8; 32]>::from(key.finalize()), origin, parent, provenance));
     }
     records.sort_unstable_by_key(|record| record.0);
     let mut digest = Sha256::new();
     digest.update(b"reflex-knowledge-revision-v1\0");
     digest.update((identity.len() as u64).to_le_bytes());
     digest.update(identity);
-    for (key, origin, parent) in records {
+    for (key, origin, parent, provenance) in records {
         digest.update(key);
         digest.update(origin);
         if let Some(parent) = parent {
@@ -1250,6 +1444,8 @@ fn knowledge_revision_id(
         } else {
             digest.update([0]);
         }
+        digest.update((provenance.len() as u64).to_le_bytes());
+        digest.update(provenance);
     }
     let mut state_input = state;
     take(&mut state_input, 5)?;
@@ -1464,7 +1660,10 @@ mod tests {
             recovered.completion(),
             Completion::SuccessConditionsSatisfied
         );
-        assert_eq!(audit_outcome(&recovered, &origins), expected);
+        let actual = audit_outcome(&recovered, &origins);
+        assert_eq!(actual.0, expected.0);
+        assert!(actual.1.same_deterministic_measurements(expected.1));
+        assert_eq!(actual.2, expected.2);
         std::fs::remove_file(target).unwrap();
     }
 
@@ -1472,6 +1671,14 @@ mod tests {
     fn consumed_v1_audit_is_complete_and_content_addressed() {
         assert_eq!(
             consumed_v1_semantics().unwrap().len(),
+            REPLICATES * CASES_PER_REPLICATE
+        );
+    }
+
+    #[test]
+    fn consumed_v2_audit_is_complete_and_content_addressed() {
+        assert_eq!(
+            consumed_v2_semantics().unwrap().len(),
             REPLICATES * CASES_PER_REPLICATE
         );
     }

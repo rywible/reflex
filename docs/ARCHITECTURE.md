@@ -302,6 +302,19 @@ The capability Modules expose semantic facts and efficient operations. They do n
 ### Structural Protocol
 
 ```rust
+pub trait StructuralView {
+    type Sort: Copy + Eq + Hash;
+    type Constructor: Copy + Eq + Hash;
+
+    fn root_sort(&self) -> Self::Sort;
+    fn node_count(&self) -> usize;
+    fn node_sort(&self, node: usize) -> Option<Self::Sort>;
+    fn node_constructor(&self, node: usize) -> Option<Self::Constructor>;
+    fn write_children(&self, node: usize, output: &mut Vec<usize>) -> bool;
+    fn write_immediates(&self, node: usize, output: &mut Vec<u64>) -> bool;
+    fn dynamic_resident_bytes(&self) -> u64;
+}
+
 pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
     type Sort: Copy + Eq + Hash + Send + Sync + 'static;
     type Constructor: Copy + Eq + Hash + Send + Sync + 'static;
@@ -317,6 +330,29 @@ pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
     fn schema(&self) -> &StructuralSchema<Self::Sort, Self::Constructor>;
 
     fn view<'a>(&'a self, artifact: &'a D::Artifact) -> Self::View<'a>;
+
+    fn compose(
+        &self,
+        constructor: Self::Constructor,
+        children: &[&D::Artifact],
+        immediates: &[u64],
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
+
+    fn extract(
+        &self,
+        artifact: &D::Artifact,
+        node: usize,
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
+
+    fn replace(
+        &self,
+        artifact: &D::Artifact,
+        node: usize,
+        replacement: &D::Artifact,
+        scratch: &mut Self::Scratch,
+    ) -> Result<D::Artifact, D::Error>;
 
     fn encode_canonical(
         &self,
@@ -403,7 +439,7 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
 }
 ```
 
-`enumerate_legal` describes deterministic legal parameterizations of Runtime-selected primitive Operators at Runtime-selected structural locations. It may not rank, prune for predicted value, allocate resources, or create its own search loop. The Runtime chooses which Artifacts, locations, and Operators receive attention and how returned applications are scheduled.
+`OperatorEnumerationBatch` contains the Runtime-selected Artifacts, explicit structural locations, and primitive Operators. `enumerate_legal` describes deterministic legal parameterizations only at those locations. It may not rank, prune for predicted value, allocate resources, or create its own search loop. The Runtime chooses which Artifacts, locations, and Operators receive attention and how returned applications are scheduled.
 
 Primitive and Derived Operators produce Candidates only.
 

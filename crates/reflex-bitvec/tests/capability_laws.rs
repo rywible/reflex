@@ -7,7 +7,8 @@ use reflex::{
     BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, MeasurementEnvironment,
     MeasurementSpace, MeasurementWriter, MetricOrdering, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, SeedSource, SeedWriter, StructuralProtocol,
-    Verdict, VerdictWriter, VerificationBatch, VerificationKernel, VerifiedBatch, improve,
+    StructuralView, Verdict, VerdictWriter, VerificationBatch, VerificationKernel, VerifiedBatch,
+    improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 
@@ -30,6 +31,39 @@ fn canonical_structure_interns_equal_subexpressions() {
         ],
         "canonical construction hash-conses structurally equal children"
     );
+}
+
+#[test]
+fn structural_protocol_exposes_and_composes_typed_locations() {
+    let domain = BitVecDomain::unary_u8();
+    let input = Expression::input();
+    let constant = domain
+        .structure()
+        .compose(reflex_bitvec::Constructor::Constant, &[], &[7], &mut ())
+        .unwrap();
+    let expression = domain
+        .structure()
+        .compose(
+            reflex_bitvec::Constructor::Xor,
+            &[&input, &constant],
+            &[],
+            &mut (),
+        )
+        .unwrap();
+    let view = domain.structure().view(&expression);
+    let mut children = Vec::new();
+    let mut immediates = Vec::new();
+    assert!(view.write_children(2, &mut children));
+    assert!(view.write_immediates(1, &mut immediates));
+    let replacement = domain
+        .structure()
+        .replace(&expression, 1, &Expression::constant(0), &mut ())
+        .unwrap();
+
+    assert_eq!(children, [0, 1]);
+    assert_eq!(immediates, [7]);
+    assert_eq!(replacement.evaluate(11), 11);
+    assert_eq!(domain.structure().schema().constructors.len(), 14);
 }
 
 #[test]
@@ -84,6 +118,49 @@ fn wrapping_add_and_rotation_expand_beyond_the_exhausted_xor_semantic_family() {
 }
 
 #[test]
+fn full_u8_expression_family_has_exact_masked_and_wrapping_semantics() {
+    let condition = Expression::bitwise_and(
+        Expression::bitwise_not(Expression::input()),
+        Expression::constant(u8::MAX),
+    );
+    let nonzero = Expression::rotate_right(
+        Expression::wrapping_subtract(
+            Expression::wrapping_multiply(Expression::input(), Expression::constant(3)),
+            Expression::constant(7),
+        ),
+        10,
+    );
+    let zero = Expression::bitwise_or(
+        Expression::shift_left(Expression::input(), 10),
+        Expression::shift_right(Expression::input(), 9),
+    );
+    let expression = Expression::select(condition, nonzero, zero);
+
+    for input in 0..=u8::MAX {
+        let expected = if !input == 0 {
+            input.wrapping_shl(2) | input.wrapping_shr(1)
+        } else {
+            input.wrapping_mul(3).wrapping_sub(7).rotate_right(2)
+        };
+        assert_eq!(expression.evaluate(input), expected);
+    }
+
+    let domain = BitVecDomain::unary_u8();
+    let mut encoded = Vec::new();
+    domain
+        .structure()
+        .encode_canonical(&expression, &mut encoded, &mut ())
+        .unwrap();
+    assert_eq!(
+        domain
+            .structure()
+            .decode_canonical(&encoded, &mut ())
+            .unwrap(),
+        expression
+    );
+}
+
+#[test]
 fn measurement_space_orders_and_tolerates_evaluator_work() {
     let domain = BitVecDomain::unary_u8();
     let expression = Expression::xor(Expression::input(), Expression::constant(0));
@@ -104,6 +181,14 @@ fn measurement_space_orders_and_tolerates_evaluator_work() {
         .iter()
         .find(|measurement| measurement.metric == Metric::EvaluatorOperations)
         .expect("Evaluator Operations is a declared Measurement");
+    let live_temporaries = measured
+        .iter()
+        .find(|measurement| measurement.metric == Metric::PeakLiveTemporaries)
+        .expect("Peak Live Temporaries is a declared Measurement");
+    let elapsed = measured
+        .iter()
+        .find(|measurement| measurement.metric == Metric::EvaluationNanoseconds)
+        .expect("Evaluation Nanoseconds is a declared Measurement");
 
     assert!(
         evaluator_work.observation == 3
@@ -120,6 +205,8 @@ fn measurement_space_orders_and_tolerates_evaluator_work() {
                 &environment,
                 &environment,
             )
+            && live_temporaries.observation == 3
+            && elapsed.observation > 0
     );
 }
 
@@ -156,6 +243,77 @@ fn decoder_rejects_a_noncanonical_duplicate_dag_node() {
 }
 
 #[test]
+fn decoder_rejects_impossible_counts_and_unreachable_nodes() {
+    let domain = BitVecDomain::unary_u8();
+    let impossible_count = u32::MAX.to_le_bytes();
+    assert!(
+        domain
+            .structure()
+            .decode_canonical(&impossible_count, &mut ())
+            .is_err(),
+        "a tiny encoding cannot reserve storage for an attacker-controlled node count"
+    );
+
+    let unreachable_input = [
+        2, 0, 0, 0, // two nodes
+        0, // unreachable input
+        1, 7, // constant root
+    ];
+    assert!(
+        domain
+            .structure()
+            .decode_canonical(&unreachable_input, &mut ())
+            .is_err(),
+        "canonical DAG encodings contain exactly the nodes reachable from their root"
+    );
+}
+
+#[test]
+fn seed_scope_decoder_rejects_empty_and_impossible_counts() {
+    let domain = BitVecDomain::unary_u8();
+    assert!(domain.seeds().decode_scope(&0_u32.to_le_bytes()).is_err());
+    assert!(
+        domain
+            .seeds()
+            .decode_scope(&u32::MAX.to_le_bytes())
+            .is_err()
+    );
+}
+
+#[test]
+fn curated_and_generated_seed_sources_are_reproducible_and_provenanced() {
+    let domain = BitVecDomain::unary_u8();
+    for (scope, expected, prefix) in [
+        (
+            SeedScope::curated(),
+            3,
+            b"reflex-bitvec/curated-v1/".as_slice(),
+        ),
+        (
+            SeedScope::generated_xor_constants(),
+            256,
+            b"reflex-bitvec/generated-xor-v1/".as_slice(),
+        ),
+    ] {
+        let mut encoded = Vec::new();
+        domain.seeds().encode_scope(&scope, &mut encoded).unwrap();
+        let decoded = domain.seeds().decode_scope(&encoded).unwrap();
+        let mut cursor = domain.seeds().open(&decoded).unwrap();
+        let mut seeds = Vec::new();
+        let mut writer = SeedWriter::new(&mut seeds);
+        let page = domain
+            .seeds()
+            .read_batch(&mut cursor, expected, &mut writer, &mut ())
+            .unwrap();
+        assert!(
+            page.exhausted
+                && seeds.len() == expected
+                && seeds.iter().all(|seed| seed.provenance.starts_with(prefix))
+        );
+    }
+}
+
+#[test]
 fn artifact_key_is_sha256_over_semantics_and_canonical_structure() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-key-{}-{}.bundle",
@@ -189,9 +347,9 @@ fn artifact_key_is_sha256_over_semantics_and_canonical_structure() {
     assert_eq!(
         outcome.pareto().artifacts()[0].key().as_bytes(),
         &[
-            0x74, 0x73, 0x59, 0x31, 0x9a, 0x3e, 0x0e, 0x2e, 0x7a, 0xbf, 0xef, 0x54, 0xe6, 0x76,
-            0x8c, 0x66, 0xfe, 0xd8, 0xbf, 0x85, 0x65, 0xf6, 0x51, 0x2a, 0xf0, 0xad, 0xb8, 0x0e,
-            0x52, 0x90, 0x97, 0x86,
+            0xf6, 0x15, 0xe1, 0xbf, 0x9b, 0x9e, 0x26, 0x61, 0xf9, 0x96, 0x22, 0x71, 0x1b, 0x35,
+            0xcd, 0xdc, 0x49, 0xad, 0xf7, 0xb3, 0xf4, 0x34, 0x0d, 0x65, 0x16, 0xe6, 0x90, 0xdf,
+            0x11, 0x39, 0x18, 0x1a,
         ]
     );
     std::fs::remove_file(bundle_path).ok();

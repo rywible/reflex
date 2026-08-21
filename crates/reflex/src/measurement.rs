@@ -12,10 +12,17 @@ impl MeasurementEnvironment {
     pub fn local_process() -> Self {
         Self {
             identity: format!(
-                "{}-{}-{}",
+                "{}-{}-{}-{}-workers-{}-{}",
                 std::env::consts::OS,
                 std::env::consts::ARCH,
-                env!("CARGO_PKG_VERSION")
+                env!("CARGO_PKG_VERSION"),
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+                rayon::current_num_threads(),
+                cpu_feature_identity(),
             ),
         }
     }
@@ -23,6 +30,30 @@ impl MeasurementEnvironment {
     #[must_use]
     pub fn identity(&self) -> &str {
         &self.identity
+    }
+}
+
+fn cpu_feature_identity() -> String {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    for (name, present) in [
+        ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::arch::is_x86_feature_detected!("avx")),
+        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+        ("avx512f", std::arch::is_x86_feature_detected!("avx512f")),
+    ] {
+        if present {
+            features.push(name);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        features.push("neon");
+    }
+    if features.is_empty() {
+        "scalar".into()
+    } else {
+        features.join("+")
     }
 }
 
@@ -83,19 +114,42 @@ pub struct Measurement<M, O> {
 
 pub struct MeasurementWriter<'a, M, O> {
     output: &'a mut Vec<Measurement<M, O>>,
+    remaining: usize,
+    overflowed: bool,
 }
 
 impl<'a, M, O> MeasurementWriter<'a, M, O> {
     pub fn new(output: &'a mut Vec<Measurement<M, O>>) -> Self {
-        Self { output }
+        Self {
+            output,
+            remaining: usize::MAX,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_limit(output: &'a mut Vec<Measurement<M, O>>, limit: usize) -> Self {
+        Self {
+            output,
+            remaining: limit,
+            overflowed: false,
+        }
     }
 
     pub fn push(&mut self, artifact_index: usize, metric: M, observation: O) {
-        self.output.push(Measurement {
-            artifact_index,
-            metric,
-            observation,
-        });
+        if self.remaining == 0 {
+            self.overflowed = true;
+        } else {
+            self.remaining -= 1;
+            self.output.push(Measurement {
+                artifact_index,
+                metric,
+                observation,
+            });
+        }
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
     }
 }
 

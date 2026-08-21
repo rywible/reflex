@@ -142,6 +142,8 @@ pub(crate) struct VerifiedArtifactRecord<D: DomainDefinition> {
     pub parent_key: Option<ArtifactKey>,
     pub measurements: Vec<Measurement<D::Metric, D::Observation>>,
     pub environment: MeasurementEnvironment,
+    pub provenance: Vec<u8>,
+    pub dynamic_resident_bytes: u64,
 }
 
 pub struct VerifiedArtifact<D: DomainDefinition> {
@@ -191,6 +193,11 @@ impl<D: DomainDefinition> VerifiedArtifact<D> {
     pub fn measurement_environment(&self) -> &MeasurementEnvironment {
         &self.inner.environment
     }
+
+    #[must_use]
+    pub fn provenance(&self) -> &[u8] {
+        &self.inner.provenance
+    }
 }
 
 pub struct ParetoSnapshot<D: DomainDefinition> {
@@ -204,10 +211,21 @@ impl<D: DomainDefinition> ParetoSnapshot<D> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GoalId(pub(crate) [u8; 32]);
+
+impl GoalId {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 pub struct ParetoUpdate<'a, D: DomainDefinition> {
     pub(crate) sequence: u64,
     pub(crate) added: &'a [VerifiedArtifact<D>],
     pub(crate) removed: &'a [ArtifactKey],
+    pub(crate) affected_goals: &'a [GoalId],
 }
 
 impl<'a, D: DomainDefinition> ParetoUpdate<'a, D> {
@@ -224,6 +242,11 @@ impl<'a, D: DomainDefinition> ParetoUpdate<'a, D> {
     #[must_use]
     pub fn removed(&self) -> &'a [ArtifactKey] {
         self.removed
+    }
+
+    #[must_use]
+    pub fn affected_goals(&self) -> &'a [GoalId] {
+        self.affected_goals
     }
 }
 

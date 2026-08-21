@@ -11,9 +11,9 @@ use crate::bundle::DomainBundle;
 use crate::domain::{
     ApplicationWriter, Candidate, CandidateWriter, DomainDefinition, OperatorAlgebra,
     OperatorEnumerationBatch, ReplayVerdictWriter, Seed, SeedSource, SeedWriter,
-    StructuralProtocol, StructuralView, Verdict, VerdictWriter, VerificationBatch,
-    VerificationKernel, VerificationRecord, VerificationReplayBatch, VerificationReplayRequest,
-    VerificationRequest,
+    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
+    VerificationBatch, VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    VerificationReplayRequest, VerificationRequest,
 };
 use crate::durability::{self, Segment, SegmentKind};
 use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
@@ -27,13 +27,14 @@ use crate::measurement::{
 };
 use crate::resource::ProductionResourceMeter;
 use crate::session::{
-    ArtifactKey, Completion, ImprovementRequest, ParetoSnapshot, ParetoUpdate, ResourceUsage,
-    SessionError, SessionOutcome, VerifiedArtifact, VerifiedArtifactRecord,
+    ArtifactKey, Completion, GoalId, ImprovementRequest, ParetoSnapshot, ParetoUpdate,
+    ResourceUsage, SessionError, SessionOutcome, VerifiedArtifact, VerifiedArtifactRecord,
 };
 
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
     verification: VerificationRecord<D>,
+    provenance: Vec<u8>,
     origin_key: Option<ArtifactKey>,
     parent_key: Option<ArtifactKey>,
 }
@@ -132,6 +133,9 @@ enum SessionSeal {
 }
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 const DURABILITY_STACK_BYTES: usize = 512 * 1024;
+const CHOICES_PER_VERIFICATION: u64 = 8;
+const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
+const MAX_CANDIDATE_CHOICES: u64 = 16_384;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -185,10 +189,19 @@ where
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
 {
     validate_goals(domain, request)?;
+    let goal_ids = goal_ids(domain, &request.goals)?;
     let recovered_bundle = request
         .bundle
         .source()
-        .map(|source| decode_bundle(domain, request, source))
+        .map(|source| {
+            decode_bundle(
+                domain,
+                request,
+                source,
+                resource_meter,
+                worker_resident_bytes,
+            )
+        })
         .transpose()?
         .unwrap_or_default();
     let recovered_keys = recovered_bundle.pareto_keys;
@@ -208,10 +221,16 @@ where
             .map_err(|()| SessionError::Resource)?;
     }
     let recovered_replays = recovered_stored.len();
+    let verification_budget = request.resources.verification_requests.get();
+    let replay_budget = verification_budget
+        .checked_sub(prior_usage.verification_requests)
+        .and_then(|remaining| remaining.checked_sub(u64::try_from(recovered_replays).ok()?))
+        .and_then(|remaining| remaining.checked_sub(u64::try_from(experience.len()).ok()?))
+        .ok_or(SessionError::Resource)?;
     let ReadSeeds {
         mut seeds,
         encoded_cursor: seed_cursor,
-    } = read_seeds(domain, &request.seeds)?;
+    } = read_seeds(domain, &request.seeds, replay_budget, resource_meter)?;
     let seed_replays = seeds.len();
     if seeds.is_empty() {
         return Err(SessionError::InvalidSeed);
@@ -221,7 +240,6 @@ where
         .and_then(|count| count.checked_add(experience.len()))
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(SessionError::Resource)?;
-    let verification_budget = request.resources.verification_requests.get();
     let mut verification_requests = prior_usage
         .verification_requests
         .checked_add(required_replays)
@@ -279,13 +297,16 @@ where
         .map(|seed| StoredArtifact {
             artifact: seed.artifact,
             verification: seed.verification,
+            provenance: seed.provenance,
             origin_key: None,
             parent_key: None,
         })
         .collect::<Vec<_>>();
     let roots = materialize(domain, seed_stored, &environment)?;
+    let recovered_goal_frontiers = goal_frontiers(domain, &request.goals, &recovered);
     let mut known = recovered.clone();
     extend_unique(&mut known, roots.iter().cloned());
+    let initial_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
     let mut pareto = pareto_union(domain, &request.goals, &known);
     let initial_usage = resource_meter
         .usage(verification_requests, 0)
@@ -362,15 +383,17 @@ where
         &mut sequence,
         &recovered_keys,
         &pareto,
+        &affected_goal_ids(
+            &goal_ids,
+            &recovered_goal_frontiers,
+            &initial_goal_frontiers,
+        ),
         resource_meter,
         initial_resident,
     );
     let mut stopped_by_observer = initial_delivery.stopped();
-    let mut success_conditions_satisfied = all_success_conditions_satisfied(
-        domain,
-        &request.goals,
-        &goal_frontiers(domain, &request.goals, &known),
-    );
+    let mut success_conditions_satisfied =
+        all_success_conditions_satisfied(domain, &request.goals, &initial_goal_frontiers);
     let mut time_exhausted = resource_meter
         .search_time_exhausted()
         .map_err(|()| SessionError::Resource)?;
@@ -425,29 +448,83 @@ where
             .collect::<Vec<_>>();
         let mut candidates = Vec::new();
         let mut application_bytes = 0_u64;
-        for descriptor in domain.operators().catalog() {
+        let mut choice_window_exhausted = false;
+        let available_resident = request
+            .resources
+            .resident_bytes
+            .get()
+            .saturating_sub(resident_before_epoch);
+        let generation_limit = usize::try_from(
+            remaining_verifications
+                .saturating_mul(CHOICES_PER_VERIFICATION)
+                .min(available_resident / MIN_CHOICE_RESIDENT_BYTES)
+                .min(MAX_CANDIDATE_CHOICES),
+        )
+        .unwrap_or(usize::MAX);
+        if generation_limit == 0 {
+            resident_budget_exhausted = true;
+            break;
+        }
+        let has_derived = pinned_knowledge
+            .operators()
+            .iter()
+            .any(crate::knowledge::DerivedOperator::active);
+        let derived_budget = if has_derived {
+            generation_limit.div_ceil(4)
+        } else {
+            0
+        };
+        let mut primitive_budget = generation_limit.saturating_sub(derived_budget);
+        let catalog = domain.operators().catalog();
+        for (operator_index, descriptor) in catalog.iter().enumerate() {
+            if resource_meter
+                .search_time_exhausted()
+                .map_err(|()| SessionError::Resource)?
+            {
+                time_exhausted = true;
+                break;
+            }
+            if primitive_budget == 0 {
+                break;
+            }
+            let operators_left = catalog.len() - operator_index;
+            let operator_limit = primitive_budget.div_ceil(operators_left);
+            let locations = root_locations(domain, &parents);
             let mut applications = Vec::new();
+            let mut application_writer =
+                ApplicationWriter::with_limit(&mut applications, operator_limit);
             domain
                 .operators()
                 .enumerate_legal(
                     OperatorEnumerationBatch::new(
                         &parents,
+                        &locations,
                         std::slice::from_ref(&descriptor.operator()),
                     ),
-                    &mut ApplicationWriter::new(&mut applications),
+                    &mut application_writer,
                     &mut operator_scratch,
                 )
                 .map_err(SessionError::Domain)?;
+            choice_window_exhausted |= application_writer.overflowed();
+            if resource_meter
+                .search_time_exhausted()
+                .map_err(|()| SessionError::Resource)?
+            {
+                time_exhausted = true;
+                break;
+            }
             let mut operator_candidates = Vec::new();
+            let mut candidate_writer =
+                CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
             domain
                 .operators()
-                .apply_batch(
-                    &applications,
-                    &mut CandidateWriter::new(&mut operator_candidates),
-                    &mut operator_scratch,
-                )
+                .apply_batch(&applications, &mut candidate_writer, &mut operator_scratch)
                 .map_err(SessionError::Domain)?;
-            application_bytes = application_bytes.saturating_add(vector_bytes(&applications));
+            choice_window_exhausted |= candidate_writer.overflowed();
+            primitive_budget = primitive_budget.saturating_sub(operator_candidates.len());
+            application_bytes = application_bytes
+                .saturating_add(vector_bytes(&locations))
+                .saturating_add(vector_bytes(&applications));
             for candidate in operator_candidates {
                 let parent = frontier
                     .get(candidate.source_index)
@@ -467,20 +544,46 @@ where
                 });
             }
         }
-        application_bytes = application_bytes.saturating_add(append_derived_candidates(
+        if time_exhausted {
+            break;
+        }
+        if resource_meter
+            .search_time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        {
+            time_exhausted = true;
+            break;
+        }
+        let (derived_bytes, derived_truncated) = append_derived_candidates(
             domain,
             &parents,
             &pinned_knowledge,
             &mut operator_scratch,
-            usize::try_from(remaining_verifications).unwrap_or(usize::MAX),
+            derived_budget,
             sequence,
             &mut candidates,
-        )?);
+        )?;
+        application_bytes = application_bytes.saturating_add(derived_bytes);
+        choice_window_exhausted |= derived_truncated;
         test_fault_point("candidate-created");
+        if resource_meter
+            .search_time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        {
+            time_exhausted = true;
+            break;
+        }
         candidates =
             retain_novel_candidates(domain, &known, &experience, &roots, &frontier, candidates)?;
-        order_by_learned_potential(pinned_model.as_ref(), &mut candidates);
+        order_by_learned_potential(
+            domain,
+            &request.goals,
+            &frontier,
+            pinned_model.as_ref(),
+            &mut candidates,
+        );
         if candidates.is_empty() {
+            resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
         let transient_resident = resident_before_epoch
@@ -602,6 +705,7 @@ where
             )?;
         }
         test_fault_point("measurement-completed");
+        let previous_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
         let prior_known_len = known.len();
         let prior_known_capacity = known.capacity();
         let prior_consequence_len = consequences.len();
@@ -621,10 +725,12 @@ where
         }
         test_fault_point("admission-completed");
         if frontier.is_empty() {
+            resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
         let proposed_pareto = pareto_union(domain, &request.goals, &known);
+        let proposed_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
         record_admission_consequences(
             domain,
             &request.goals,
@@ -696,6 +802,11 @@ where
             &mut sequence,
             &previous_keys,
             &proposed_pareto,
+            &affected_goal_ids(
+                &goal_ids,
+                &previous_goal_frontiers,
+                &proposed_goal_frontiers,
+            ),
             resource_meter,
             proposed_resident,
         );
@@ -720,6 +831,10 @@ where
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?;
         if verification_budget_exhausted {
+            break;
+        }
+        if choice_window_exhausted {
+            resident_budget_exhausted = true;
             break;
         }
     }
@@ -978,6 +1093,8 @@ fn resident_state_bytes<D: DomainDefinition, O>(
     let records = known.iter().fold(0_u64, |bytes, artifact| {
         bytes
             .saturating_add(std::mem::size_of::<VerifiedArtifactRecord<D>>() as u64)
+            .saturating_add(artifact.inner.dynamic_resident_bytes)
+            .saturating_add(artifact.inner.provenance.capacity() as u64)
             .saturating_add(vector_bytes(&artifact.inner.measurements))
     });
     let experience_payloads = experience.iter().fold(0_u64, |bytes, entry| {
@@ -1018,16 +1135,33 @@ fn vector_bytes<T>(values: &Vec<T>) -> u64 {
     (values.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
 }
 
+fn root_locations<D: DomainDefinition>(
+    domain: &D,
+    artifacts: &[&D::Artifact],
+) -> Vec<StructuralLocation> {
+    artifacts
+        .iter()
+        .enumerate()
+        .filter_map(|(artifact_index, artifact)| {
+            domain
+                .structure()
+                .view(artifact)
+                .node_count()
+                .checked_sub(1)
+                .map(|node_index| StructuralLocation::new(artifact_index, node_index))
+        })
+        .collect()
+}
+
 fn candidate_pipeline_reserve<D: DomainDefinition>(
     domain: &D,
     candidates: &[ProposedCandidate<D>],
 ) -> u64 {
     candidates.iter().fold(0_u64, |bytes, candidate| {
-        let structural = (domain
-            .structure()
-            .view(&candidate.candidate.artifact)
-            .node_count() as u64)
-            .saturating_mul(128);
+        let view = domain.structure().view(&candidate.candidate.artifact);
+        let structural = view
+            .dynamic_resident_bytes()
+            .saturating_add((view.node_count() as u64).saturating_mul(256));
         let ledger = (std::mem::size_of::<ExperienceEntry>() as u64)
             .saturating_add(candidate.operator_symbol.capacity() as u64)
             .saturating_add(structural)
@@ -1072,13 +1206,14 @@ fn append_derived_candidates<D: DomainDefinition>(
     remaining_verifications: usize,
     epoch: u64,
     output: &mut Vec<ProposedCandidate<D>>,
-) -> Result<u64, SessionError<D::Error>> {
+) -> Result<(u64, bool), SessionError<D::Error>> {
     const MAX_DERIVED_CANDIDATES_PER_OPERATOR: usize = 1_024;
 
     let mut application_bytes = 0_u64;
+    let mut truncated = false;
     let limit = remaining_verifications.min(MAX_DERIVED_CANDIDATES_PER_OPERATOR);
     if limit == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
     let mut emitted = 0_usize;
     for derived in knowledge
@@ -1108,27 +1243,31 @@ fn append_derived_candidates<D: DomainDefinition>(
                     .map(|candidate| &candidate.artifact)
                     .collect()
             };
+            let locations = root_locations(domain, &stage_parents);
             let mut applications = Vec::new();
+            let mut application_writer =
+                ApplicationWriter::with_limit(&mut applications, operator_limit);
             domain
                 .operators()
                 .enumerate_legal(
                     OperatorEnumerationBatch::new(
                         &stage_parents,
+                        &locations,
                         std::slice::from_ref(&descriptor.operator()),
                     ),
-                    &mut ApplicationWriter::new(&mut applications),
+                    &mut application_writer,
                     scratch,
                 )
                 .map_err(SessionError::Domain)?;
+            truncated |= application_writer.overflowed();
             application_bytes = application_bytes.saturating_add(vector_bytes(&applications));
             let mut next = Vec::new();
+            let mut candidate_writer = CandidateWriter::with_limit(&mut next, operator_limit);
             domain
                 .operators()
-                .apply_batch(&applications, &mut CandidateWriter::new(&mut next), scratch)
+                .apply_batch(&applications, &mut candidate_writer, scratch)
                 .map_err(SessionError::Domain)?;
-            if next.len() > operator_limit {
-                next.truncate(operator_limit);
-            }
+            truncated |= candidate_writer.overflowed();
             if step_index > 0 {
                 for candidate in &mut next {
                     let Some(parent) = current.get(candidate.source_index) else {
@@ -1158,17 +1297,33 @@ fn append_derived_candidates<D: DomainDefinition>(
             });
         }
     }
-    Ok(application_bytes)
+    Ok((application_bytes, truncated))
 }
 
 fn order_by_learned_potential<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+    frontier: &[(VerifiedArtifact<D>, usize)],
     model: Option<&FtrlModel>,
     candidates: &mut Vec<ProposedCandidate<D>>,
 ) {
     if model.is_none() {
-        let (derived, ordinary): (Vec<_>, Vec<_>) = std::mem::take(candidates)
+        let (mut derived, mut ordinary): (Vec<_>, Vec<_>) = std::mem::take(candidates)
             .into_iter()
             .partition(|candidate| candidate.protected_derived);
+        let compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
+            compare_parent_preferences(domain, goals, frontier, left, right).then_with(|| {
+                left.operator_symbol
+                    .cmp(&right.operator_symbol)
+                    .then_with(|| {
+                        left.candidate
+                            .source_index
+                            .cmp(&right.candidate.source_index)
+                    })
+            })
+        };
+        derived.sort_by(compare);
+        ordinary.sort_by(compare);
         let mut derived = derived.into_iter();
         let mut ordinary = ordinary.into_iter();
         loop {
@@ -1200,6 +1355,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
             .map_or(Ordering::Equal, |(left, right)| {
                 compare_forecasts(left, right)
             })
+            .then_with(|| compare_parent_preferences(domain, goals, frontier, left, right))
             .then_with(|| {
                 left.operator_symbol
                     .cmp(&right.operator_symbol)
@@ -1224,6 +1380,135 @@ fn order_by_learned_potential<D: DomainDefinition>(
             break;
         }
     }
+}
+
+fn compare_parent_preferences<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+    frontier: &[(VerifiedArtifact<D>, usize)],
+    left: &ProposedCandidate<D>,
+    right: &ProposedCandidate<D>,
+) -> Ordering {
+    let Some(left_parent) = frontier
+        .get(left.candidate.source_index)
+        .map(|parent| &parent.0)
+    else {
+        return Ordering::Equal;
+    };
+    let Some(right_parent) = frontier
+        .get(right.candidate.source_index)
+        .map(|parent| &parent.0)
+    else {
+        return Ordering::Equal;
+    };
+    let mut left_better = false;
+    let mut right_better = false;
+    for goal in goals.goals.iter() {
+        match compare_for_goal_preference(domain, goal, left_parent, right_parent) {
+            Ordering::Less => left_better = true,
+            Ordering::Greater => right_better = true,
+            Ordering::Equal => {}
+        }
+    }
+    match (left_better, right_better) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_for_goal_preference<D: DomainDefinition>(
+    domain: &D,
+    goal: &OptimizationGoal<D>,
+    left: &VerifiedArtifact<D>,
+    right: &VerifiedArtifact<D>,
+) -> Ordering {
+    if !goal
+        .constraints
+        .iter()
+        .all(|constraint| threshold_satisfied(domain, left, constraint))
+        || !goal
+            .constraints
+            .iter()
+            .all(|constraint| threshold_satisfied(domain, right, constraint))
+    {
+        return Ordering::Equal;
+    }
+    for tier in goal.preference.priority_tiers.iter() {
+        let mut left_better = false;
+        let mut right_better = false;
+        for metric in tier.iter() {
+            let Some(objective) = goal
+                .objectives
+                .iter()
+                .find(|objective| objective.metric == *metric)
+            else {
+                return Ordering::Equal;
+            };
+            let Some(left_measurement) = left
+                .inner
+                .measurements
+                .iter()
+                .find(|measurement| measurement.metric == *metric)
+            else {
+                return Ordering::Equal;
+            };
+            let Some(right_measurement) = right
+                .inner
+                .measurements
+                .iter()
+                .find(|measurement| measurement.metric == *metric)
+            else {
+                return Ordering::Equal;
+            };
+            if !domain.measurements().environments_compatible(
+                *metric,
+                &left.inner.environment,
+                &right.inner.environment,
+            ) {
+                return Ordering::Equal;
+            }
+            if let Some(tolerance) = goal
+                .preference
+                .tolerances
+                .iter()
+                .find(|tolerance| tolerance.metric == *metric)
+                && domain
+                    .measurements()
+                    .within_tolerance(
+                        *metric,
+                        &left_measurement.observation,
+                        &right_measurement.observation,
+                        &tolerance.amount,
+                    )
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(ordering) = domain.measurements().compare(
+                *metric,
+                &left_measurement.observation,
+                &right_measurement.observation,
+            ) else {
+                return Ordering::Equal;
+            };
+            let ordering = match (objective.direction, ordering) {
+                (Direction::Minimize, ordering) => ordering,
+                (Direction::Maximize, MetricOrdering::Equal) => MetricOrdering::Equal,
+                (Direction::Maximize, MetricOrdering::Less) => MetricOrdering::Greater,
+                (Direction::Maximize, MetricOrdering::Greater) => MetricOrdering::Less,
+            };
+            left_better |= ordering == MetricOrdering::Less;
+            right_better |= ordering == MetricOrdering::Greater;
+        }
+        match (left_better, right_better) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (true, true) => return Ordering::Equal,
+            (false, false) => {}
+        }
+    }
+    Ordering::Equal
 }
 
 fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Ordering {
@@ -1355,15 +1640,23 @@ fn materialize<D: DomainDefinition>(
         .collect::<Vec<_>>();
     let mut measured = Vec::new();
     let mut measurement_scratch = <D::Measurements as MeasurementSpace<D>>::Scratch::default();
+    let expected_measurements = artifact_refs
+        .len()
+        .checked_mul(domain.measurements().schema().len())
+        .ok_or(SessionError::Resource)?;
+    let mut writer = MeasurementWriter::with_limit(&mut measured, expected_measurements);
     domain
         .measurements()
         .measure_batch(
             VerifiedBatch::new(&artifact_refs),
             environment,
-            &mut MeasurementWriter::new(&mut measured),
+            &mut writer,
             &mut measurement_scratch,
         )
         .map_err(SessionError::Domain)?;
+    if writer.overflowed() || measured.len() != expected_measurements {
+        return Err(SessionError::InvalidSeed);
+    }
     let mut by_artifact = (0..stored.len())
         .map(|_| Vec::new())
         .collect::<Vec<Vec<Measurement<D::Metric, D::Observation>>>>();
@@ -1372,6 +1665,18 @@ fn materialize<D: DomainDefinition>(
             return Err(SessionError::InvalidSeed);
         };
         output.push(measurement);
+    }
+    let schema = domain.measurements().schema();
+    if by_artifact.iter().any(|measurements| {
+        schema.iter().any(|descriptor| {
+            measurements
+                .iter()
+                .filter(|measurement| measurement.metric == descriptor.metric())
+                .count()
+                != 1
+        })
+    }) {
+        return Err(SessionError::InvalidSeed);
     }
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
     let identity = domain.semantic_identity();
@@ -1385,6 +1690,10 @@ fn materialize<D: DomainDefinition>(
                 .encode_canonical(&stored.artifact, &mut canonical, &mut structure_scratch)
                 .map_err(SessionError::Domain)?;
             let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
+            let dynamic_resident_bytes = domain
+                .structure()
+                .view(&stored.artifact)
+                .dynamic_resident_bytes();
             Ok(VerifiedArtifact {
                 inner: Arc::new(VerifiedArtifactRecord {
                     key,
@@ -1394,6 +1703,8 @@ fn materialize<D: DomainDefinition>(
                     parent_key: stored.parent_key,
                     measurements,
                     environment: environment.clone(),
+                    provenance: stored.provenance,
+                    dynamic_resident_bytes,
                 }),
             })
         })
@@ -1452,6 +1763,41 @@ fn pareto_union<D: DomainDefinition>(
         extend_unique(&mut pareto, frontier);
     }
     pareto
+}
+
+fn affected_goal_ids<D: DomainDefinition>(
+    ids: &[GoalId],
+    previous: &[Vec<VerifiedArtifact<D>>],
+    current: &[Vec<VerifiedArtifact<D>>],
+) -> Vec<GoalId> {
+    ids.iter()
+        .zip(previous.iter().zip(current))
+        .filter_map(|(id, (previous, current))| {
+            let changed = previous.len() != current.len()
+                || previous
+                    .iter()
+                    .any(|artifact| !current.iter().any(|item| item.key() == artifact.key()));
+            changed.then_some(*id)
+        })
+        .collect()
+}
+
+fn goal_ids<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+) -> Result<Vec<GoalId>, SessionError<D::Error>> {
+    goals
+        .goals
+        .iter()
+        .map(|goal| {
+            let mut encoded = Vec::new();
+            encode_goal(domain, goal, &mut encoded)?;
+            let mut digest = Sha256::new();
+            digest.update(b"reflex-goal-v1\0");
+            digest.update(encoded);
+            Ok(GoalId(digest.finalize().into()))
+        })
+        .collect()
 }
 
 #[expect(
@@ -1597,6 +1943,7 @@ fn deliver_delta<D, O>(
     sequence: &mut u64,
     previous: &[ArtifactKey],
     current: &[VerifiedArtifact<D>],
+    affected_goals: &[GoalId],
     resource_meter: &ProductionResourceMeter,
     resident_state: u64,
 ) -> DeltaDelivery
@@ -1619,7 +1966,8 @@ where
     }
     let resident_with_export = resident_state
         .saturating_add(vector_bytes(&added))
-        .saturating_add(vector_bytes(&removed));
+        .saturating_add(vector_bytes(&removed))
+        .saturating_add(std::mem::size_of_val(affected_goals) as u64);
     if !resource_meter.observe_resident(resident_with_export) {
         return DeltaDelivery::ResourceExhausted;
     }
@@ -1628,6 +1976,7 @@ where
         sequence: *sequence,
         added: &added,
         removed: &removed,
+        affected_goals,
     })
     .is_break();
     DeltaDelivery::Delivered { stopped }
@@ -1659,9 +2008,24 @@ fn decode_bundle<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
     source: &std::path::Path,
+    resource_meter: &ProductionResourceMeter,
+    resident_before_bundle: u64,
 ) -> Result<RecoveredBundle<D>, SessionError<D::Error>> {
+    let bundle_bytes = std::fs::metadata(source)
+        .map_err(SessionError::Durability)?
+        .len();
+    if bundle_bytes > request.resources.durable_bytes.get()
+        || !resource_meter
+            .observe_resident(resident_before_bundle.saturating_add(bundle_bytes.saturating_mul(4)))
+    {
+        return Err(SessionError::Resource);
+    }
     let bytes = std::fs::read(source).map_err(SessionError::Durability)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != bundle_bytes {
+        return Err(SessionError::Resource);
+    }
     let decoded = durability::decode(&bytes).map_err(|_| SessionError::CorruptBundle)?;
+    drop(bytes);
     if decoded.identity != domain.semantic_identity().as_str().as_bytes() {
         return Err(SessionError::IncompatibleBundle);
     }
@@ -1748,6 +2112,7 @@ fn decode_bundle<D: DomainDefinition>(
             )),
             _ => return Err(SessionError::CorruptBundle),
         };
+        let provenance = take_sized(&mut input)?.to_vec();
         if recovered_index.insert(key, recovered.len()).is_some() {
             return Err(SessionError::CorruptBundle);
         }
@@ -1758,6 +2123,7 @@ fn decode_bundle<D: DomainDefinition>(
                 evidence,
                 kernel_revision,
             },
+            provenance,
             origin_key: Some(origin_key),
             parent_key,
         });
@@ -2140,15 +2506,19 @@ fn replay_stored<D: DomainDefinition>(
         .collect::<Vec<_>>();
     let mut replayed = Vec::with_capacity(replay_requests.len());
     let mut kernel_scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
+    let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, replay_requests.len());
     domain
         .kernel()
         .replay_batch(
             VerificationReplayBatch::new(&replay_requests),
-            &mut ReplayVerdictWriter::new(&mut replayed),
+            &mut writer,
             &mut kernel_scratch,
         )
         .map_err(SessionError::Domain)?;
-    if replayed.len() != stored.len() || replayed.iter().any(|accepted| !accepted) {
+    if writer.overflowed()
+        || replayed.len() != stored.len()
+        || replayed.iter().any(|accepted| !accepted)
+    {
         return Err(SessionError::InvalidSeed);
     }
     Ok(())
@@ -2212,15 +2582,17 @@ fn replay_experience<D: DomainDefinition>(
             })
             .collect::<Vec<_>>();
         let mut verdicts = Vec::with_capacity(entries.len());
+        let mut writer = VerdictWriter::with_limit(&mut verdicts, entries.len());
         domain
             .kernel()
             .verify_batch(
                 VerificationBatch::new(&requests),
-                &mut VerdictWriter::new(&mut verdicts),
+                &mut writer,
                 &mut kernel_scratch,
             )
             .map_err(SessionError::Domain)?;
-        if verdicts.len() != entries.len()
+        if writer.overflowed()
+            || verdicts.len() != entries.len()
             || entries.iter().zip(verdicts).any(|(entry, verdict)| {
                 !matches!(
                     (entry.verdict, verdict),
@@ -2285,14 +2657,119 @@ fn validate_goals<D: DomainDefinition>(
 ) -> Result<(), SessionError<D::Error>> {
     let known = domain.measurements().schema();
     for goal in request.goals.goals.iter() {
-        for objective in goal.objectives.iter() {
-            if !known
-                .iter()
-                .any(|descriptor| descriptor.metric() == objective.metric)
-            {
+        for metric in goal
+            .objectives
+            .iter()
+            .map(|objective| objective.metric)
+            .chain(goal.constraints.iter().map(|constraint| constraint.metric))
+            .chain(
+                goal.preference
+                    .tolerances
+                    .iter()
+                    .map(|tolerance| tolerance.metric),
+            )
+            .chain(
+                goal.success
+                    .iter()
+                    .flat_map(|success| success.thresholds.iter())
+                    .map(|threshold| threshold.metric),
+            )
+        {
+            if !known.iter().any(|descriptor| descriptor.metric() == metric) {
                 return Err(SessionError::InvalidGoal(crate::GoalError::UnknownMetric));
             }
         }
+        for constraint in goal.constraints.iter().chain(
+            goal.success
+                .iter()
+                .flat_map(|success| success.thresholds.iter()),
+        ) {
+            validate_goal_observation(domain, constraint.metric, &constraint.threshold)?;
+        }
+        for tolerance in &goal.preference.tolerances {
+            validate_goal_observation(domain, tolerance.metric, &tolerance.amount)?;
+            domain
+                .measurements()
+                .within_tolerance(
+                    tolerance.metric,
+                    &tolerance.amount,
+                    &tolerance.amount,
+                    &tolerance.amount,
+                )
+                .map_err(|_| SessionError::InvalidGoal(crate::GoalError::InvalidObservation))?;
+        }
+        let thresholds = goal
+            .constraints
+            .iter()
+            .map(|threshold| (threshold, false))
+            .chain(
+                goal.success
+                    .iter()
+                    .flat_map(|success| success.thresholds.iter())
+                    .map(|threshold| (threshold, true)),
+            )
+            .collect::<Vec<_>>();
+        for (index, (left, left_is_success)) in thresholds.iter().enumerate() {
+            for (right, right_is_success) in &thresholds[index + 1..] {
+                if left.metric != right.metric || left.relation == right.relation {
+                    continue;
+                }
+                let ordering = domain
+                    .measurements()
+                    .compare(left.metric, &left.threshold, &right.threshold)
+                    .map_err(|_| SessionError::InvalidGoal(crate::GoalError::InvalidObservation))?;
+                let incompatible = matches!(
+                    (left.relation, right.relation, ordering),
+                    (
+                        ThresholdRelation::AtMost,
+                        ThresholdRelation::AtLeast,
+                        MetricOrdering::Less
+                    ) | (
+                        ThresholdRelation::AtLeast,
+                        ThresholdRelation::AtMost,
+                        MetricOrdering::Greater
+                    )
+                );
+                if incompatible {
+                    return Err(SessionError::InvalidGoal(
+                        if *left_is_success || *right_is_success {
+                            crate::GoalError::IncompatibleSuccessCondition
+                        } else {
+                            crate::GoalError::IncompatibleConstraints
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_goal_observation<D: DomainDefinition>(
+    domain: &D,
+    metric: D::Metric,
+    observation: &D::Observation,
+) -> Result<(), SessionError<D::Error>> {
+    let mut encoded = Vec::new();
+    domain
+        .measurements()
+        .encode_observation(metric, observation, &mut encoded)
+        .map_err(SessionError::Domain)?;
+    let decoded = domain
+        .measurements()
+        .decode_observation(metric, &encoded)
+        .map_err(SessionError::Domain)?;
+    let mut canonical = Vec::new();
+    domain
+        .measurements()
+        .encode_observation(metric, &decoded, &mut canonical)
+        .map_err(SessionError::Domain)?;
+    if encoded != canonical
+        || domain.measurements().compare(metric, observation, &decoded) != Ok(MetricOrdering::Equal)
+    {
+        return Err(SessionError::InvalidGoal(
+            crate::GoalError::InvalidObservation,
+        ));
     }
     Ok(())
 }
@@ -2300,20 +2777,39 @@ fn validate_goals<D: DomainDefinition>(
 fn read_seeds<D: DomainDefinition>(
     domain: &D,
     scope: &D::SeedScope,
+    maximum: u64,
+    resource_meter: &ProductionResourceMeter,
 ) -> Result<ReadSeeds<D>, SessionError<D::Error>> {
     let mut cursor = domain.seeds().open(scope).map_err(SessionError::Domain)?;
     let mut scratch = <D::Seeds as SeedSource<D>>::Scratch::default();
     let mut seeds = Vec::new();
     loop {
+        if resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        {
+            return Err(SessionError::Resource);
+        }
+        let remaining =
+            usize::try_from(maximum.saturating_sub(u64::try_from(seeds.len()).unwrap_or(u64::MAX)))
+                .unwrap_or(usize::MAX);
+        if remaining == 0 {
+            return Err(SessionError::Resource);
+        }
+        let limit = remaining.min(256);
+        let before = seeds.len();
+        let mut writer = SeedWriter::with_limit(&mut seeds, limit);
         let page = domain
             .seeds()
-            .read_batch(
-                &mut cursor,
-                256,
-                &mut SeedWriter::new(&mut seeds),
-                &mut scratch,
-            )
+            .read_batch(&mut cursor, limit, &mut writer, &mut scratch)
             .map_err(SessionError::Domain)?;
+        if writer.overflowed() {
+            return Err(SessionError::Resource);
+        }
+        let accepted = seeds.len() - before;
+        if page.emitted != accepted || page.emitted > limit {
+            return Err(SessionError::InvalidSeed);
+        }
         if page.exhausted {
             break;
         }
@@ -2347,15 +2843,19 @@ fn replay_seeds<D: DomainDefinition>(
         .collect::<Vec<_>>();
     let mut replayed = Vec::new();
     let mut scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
+    let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, requests.len());
     domain
         .kernel()
         .replay_batch(
             VerificationReplayBatch::new(&requests),
-            &mut ReplayVerdictWriter::new(&mut replayed),
+            &mut writer,
             &mut scratch,
         )
         .map_err(SessionError::Domain)?;
-    if replayed.len() != seeds.len() || replayed.iter().any(|accepted| !accepted) {
+    if writer.overflowed()
+        || replayed.len() != seeds.len()
+        || replayed.iter().any(|accepted| !accepted)
+    {
         return Err(SessionError::InvalidSeed);
     }
     Ok(())
@@ -2419,15 +2919,12 @@ fn verify_candidates<D: DomainDefinition>(
         .collect::<Vec<_>>();
     let mut verdicts = Vec::new();
     let mut scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
+    let mut writer = VerdictWriter::with_limit(&mut verdicts, requests.len());
     domain
         .kernel()
-        .verify_batch(
-            VerificationBatch::new(&requests),
-            &mut VerdictWriter::new(&mut verdicts),
-            &mut scratch,
-        )
+        .verify_batch(VerificationBatch::new(&requests), &mut writer, &mut scratch)
         .map_err(SessionError::Domain)?;
-    if verdicts.len() != candidates.len() {
+    if writer.overflowed() || verdicts.len() != candidates.len() {
         return Err(SessionError::InvalidSeed);
     }
     let revision = domain.kernel().revision();
@@ -2465,6 +2962,7 @@ fn verify_candidates<D: DomainDefinition>(
                             evidence,
                             kernel_revision: revision,
                         },
+                        provenance: candidate.operator_symbol.clone(),
                         origin_key: Some(origin_key),
                         parent_key: Some(parent_key),
                     },
@@ -2683,6 +3181,7 @@ fn encode_bundle<D: DomainDefinition>(
             }
             None => artifact_payload.push(0),
         }
+        push_bytes(&mut artifact_payload, &artifact.inner.provenance);
     }
     let identity = domain.semantic_identity();
     let revision_ids = revision_ids(identity.as_str(), artifacts, knowledge, learning);
@@ -2792,6 +3291,8 @@ fn revision_ids<D: DomainDefinition>(
             }
             None => knowledge.update([0]),
         }
+        knowledge.update((artifact.inner.provenance.len() as u64).to_le_bytes());
+        knowledge.update(&artifact.inner.provenance);
     }
     knowledge.update(state.revision_digest(semantic_identity));
     RevisionIds {
@@ -2800,10 +3301,76 @@ fn revision_ids<D: DomainDefinition>(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the Session segment is encoded in declared canonical field order"
-)]
+fn encode_goal<D: DomainDefinition>(
+    domain: &D,
+    goal: &OptimizationGoal<D>,
+    output: &mut Vec<u8>,
+) -> Result<(), SessionError<D::Error>> {
+    push_u64(output, goal.constraints.len() as u64);
+    for constraint in &goal.constraints {
+        encode_metric(domain, constraint.metric, output)?;
+        output.push(match constraint.relation {
+            ThresholdRelation::AtMost => 0,
+            ThresholdRelation::AtLeast => 1,
+        });
+        let mut observation = Vec::new();
+        domain
+            .measurements()
+            .encode_observation(constraint.metric, &constraint.threshold, &mut observation)
+            .map_err(SessionError::Domain)?;
+        push_bytes(output, &observation);
+    }
+    push_u64(output, goal.objectives.as_slice().len() as u64);
+    for objective in goal.objectives.iter() {
+        encode_metric(domain, objective.metric, output)?;
+        output.push(match objective.direction {
+            Direction::Minimize => 0,
+            Direction::Maximize => 1,
+        });
+    }
+    push_u64(
+        output,
+        goal.preference.priority_tiers.as_slice().len() as u64,
+    );
+    for tier in goal.preference.priority_tiers.iter() {
+        push_u64(output, tier.as_slice().len() as u64);
+        for metric in tier.iter() {
+            encode_metric(domain, *metric, output)?;
+        }
+    }
+    push_u64(output, goal.preference.tolerances.len() as u64);
+    for tolerance in &goal.preference.tolerances {
+        encode_metric(domain, tolerance.metric, output)?;
+        let mut observation = Vec::new();
+        domain
+            .measurements()
+            .encode_observation(tolerance.metric, &tolerance.amount, &mut observation)
+            .map_err(SessionError::Domain)?;
+        push_bytes(output, &observation);
+    }
+    match &goal.success {
+        Some(success) => {
+            output.push(1);
+            push_u64(output, success.thresholds.as_slice().len() as u64);
+            for threshold in success.thresholds.iter() {
+                encode_metric(domain, threshold.metric, output)?;
+                output.push(match threshold.relation {
+                    ThresholdRelation::AtMost => 0,
+                    ThresholdRelation::AtLeast => 1,
+                });
+                let mut observation = Vec::new();
+                domain
+                    .measurements()
+                    .encode_observation(threshold.metric, &threshold.threshold, &mut observation)
+                    .map_err(SessionError::Domain)?;
+                push_bytes(output, &observation);
+            }
+        }
+        None => output.push(0),
+    }
+    Ok(())
+}
+
 fn encode_session<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
@@ -2818,72 +3385,7 @@ fn encode_session<D: DomainDefinition>(
     let mut goals = Vec::new();
     push_u64(&mut goals, request.goals.goals.as_slice().len() as u64);
     for goal in request.goals.goals.iter() {
-        push_u64(&mut goals, goal.constraints.len() as u64);
-        for constraint in &goal.constraints {
-            encode_metric(domain, constraint.metric, &mut goals)?;
-            goals.push(match constraint.relation {
-                ThresholdRelation::AtMost => 0,
-                ThresholdRelation::AtLeast => 1,
-            });
-            let mut observation = Vec::new();
-            domain
-                .measurements()
-                .encode_observation(constraint.metric, &constraint.threshold, &mut observation)
-                .map_err(SessionError::Domain)?;
-            push_bytes(&mut goals, &observation);
-        }
-        push_u64(&mut goals, goal.objectives.as_slice().len() as u64);
-        for objective in goal.objectives.iter() {
-            encode_metric(domain, objective.metric, &mut goals)?;
-            goals.push(match objective.direction {
-                Direction::Minimize => 0,
-                Direction::Maximize => 1,
-            });
-        }
-        push_u64(
-            &mut goals,
-            goal.preference.priority_tiers.as_slice().len() as u64,
-        );
-        for tier in goal.preference.priority_tiers.iter() {
-            push_u64(&mut goals, tier.as_slice().len() as u64);
-            for metric in tier.iter() {
-                encode_metric(domain, *metric, &mut goals)?;
-            }
-        }
-        push_u64(&mut goals, goal.preference.tolerances.len() as u64);
-        for tolerance in &goal.preference.tolerances {
-            encode_metric(domain, tolerance.metric, &mut goals)?;
-            let mut observation = Vec::new();
-            domain
-                .measurements()
-                .encode_observation(tolerance.metric, &tolerance.amount, &mut observation)
-                .map_err(SessionError::Domain)?;
-            push_bytes(&mut goals, &observation);
-        }
-        match &goal.success {
-            Some(success) => {
-                goals.push(1);
-                push_u64(&mut goals, success.thresholds.as_slice().len() as u64);
-                for threshold in success.thresholds.iter() {
-                    encode_metric(domain, threshold.metric, &mut goals)?;
-                    goals.push(match threshold.relation {
-                        ThresholdRelation::AtMost => 0,
-                        ThresholdRelation::AtLeast => 1,
-                    });
-                    let mut observation = Vec::new();
-                    domain
-                        .measurements()
-                        .encode_observation(
-                            threshold.metric,
-                            &threshold.threshold,
-                            &mut observation,
-                        )
-                        .map_err(SessionError::Domain)?;
-                    push_bytes(&mut goals, &observation);
-                }
-            }
-            None => goals.push(0),
-        }
+        encode_goal(domain, goal, &mut goals)?;
     }
     let mut payload = Vec::new();
     payload.push(u8::from(matches!(session_seal, SessionSeal::Completed(..))));

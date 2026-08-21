@@ -61,7 +61,7 @@ fn v3_bundle_segments_preserve_refuted_experience() {
             && segments
                 .iter()
                 .map(|(_, version, _)| *version)
-                .eq([1, 3, 1, 2, 1])
+                .eq([1, 3, 2, 2, 1])
             && count == 1
             && verdict == 2
             && outcome.usage().verification_requests == 2,
@@ -134,7 +134,7 @@ fn v3_experience_keeps_resource_admission_and_measurement_observations_separate(
             && consequence_count >= 3
             && measurement_count == 1
             && environment_length > 0
-            && value_count == 4,
+            && value_count == 6,
         "the immutable attempt, delayed consequences, and encoded Measurements remain distinct records"
     );
     std::fs::remove_file(bundle_path).ok();

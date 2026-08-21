@@ -245,6 +245,7 @@ dependencies = [
 name = "reflex-bitvec"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "reflex",
  "sha2",
 ]
