@@ -1173,10 +1173,8 @@ fn order_by_learned_potential<D: DomainDefinition>(
         let mut ordinary = ordinary.into_iter();
         loop {
             let before = candidates.len();
-            if let Some(candidate) = derived.next() {
-                candidates.push(candidate);
-            }
-            candidates.extend(ordinary.by_ref().take(7));
+            candidates.extend(derived.by_ref().take(2));
+            candidates.extend(ordinary.by_ref().take(6));
             if candidates.len() == before {
                 break;
             }
@@ -1217,13 +1215,11 @@ fn order_by_learned_potential<D: DomainDefinition>(
     let mut derived_exploration = derived_exploration.into_iter();
     loop {
         let before = candidates.len();
-        if let Some(candidate) = derived_exploration.next() {
-            candidates.push(candidate);
-        }
+        candidates.extend(derived_exploration.by_ref().take(2));
         if let Some(candidate) = exploration.next() {
             candidates.push(candidate);
         }
-        candidates.extend(ranked.by_ref().take(6));
+        candidates.extend(ranked.by_ref().take(5));
         if candidates.len() == before {
             break;
         }
