@@ -33,6 +33,57 @@ fn canonical_structure_interns_equal_subexpressions() {
 }
 
 #[test]
+fn expanded_unary_expressions_have_exact_wrapping_semantics_and_canonical_round_trips() {
+    let domain = BitVecDomain::unary_u8();
+    let expression = Expression::rotate_left(
+        Expression::wrapping_add(Expression::input(), Expression::constant(250)),
+        3,
+    );
+    assert_eq!(expression.evaluate(10), 4_u8.rotate_left(3));
+
+    let mut encoded = Vec::new();
+    domain
+        .structure()
+        .encode_canonical(&expression, &mut encoded, &mut ())
+        .unwrap();
+    let decoded = domain
+        .structure()
+        .decode_canonical(&encoded, &mut ())
+        .unwrap();
+    let claim = domain
+        .kernel()
+        .claim_for_candidate(&expression, &expression)
+        .unwrap();
+    let requests = [VerificationRequest {
+        seed: &expression,
+        candidate: &decoded,
+        claim: &claim,
+    }];
+    let mut verdicts = Vec::new();
+    domain
+        .kernel()
+        .verify_batch(
+            VerificationBatch::new(&requests),
+            &mut VerdictWriter::new(&mut verdicts),
+            &mut (),
+        )
+        .unwrap();
+    assert!(matches!(verdicts.as_slice(), [Verdict::Accepted { .. }]));
+}
+
+#[test]
+fn wrapping_add_and_rotation_expand_beyond_the_exhausted_xor_semantic_family() {
+    let expanded = Expression::rotate_left(
+        Expression::wrapping_add(Expression::input(), Expression::constant(1)),
+        1,
+    );
+    assert!((0..=u8::MAX).all(|constant| {
+        let xor = Expression::xor(Expression::input(), Expression::constant(constant));
+        (0..=u8::MAX).any(|input| expanded.evaluate(input) != xor.evaluate(input))
+    }));
+}
+
+#[test]
 fn measurement_space_orders_and_tolerates_evaluator_work() {
     let domain = BitVecDomain::unary_u8();
     let expression = Expression::xor(Expression::input(), Expression::constant(0));
@@ -89,6 +140,19 @@ fn decoder_rejects_a_noncanonical_duplicate_dag_node() {
             .is_err(),
         "one semantic DAG has exactly one accepted canonical byte representation"
     );
+
+    let invalid_rotation = [
+        2, 0, 0, 0, // two nodes
+        0, // input
+        4, 0, 0, 0, 0, 8, // rotate-left(node 0, invalid amount 8)
+    ];
+    assert!(
+        domain
+            .structure()
+            .decode_canonical(&invalid_rotation, &mut ())
+            .is_err(),
+        "rotation immediates have one canonical value in 0..8"
+    );
 }
 
 #[test]
@@ -125,9 +189,9 @@ fn artifact_key_is_sha256_over_semantics_and_canonical_structure() {
     assert_eq!(
         outcome.pareto().artifacts()[0].key().as_bytes(),
         &[
-            0x98, 0x32, 0x52, 0x12, 0x90, 0x49, 0x45, 0xf9, 0x8d, 0x15, 0x76, 0xcc, 0xd7, 0x39,
-            0x98, 0x8b, 0xf2, 0x10, 0x0c, 0x5f, 0xa2, 0x12, 0xef, 0xac, 0xc3, 0xf9, 0xd4, 0x68,
-            0xc5, 0x3c, 0x15, 0xad,
+            0x74, 0x73, 0x59, 0x31, 0x9a, 0x3e, 0x0e, 0x2e, 0x7a, 0xbf, 0xef, 0x54, 0xe6, 0x76,
+            0x8c, 0x66, 0xfe, 0xd8, 0xbf, 0x85, 0x65, 0xf6, 0x51, 0x2a, 0xf0, 0xad, 0xb8, 0x0e,
+            0x52, 0x90, 0x97, 0x86,
         ]
     );
     std::fs::remove_file(bundle_path).ok();

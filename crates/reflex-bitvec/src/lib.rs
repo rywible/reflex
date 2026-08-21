@@ -15,6 +15,8 @@ use reflex::{
     VerifiedBatch,
 };
 
+const U8_ROTATIONS: u8 = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Expression {
     nodes: Vec<Node>,
@@ -25,6 +27,8 @@ enum Node {
     Input,
     Constant(u8),
     Xor(u32, u32),
+    Add(u32, u32),
+    RotateLeft(u32, u8),
 }
 
 impl Expression {
@@ -48,6 +52,35 @@ impl Expression {
     ///
     /// Panics if the combined expression exceeds the `u32` node-ID space.
     pub fn xor(left: Self, right: Self) -> Self {
+        Self::binary(left, right, Node::Xor)
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if the combined expression exceeds the `u32` node-ID space.
+    pub fn wrapping_add(left: Self, right: Self) -> Self {
+        Self::binary(left, right, Node::Add)
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if the expression exceeds the `u32` node-ID space.
+    pub fn rotate_left(value: Self, amount: u8) -> Self {
+        let amount = amount % U8_ROTATIONS;
+        let mut nodes = value.nodes;
+        let value_root = u32::try_from(nodes.len() - 1).expect("expression exceeds u32 node IDs");
+        let root = Node::RotateLeft(value_root, amount);
+        if !nodes.contains(&root) {
+            nodes.push(root);
+        }
+        Self { nodes }
+    }
+
+    fn binary(left: Self, right: Self, constructor: fn(u32, u32) -> Node) -> Self {
         let mut nodes = left.nodes;
         let left_root = u32::try_from(nodes.len() - 1).expect("expression exceeds u32 node IDs");
         let mut interned = nodes
@@ -69,6 +102,12 @@ impl Expression {
                 Node::Xor(left, right) => {
                     Node::Xor(right_ids[left as usize], right_ids[right as usize])
                 }
+                Node::Add(left, right) => {
+                    Node::Add(right_ids[left as usize], right_ids[right as usize])
+                }
+                Node::RotateLeft(value, amount) => {
+                    Node::RotateLeft(right_ids[value as usize], amount)
+                }
             };
             let id = if let Some(id) = interned.get(&remapped) {
                 *id
@@ -81,7 +120,7 @@ impl Expression {
             right_ids.push(id);
         }
         let right_root = *right_ids.last().expect("Expression is never empty");
-        let root = Node::Xor(left_root, right_root);
+        let root = constructor(left_root, right_root);
         if !interned.contains_key(&root) {
             nodes.push(root);
         }
@@ -100,12 +139,18 @@ impl Expression {
     /// Panics only if an `Expression` violates its private nonempty,
     /// topologically ordered representation invariant.
     pub fn evaluate(&self, input: u8) -> u8 {
-        let mut values = Vec::with_capacity(self.nodes.len());
+        let mut values: Vec<u8> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let value = match *node {
                 Node::Input => input,
                 Node::Constant(value) => value,
                 Node::Xor(left, right) => values[left as usize] ^ values[right as usize],
+                Node::Add(left, right) => {
+                    values[left as usize].wrapping_add(values[right as usize])
+                }
+                Node::RotateLeft(value, amount) => {
+                    values[value as usize].rotate_left(amount.into())
+                }
             };
             values.push(value);
         }
@@ -117,7 +162,10 @@ impl Expression {
         for node in &self.nodes {
             let depth = match *node {
                 Node::Input | Node::Constant(_) => 1,
-                Node::Xor(left, right) => 1 + depths[left as usize].max(depths[right as usize]),
+                Node::Xor(left, right) | Node::Add(left, right) => {
+                    1 + depths[left as usize].max(depths[right as usize])
+                }
+                Node::RotateLeft(value, _) => 1 + depths[value as usize],
             };
             depths.push(depth);
         }
@@ -161,6 +209,15 @@ impl Expression {
                     let new_right = copy_node(source, right, output, copied);
                     Node::Xor(new_left, new_right)
                 }
+                Node::Add(left, right) => {
+                    let new_left = copy_node(source, left, output, copied);
+                    let new_right = copy_node(source, right, output, copied);
+                    Node::Add(new_left, new_right)
+                }
+                Node::RotateLeft(value, amount) => {
+                    let new_value = copy_node(source, value, output, copied);
+                    Node::RotateLeft(new_value, amount)
+                }
             };
             let new_id = u32::try_from(output.len()).expect("expression exceeds u32 node IDs");
             output.push(node);
@@ -188,6 +245,16 @@ impl Expression {
                     output.extend_from_slice(&left.to_le_bytes());
                     output.extend_from_slice(&right.to_le_bytes());
                 }
+                Node::Add(left, right) => {
+                    output.push(3);
+                    output.extend_from_slice(&left.to_le_bytes());
+                    output.extend_from_slice(&right.to_le_bytes());
+                }
+                Node::RotateLeft(value, amount) => {
+                    output.push(4);
+                    output.extend_from_slice(&value.to_le_bytes());
+                    output.push(amount);
+                }
             }
         }
     }
@@ -211,6 +278,22 @@ impl Expression {
                         return Err(BitVecError::InvalidEncoding);
                     }
                     Node::Xor(left, right)
+                }
+                3 => {
+                    let left = read_u32(&mut bytes)?;
+                    let right = read_u32(&mut bytes)?;
+                    if left as usize >= index || right as usize >= index {
+                        return Err(BitVecError::InvalidEncoding);
+                    }
+                    Node::Add(left, right)
+                }
+                4 => {
+                    let value = read_u32(&mut bytes)?;
+                    let amount = take(&mut bytes, 1)?[0];
+                    if value as usize >= index || amount >= U8_ROTATIONS {
+                        return Err(BitVecError::InvalidEncoding);
+                    }
+                    Node::RotateLeft(value, amount)
                 }
                 _ => return Err(BitVecError::InvalidEncoding),
             };
@@ -314,7 +397,7 @@ impl DomainDefinition for BitVecDomain {
     type Measurements = ExpressionMeasurements;
 
     fn semantic_identity(&self) -> SemanticIdentity {
-        SemanticIdentity::new("reflex-bitvec/u8/unary/xor/v1")
+        SemanticIdentity::new("reflex-bitvec/u8/unary/xor-add-rotl/v2")
     }
 
     fn structure(&self) -> &Self::Structure {
@@ -348,6 +431,8 @@ pub enum Constructor {
     Input,
     Constant,
     Xor,
+    Add,
+    RotateLeft,
 }
 
 pub struct ExpressionView<'a>(&'a Expression);
@@ -378,6 +463,8 @@ impl ExpressionStructure {
                     (Constructor::Input, SymbolId::new("input")),
                     (Constructor::Constant, SymbolId::new("constant")),
                     (Constructor::Xor, SymbolId::new("xor")),
+                    (Constructor::Add, SymbolId::new("wrapping-add")),
+                    (Constructor::RotateLeft, SymbolId::new("rotate-left")),
                 ],
             },
         }

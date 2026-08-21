@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v3";
 const CORPUS_NAME: &str = "unary-u8-xor-development-v1";
 const EXPECTED_SEMANTIC_OUTCOME: &str =
-    "8c5e4703787465fece63053886929642901c74fdbd02ff4412d0a15fca366130";
+    "339c0c6d5e20b4c8af292e7b32699576e474bc7828e451481d36e31d1bdb070f";
 const WARMUPS: u32 = 2;
 const REPLICATES: u32 = 10;
 const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
