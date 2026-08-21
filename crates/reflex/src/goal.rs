@@ -29,6 +29,11 @@ impl<T> NonEmpty<T> {
         &self.values
     }
 
+    #[must_use]
+    pub fn into_vec(self) -> Vec<T> {
+        self.values
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.values.iter()
     }

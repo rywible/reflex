@@ -68,12 +68,12 @@ fn satisfying_every_goal_success_condition_stops_the_session() {
     let success = SuccessCondition::all(NonEmpty::one(MeasurementConstraint::new(
         Metric::NodeCount,
         ThresholdRelation::AtMost,
-        1,
+        3,
     )));
     let request = ImprovementRequest::new(
         GoalSet::one(OptimizationGoal::new([], objectives, preference, Some(success)).unwrap()),
         SeedScope::one(Expression::xor(
-            Expression::input(),
+            Expression::xor(Expression::input(), Expression::constant(0)),
             Expression::constant(0),
         )),
         ResourceEnvelope::new(
@@ -95,7 +95,12 @@ fn satisfying_every_goal_success_condition_stops_the_session() {
     })
     .unwrap();
 
-    assert_eq!(outcome.completion(), Completion::SuccessConditionsSatisfied);
+    assert!(
+        outcome.completion() == Completion::SuccessConditionsSatisfied
+            && outcome.usage().verification_requests == 2
+            && outcome.pareto().artifacts()[0].artifact().node_count() == 3,
+        "success at an epoch boundary must stop before another Candidate is scheduled"
+    );
     std::fs::remove_file(bundle_path).ok();
 }
 

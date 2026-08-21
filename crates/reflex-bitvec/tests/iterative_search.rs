@@ -1,0 +1,251 @@
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::ControlFlow;
+use std::time::Duration;
+
+use reflex::{
+    BundlePlan, Completion, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration,
+    Objective, OptimizationGoal, Preference, ResourceEnvelope, improve,
+};
+use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+
+#[test]
+fn session_reinvests_in_a_verified_intermediate_artifact() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-iterative-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seed = Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(0)),
+        Expression::constant(0),
+    );
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(seed),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    assert!(
+        outcome.pareto().artifacts().len() == 1
+            && outcome.pareto().artifacts()[0].artifact().node_count() == 1
+            && outcome.usage().verification_requests == 3,
+        "the second Operator application may run only after its parent was Verified"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn observer_can_stop_before_the_next_search_epoch() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-epoch-stop-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seed = Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(0)),
+        Expression::constant(0),
+    );
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(seed),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |update| {
+        if update
+            .added()
+            .iter()
+            .any(|artifact| artifact.artifact().node_count() == 3)
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .unwrap();
+
+    assert!(
+        outcome.completion() == Completion::StoppedByObserver
+            && outcome.pareto().artifacts()[0].artifact().node_count() == 3
+            && outcome.usage().verification_requests == 2,
+        "observer stop is applied before another Candidate can consume resources"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn observer_receives_one_monotonic_delta_per_completed_epoch() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-epoch-deltas-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seed = Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(0)),
+        Expression::constant(0),
+    );
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(seed),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+    let mut deltas = Vec::new();
+
+    improve(BitVecDomain::unary_u8(), request, |update| {
+        deltas.push((
+            update.sequence(),
+            update
+                .added()
+                .iter()
+                .map(|artifact| artifact.artifact().node_count())
+                .collect::<Vec<_>>(),
+            update.removed().len(),
+        ));
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        deltas,
+        vec![(1, vec![4], 0), (2, vec![3], 1), (3, vec![1], 1)],
+        "each update must atomically describe one committed Pareto transition"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn canonical_dedup_does_not_reverify_an_already_known_artifact() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-search-dedup-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seeds = NonEmpty::try_from_iter([
+        Expression::input(),
+        Expression::xor(Expression::input(), Expression::constant(0)),
+    ])
+    .unwrap();
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(seeds),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(10_000).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        outcome.usage().verification_requests,
+        2,
+        "ArtifactKey dedup must happen before Candidate verification and scheduling"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn verification_budget_stops_before_an_unaffordable_epoch() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-epoch-budget-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let seed = Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(0)),
+        Expression::constant(0),
+    );
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(seed),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+
+    assert!(
+        outcome.completion() == Completion::ResourceEnvelopeExhausted
+            && outcome.usage().verification_requests == 2
+            && outcome.pareto().artifacts()[0].artifact().node_count() == 3,
+        "the second search epoch cannot start when its verification is unaffordable"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}

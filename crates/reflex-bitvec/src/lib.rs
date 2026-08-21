@@ -9,8 +9,8 @@ use reflex::domain::{
 use reflex::{
     ApplicationWriter, CandidateWriter, DomainDefinition, Incomparable, KernelRevision,
     MeasurementDescriptor, MeasurementEnvironment, MeasurementSpace, MeasurementWriter,
-    MetricOrdering, OperatorAlgebra, OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage,
-    SeedSource, SeedWriter, SemanticIdentity, StructuralProtocol, Verdict, VerdictWriter,
+    MetricOrdering, NonEmpty, OperatorAlgebra, OperatorDescriptor, OperatorEnumerationBatch, Seed,
+    SeedPage, SeedSource, SeedWriter, SemanticIdentity, StructuralProtocol, Verdict, VerdictWriter,
     VerificationBatch, VerificationKernel, VerificationRecord, VerificationReplayBatch,
     VerifiedBatch,
 };
@@ -230,10 +230,15 @@ pub struct SeedScope {
 
 impl SeedScope {
     #[must_use]
-    pub fn one(expression: Expression) -> Self {
+    pub fn new(expressions: NonEmpty<Expression>) -> Self {
         Self {
-            expressions: vec![expression],
+            expressions: expressions.into_vec(),
         }
+    }
+
+    #[must_use]
+    pub fn one(expression: Expression) -> Self {
+        Self::new(NonEmpty::one(expression))
     }
 }
 

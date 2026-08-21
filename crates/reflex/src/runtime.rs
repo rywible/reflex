@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -25,6 +26,7 @@ use crate::session::{
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type StoredArtifact<D> = (<D as DomainDefinition>::Artifact, VerificationRecord<D>);
+type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize);
 
 #[expect(
     clippy::too_many_lines,
@@ -40,50 +42,19 @@ where
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
 {
     validate_goals(domain, request)?;
-
-    let recovered = request
+    let recovered_stored = request
         .bundle
         .source()
         .map(|source| load_bundle(domain, source))
         .transpose()?
         .unwrap_or_default();
-    let recovered_replays = recovered.len();
-
+    let recovered_replays = recovered_stored.len();
     let mut seeds = read_seeds(domain, &request.seeds)?;
     let seed_replays = seeds.len();
     replay_seeds(domain, &seeds)?;
     if seeds.is_empty() {
         return Err(SessionError::InvalidSeed);
     }
-
-    let mut applications = Vec::new();
-    let seed_artifacts = seeds.iter().map(|seed| &seed.artifact).collect::<Vec<_>>();
-    let operators = domain
-        .operators()
-        .catalog()
-        .iter()
-        .map(crate::OperatorDescriptor::operator)
-        .collect::<Vec<_>>();
-    let mut operator_scratch = <D::Operators as OperatorAlgebra<D>>::Scratch::default();
-    domain
-        .operators()
-        .enumerate_legal(
-            OperatorEnumerationBatch::new(&seed_artifacts, &operators),
-            &mut ApplicationWriter::new(&mut applications),
-            &mut operator_scratch,
-        )
-        .map_err(SessionError::Domain)?;
-
-    let mut candidates = Vec::new();
-    domain
-        .operators()
-        .apply_batch(
-            &applications,
-            &mut CandidateWriter::new(&mut candidates),
-            &mut operator_scratch,
-        )
-        .map_err(SessionError::Domain)?;
-
     let required_replays = recovered_replays
         .checked_add(seed_replays)
         .and_then(|count| u64::try_from(count).ok())
@@ -92,121 +63,124 @@ where
     if required_replays > verification_budget {
         return Err(SessionError::Resource);
     }
-    let available_candidate_requests =
-        usize::try_from(verification_budget - required_replays).unwrap_or(usize::MAX);
-    let verification_budget_exhausted = candidates.len() > available_candidate_requests;
-    candidates.truncate(available_candidate_requests);
-    let candidate_requests = u64::try_from(candidates.len()).map_err(|_| SessionError::Resource)?;
-    let verification_requests = required_replays + candidate_requests;
-    let accepted = verify_candidates(domain, &seeds, candidates)?;
-
-    let mut pending = recovered;
-    pending.extend(
-        seeds
-            .drain(..)
-            .map(|seed| (seed.artifact, seed.verification)),
-    );
-    pending.extend(accepted);
-
     let environment = crate::MeasurementEnvironment::local_process();
-    let artifact_refs = pending
+    let recovered = materialize(domain, recovered_stored, &environment)?;
+    let recovered_keys = recovered
         .iter()
-        .map(|(artifact, _)| artifact)
-        .collect::<Vec<_>>();
-    let mut measured = Vec::new();
-    let mut measurement_scratch = <D::Measurements as MeasurementSpace<D>>::Scratch::default();
-    domain
-        .measurements()
-        .measure_batch(
-            VerifiedBatch::new(&artifact_refs),
-            &environment,
-            &mut MeasurementWriter::new(&mut measured),
-            &mut measurement_scratch,
-        )
-        .map_err(SessionError::Domain)?;
-
-    let mut measurements_by_artifact = (0..pending.len())
-        .map(|_| Vec::new())
-        .collect::<Vec<Vec<Measurement<D::Metric, D::Observation>>>>();
-    for measurement in measured {
-        let Some(output) = measurements_by_artifact.get_mut(measurement.artifact_index) else {
-            return Err(SessionError::InvalidSeed);
-        };
-        output.push(measurement);
-    }
-
-    let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
-    let semantic_identity = domain.semantic_identity();
-    let mut verified = Vec::with_capacity(pending.len());
-    for ((artifact, verification), measurements) in
-        pending.into_iter().zip(measurements_by_artifact)
-    {
-        let mut canonical = Vec::new();
-        domain
-            .structure()
-            .encode_canonical(&artifact, &mut canonical, &mut structure_scratch)
-            .map_err(SessionError::Domain)?;
-        verified.push(VerifiedArtifact {
-            inner: Arc::new(VerifiedArtifactRecord {
-                key: ArtifactKey(stable_digest(semantic_identity.as_str(), &canonical)),
-                artifact,
-                verification,
-                measurements,
-                environment: environment.clone(),
-            }),
-        });
-    }
-    let mut unique = Vec::with_capacity(verified.len());
-    for artifact in verified {
-        if !unique
-            .iter()
-            .any(|retained: &VerifiedArtifact<D>| retained.key() == artifact.key())
-        {
-            unique.push(artifact);
-        }
-    }
-    let recovered_keys = unique
-        .iter()
-        .take(recovered_replays)
         .map(VerifiedArtifact::key)
         .collect::<Vec<_>>();
-
-    let goal_frontiers = request
-        .goals
-        .goals
-        .iter()
-        .map(|goal| retain_pareto(domain, goal, unique.clone()))
+    let seed_stored = seeds
+        .drain(..)
+        .map(|seed| (seed.artifact, seed.verification))
         .collect::<Vec<_>>();
-    let mut pareto = Vec::new();
-    for frontier in &goal_frontiers {
-        for artifact in frontier {
-            if !pareto
-                .iter()
-                .any(|retained: &VerifiedArtifact<D>| retained.key() == artifact.key())
-            {
-                pareto.push(artifact.clone());
+    let roots = materialize(domain, seed_stored, &environment)?;
+    let mut known = recovered;
+    extend_unique(&mut known, roots.iter().cloned());
+    let mut pareto = pareto_union(domain, &request.goals, &known);
+    let mut sequence = 0_u64;
+    let mut stopped_by_observer =
+        deliver_delta(&mut observer, &mut sequence, &recovered_keys, &pareto);
+    let mut success_conditions_satisfied = all_success_conditions_satisfied(
+        domain,
+        &request.goals,
+        &goal_frontiers(domain, &request.goals, &known),
+    );
+    let mut verification_requests = required_replays;
+    let mut verification_budget_exhausted = false;
+    let mut frontier = roots
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(origin, artifact)| (artifact, origin))
+        .collect::<Vec<_>>();
+    let operators = domain
+        .operators()
+        .catalog()
+        .iter()
+        .map(crate::OperatorDescriptor::operator)
+        .collect::<Vec<_>>();
+    let mut operator_scratch = <D::Operators as OperatorAlgebra<D>>::Scratch::default();
+
+    while !stopped_by_observer && !success_conditions_satisfied && !frontier.is_empty() {
+        let parents = frontier
+            .iter()
+            .map(|(artifact, _)| artifact.artifact())
+            .collect::<Vec<_>>();
+        let origins = frontier
+            .iter()
+            .map(|(_, origin)| *origin)
+            .collect::<Vec<_>>();
+        let mut applications = Vec::new();
+        domain
+            .operators()
+            .enumerate_legal(
+                OperatorEnumerationBatch::new(&parents, &operators),
+                &mut ApplicationWriter::new(&mut applications),
+                &mut operator_scratch,
+            )
+            .map_err(SessionError::Domain)?;
+        let mut candidates = Vec::new();
+        domain
+            .operators()
+            .apply_batch(
+                &applications,
+                &mut CandidateWriter::new(&mut candidates),
+                &mut operator_scratch,
+            )
+            .map_err(SessionError::Domain)?;
+        candidates = retain_novel_candidates(domain, &known, candidates)?;
+        if candidates.is_empty() {
+            break;
+        }
+        let remaining = verification_budget
+            .checked_sub(verification_requests)
+            .and_then(|remaining| usize::try_from(remaining).ok())
+            .unwrap_or(0);
+        if candidates.len() > remaining {
+            candidates.truncate(remaining);
+            verification_budget_exhausted = true;
+        }
+        if candidates.is_empty() {
+            break;
+        }
+        verification_requests +=
+            u64::try_from(candidates.len()).map_err(|_| SessionError::Resource)?;
+        let accepted_stored = verify_candidates(domain, &roots, &origins, candidates)?;
+        let accepted_origins = accepted_stored
+            .iter()
+            .map(|(_, origin)| *origin)
+            .collect::<Vec<_>>();
+        let accepted = materialize(
+            domain,
+            accepted_stored
+                .into_iter()
+                .map(|(artifact, _)| artifact)
+                .collect(),
+            &environment,
+        )?;
+        frontier.clear();
+        for (artifact, origin) in accepted.into_iter().zip(accepted_origins) {
+            if !known.iter().any(|known| known.key() == artifact.key()) {
+                frontier.push((artifact.clone(), origin));
+                known.push(artifact);
             }
         }
+        if frontier.is_empty() {
+            break;
+        }
+        let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
+        pareto = pareto_union(domain, &request.goals, &known);
+        stopped_by_observer = deliver_delta(&mut observer, &mut sequence, &previous_keys, &pareto);
+        success_conditions_satisfied = all_success_conditions_satisfied(
+            domain,
+            &request.goals,
+            &goal_frontiers(domain, &request.goals, &known),
+        );
+        if verification_budget_exhausted {
+            break;
+        }
     }
-    let success_conditions_satisfied =
-        all_success_conditions_satisfied(domain, &request.goals, &goal_frontiers);
-    let added = pareto
-        .iter()
-        .filter(|artifact| !recovered_keys.contains(&artifact.key()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let removed = recovered_keys
-        .iter()
-        .filter(|key| !pareto.iter().any(|artifact| artifact.key() == **key))
-        .copied()
-        .collect::<Vec<_>>();
-    let stopped_by_observer = (!added.is_empty() || !removed.is_empty())
-        && observer(ParetoUpdate {
-            sequence: 1,
-            added: &added,
-            removed: &removed,
-        })
-        .is_break();
+
     let completion = if stopped_by_observer {
         Completion::StoppedByObserver
     } else if success_conditions_satisfied {
@@ -228,6 +202,156 @@ where
         },
         bundle: DomainBundle::published(target),
     })
+}
+
+fn retain_novel_candidates<D: DomainDefinition>(
+    domain: &D,
+    known: &[VerifiedArtifact<D>],
+    candidates: Vec<Candidate<D>>,
+) -> Result<Vec<Candidate<D>>, SessionError<D::Error>> {
+    let mut keys = known
+        .iter()
+        .map(VerifiedArtifact::key)
+        .collect::<HashSet<_>>();
+    let mut scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
+    let identity = domain.semantic_identity();
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let mut canonical = Vec::new();
+            match domain.structure().encode_canonical(
+                &candidate.artifact,
+                &mut canonical,
+                &mut scratch,
+            ) {
+                Ok(()) => {
+                    let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
+                    keys.insert(key).then_some(Ok(candidate))
+                }
+                Err(error) => Some(Err(SessionError::Domain(error))),
+            }
+        })
+        .collect()
+}
+
+fn materialize<D: DomainDefinition>(
+    domain: &D,
+    stored: Vec<StoredArtifact<D>>,
+    environment: &crate::MeasurementEnvironment,
+) -> Result<Vec<VerifiedArtifact<D>>, SessionError<D::Error>> {
+    let artifact_refs = stored
+        .iter()
+        .map(|(artifact, _)| artifact)
+        .collect::<Vec<_>>();
+    let mut measured = Vec::new();
+    let mut measurement_scratch = <D::Measurements as MeasurementSpace<D>>::Scratch::default();
+    domain
+        .measurements()
+        .measure_batch(
+            VerifiedBatch::new(&artifact_refs),
+            environment,
+            &mut MeasurementWriter::new(&mut measured),
+            &mut measurement_scratch,
+        )
+        .map_err(SessionError::Domain)?;
+    let mut by_artifact = (0..stored.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<Measurement<D::Metric, D::Observation>>>>();
+    for measurement in measured {
+        let Some(output) = by_artifact.get_mut(measurement.artifact_index) else {
+            return Err(SessionError::InvalidSeed);
+        };
+        output.push(measurement);
+    }
+    let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
+    let identity = domain.semantic_identity();
+    stored
+        .into_iter()
+        .zip(by_artifact)
+        .map(|((artifact, verification), measurements)| {
+            let mut canonical = Vec::new();
+            domain
+                .structure()
+                .encode_canonical(&artifact, &mut canonical, &mut structure_scratch)
+                .map_err(SessionError::Domain)?;
+            Ok(VerifiedArtifact {
+                inner: Arc::new(VerifiedArtifactRecord {
+                    key: ArtifactKey(stable_digest(identity.as_str(), &canonical)),
+                    artifact,
+                    verification,
+                    measurements,
+                    environment: environment.clone(),
+                }),
+            })
+        })
+        .collect()
+}
+
+fn extend_unique<D: DomainDefinition>(
+    known: &mut Vec<VerifiedArtifact<D>>,
+    artifacts: impl IntoIterator<Item = VerifiedArtifact<D>>,
+) {
+    for artifact in artifacts {
+        if !known.iter().any(|known| known.key() == artifact.key()) {
+            known.push(artifact);
+        }
+    }
+}
+
+fn goal_frontiers<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+    known: &[VerifiedArtifact<D>],
+) -> Vec<Vec<VerifiedArtifact<D>>> {
+    goals
+        .goals
+        .iter()
+        .map(|goal| retain_pareto(domain, goal, known.to_vec()))
+        .collect()
+}
+
+fn pareto_union<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+    known: &[VerifiedArtifact<D>],
+) -> Vec<VerifiedArtifact<D>> {
+    let mut pareto = Vec::new();
+    for frontier in goal_frontiers(domain, goals, known) {
+        extend_unique(&mut pareto, frontier);
+    }
+    pareto
+}
+
+fn deliver_delta<D, O>(
+    observer: &mut O,
+    sequence: &mut u64,
+    previous: &[ArtifactKey],
+    current: &[VerifiedArtifact<D>],
+) -> bool
+where
+    D: DomainDefinition,
+    O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
+{
+    let added = current
+        .iter()
+        .filter(|artifact| !previous.contains(&artifact.key()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = previous
+        .iter()
+        .filter(|key| !current.iter().any(|artifact| artifact.key() == **key))
+        .copied()
+        .collect::<Vec<_>>();
+    if added.is_empty() && removed.is_empty() {
+        return false;
+    }
+    *sequence += 1;
+    observer(ParetoUpdate {
+        sequence: *sequence,
+        added: &added,
+        removed: &removed,
+    })
+    .is_break()
 }
 
 fn all_success_conditions_satisfied<D: DomainDefinition>(
@@ -428,28 +552,33 @@ fn replay_seeds<D: DomainDefinition>(
 
 fn verify_candidates<D: DomainDefinition>(
     domain: &D,
-    seeds: &[Seed<D>],
+    roots: &[VerifiedArtifact<D>],
+    parent_origins: &[usize],
     candidates: Vec<Candidate<D>>,
-) -> Result<Vec<StoredArtifact<D>>, SessionError<D::Error>> {
+) -> Result<Vec<OriginatedStoredArtifact<D>>, SessionError<D::Error>> {
     let mut claims = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
-        let seed = seeds
+        let origin = *parent_origins
             .get(candidate.source_index)
             .ok_or(SessionError::InvalidSeed)?;
+        let seed = roots.get(origin).ok_or(SessionError::InvalidSeed)?;
         claims.push(
             domain
                 .kernel()
-                .claim_for_candidate(&seed.artifact, &candidate.artifact)
+                .claim_for_candidate(seed.artifact(), &candidate.artifact)
                 .map_err(SessionError::Domain)?,
         );
     }
     let requests = candidates
         .iter()
         .zip(&claims)
-        .map(|(candidate, claim)| VerificationRequest {
-            seed: &seeds[candidate.source_index].artifact,
-            candidate: &candidate.artifact,
-            claim,
+        .map(|(candidate, claim)| {
+            let origin = parent_origins[candidate.source_index];
+            VerificationRequest {
+                seed: roots[origin].artifact(),
+                candidate: &candidate.artifact,
+                claim,
+            }
         })
         .collect::<Vec<_>>();
     let mut verdicts = Vec::new();
@@ -470,16 +599,22 @@ fn verify_candidates<D: DomainDefinition>(
         .into_iter()
         .zip(claims)
         .zip(verdicts)
-        .filter_map(|((candidate, claim), verdict)| match verdict {
-            Verdict::Accepted { evidence } => Some((
-                candidate.artifact,
-                VerificationRecord {
-                    claim,
-                    evidence,
-                    kernel_revision: revision,
-                },
-            )),
-            Verdict::Refuted | Verdict::Unknown => None,
+        .filter_map(|((candidate, claim), verdict)| {
+            let origin = parent_origins[candidate.source_index];
+            match verdict {
+                Verdict::Accepted { evidence } => Some((
+                    (
+                        candidate.artifact,
+                        VerificationRecord {
+                            claim,
+                            evidence,
+                            kernel_revision: revision,
+                        },
+                    ),
+                    origin,
+                )),
+                Verdict::Refuted | Verdict::Unknown => None,
+            }
         })
         .collect())
 }
