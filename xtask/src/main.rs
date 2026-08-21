@@ -15,6 +15,8 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod causal;
+
 const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v4";
 const CORPUS_NAME: &str = "unary-u8-xor-development-v1";
 const EXPECTED_SEMANTIC_OUTCOME: &str =
@@ -145,7 +147,18 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             run_child(&arguments)
         }
-        _ => Err("usage: cargo run --release -p xtask -- baseline [--output PATH]".into()),
+        Some("causal-confirm") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            causal::run_confirm(&arguments)
+        }
+        Some("causal-child") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            causal::run_child(&arguments)
+        }
+        _ => Err(
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm> [--output PATH]"
+                .into(),
+        ),
     }
 }
 
