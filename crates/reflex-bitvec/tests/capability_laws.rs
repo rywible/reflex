@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use reflex::domain::VerificationRequest;
 use reflex::{
-    BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
-    NonZeroDuration, Objective, OptimizationGoal, Preference, ResourceEnvelope, SeedSource,
-    SeedWriter, StructuralProtocol, Verdict, VerdictWriter, VerificationBatch, VerificationKernel,
-    improve,
+    BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, MeasurementEnvironment,
+    MeasurementSpace, MeasurementWriter, MetricOrdering, NonEmpty, NonZeroDuration, Objective,
+    OptimizationGoal, Preference, ResourceEnvelope, SeedSource, SeedWriter, StructuralProtocol,
+    Verdict, VerdictWriter, VerificationBatch, VerificationKernel, VerifiedBatch, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 
@@ -29,6 +29,46 @@ fn canonical_structure_interns_equal_subexpressions() {
             2, 0, 0, 0, 0, 0, 0, 0, 0, // xor(node 0, node 0)
         ],
         "canonical construction hash-conses structurally equal children"
+    );
+}
+
+#[test]
+fn measurement_space_orders_and_tolerates_evaluator_work() {
+    let domain = BitVecDomain::unary_u8();
+    let expression = Expression::xor(Expression::input(), Expression::constant(0));
+    let artifacts = [&expression];
+    let environment = MeasurementEnvironment::local_process();
+    let mut measured = Vec::new();
+    let mut scratch = Vec::new();
+    domain
+        .measurements()
+        .measure_batch(
+            VerifiedBatch::new(&artifacts),
+            &environment,
+            &mut MeasurementWriter::new(&mut measured),
+            &mut scratch,
+        )
+        .unwrap();
+    let evaluator_work = measured
+        .iter()
+        .find(|measurement| measurement.metric == Metric::EvaluatorOperations)
+        .expect("Evaluator Operations is a declared Measurement");
+
+    assert!(
+        evaluator_work.observation == 3
+            && domain
+                .measurements()
+                .compare(Metric::EvaluatorOperations, &2, &3)
+                == Ok(MetricOrdering::Less)
+            && domain
+                .measurements()
+                .within_tolerance(Metric::EvaluatorOperations, &2, &4, &2)
+                == Ok(true)
+            && domain.measurements().environments_compatible(
+                Metric::EvaluatorOperations,
+                &environment,
+                &environment,
+            )
     );
 }
 

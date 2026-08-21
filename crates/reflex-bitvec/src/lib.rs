@@ -242,6 +242,7 @@ pub enum Metric {
     NodeCount,
     Depth,
     EncodedBytes,
+    EvaluatorOperations,
 }
 
 #[derive(Debug)]
@@ -673,6 +674,10 @@ impl ExpressionMeasurements {
                 MeasurementDescriptor::new(Metric::NodeCount, SymbolId::new("node-count")),
                 MeasurementDescriptor::new(Metric::Depth, SymbolId::new("depth")),
                 MeasurementDescriptor::new(Metric::EncodedBytes, SymbolId::new("encoded-bytes")),
+                MeasurementDescriptor::new(
+                    Metric::EvaluatorOperations,
+                    SymbolId::new("evaluator-operations"),
+                ),
             ],
         }
     }
@@ -704,6 +709,11 @@ impl MeasurementSpace<BitVecDomain> for ExpressionMeasurements {
             scratch.clear();
             artifact.encode(scratch);
             output.push(artifact_index, Metric::EncodedBytes, scratch.len() as u64);
+            output.push(
+                artifact_index,
+                Metric::EvaluatorOperations,
+                artifact.node_count() as u64,
+            );
         }
         Ok(())
     }
