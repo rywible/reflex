@@ -11,7 +11,7 @@ use crate::domain::{
     StructuralProtocol, Verdict, VerdictWriter, VerificationBatch, VerificationKernel,
     VerificationRecord, VerificationReplayBatch, VerificationReplayRequest, VerificationRequest,
 };
-use crate::goal::{Direction, OptimizationGoal};
+use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
 use crate::measurement::{
     Measurement, MeasurementSpace, MeasurementWriter, MetricOrdering, VerifiedBatch,
 };
@@ -82,15 +82,20 @@ where
         )
         .map_err(SessionError::Domain)?;
 
-    let candidate_requests = candidates.len();
-    let verification_requests = recovered_replays
+    let required_replays = recovered_replays
         .checked_add(seed_replays)
-        .and_then(|count| count.checked_add(candidate_requests))
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(SessionError::Resource)?;
-    if verification_requests > request.resources.verification_requests.get() {
+    let verification_budget = request.resources.verification_requests.get();
+    if required_replays > verification_budget {
         return Err(SessionError::Resource);
     }
+    let available_candidate_requests =
+        usize::try_from(verification_budget - required_replays).unwrap_or(usize::MAX);
+    let verification_budget_exhausted = candidates.len() > available_candidate_requests;
+    candidates.truncate(available_candidate_requests);
+    let candidate_requests = u64::try_from(candidates.len()).map_err(|_| SessionError::Resource)?;
+    let verification_requests = required_replays + candidate_requests;
     let accepted = verify_candidates(domain, &seeds, candidates)?;
 
     let mut pending = recovered;
@@ -158,15 +163,25 @@ where
         }
     }
 
-    let goal = request
+    let goal_frontiers = request
         .goals
         .goals
-        .as_slice()
-        .first()
-        .ok_or(SessionError::InvalidGoal(
-            crate::GoalError::PreferenceDoesNotCoverObjectives,
-        ))?;
-    let pareto = retain_pareto(domain, goal, unique);
+        .iter()
+        .map(|goal| retain_pareto(domain, goal, unique.clone()))
+        .collect::<Vec<_>>();
+    let mut pareto = Vec::new();
+    for frontier in &goal_frontiers {
+        for artifact in frontier {
+            if !pareto
+                .iter()
+                .any(|retained: &VerifiedArtifact<D>| retained.key() == artifact.key())
+            {
+                pareto.push(artifact.clone());
+            }
+        }
+    }
+    let success_conditions_satisfied =
+        all_success_conditions_satisfied(domain, &request.goals, &goal_frontiers);
     let completion = if observer(ParetoUpdate {
         sequence: 1,
         added: &pareto,
@@ -175,6 +190,10 @@ where
     .is_break()
     {
         Completion::StoppedByObserver
+    } else if success_conditions_satisfied {
+        Completion::SuccessConditionsSatisfied
+    } else if verification_budget_exhausted {
+        Completion::ResourceEnvelopeExhausted
     } else {
         Completion::NoEligibleWork
     };
@@ -189,6 +208,24 @@ where
             durable_bytes,
         },
         bundle: DomainBundle::published(target),
+    })
+}
+
+fn all_success_conditions_satisfied<D: DomainDefinition>(
+    domain: &D,
+    goals: &GoalSet<D>,
+    frontiers: &[Vec<VerifiedArtifact<D>>],
+) -> bool {
+    goals.goals.iter().zip(frontiers).all(|(goal, frontier)| {
+        let Some(success) = goal.success.as_ref() else {
+            return false;
+        };
+        frontier.iter().any(|artifact| {
+            success
+                .thresholds
+                .iter()
+                .all(|threshold| threshold_satisfied(domain, artifact, threshold))
+        })
     })
 }
 
@@ -425,6 +462,14 @@ fn retain_pareto<D: DomainDefinition>(
     goal: &OptimizationGoal<D>,
     artifacts: Vec<VerifiedArtifact<D>>,
 ) -> Vec<VerifiedArtifact<D>> {
+    let artifacts = artifacts
+        .into_iter()
+        .filter(|artifact| {
+            goal.constraints
+                .iter()
+                .all(|constraint| threshold_satisfied(domain, artifact, constraint))
+        })
+        .collect::<Vec<_>>();
     let dominated = (0..artifacts.len())
         .map(|right| {
             (0..artifacts.len()).any(|left| {
@@ -437,6 +482,38 @@ fn retain_pareto<D: DomainDefinition>(
         .zip(dominated)
         .filter_map(|(artifact, dominated)| (!dominated).then_some(artifact))
         .collect()
+}
+
+fn threshold_satisfied<D: DomainDefinition>(
+    domain: &D,
+    artifact: &VerifiedArtifact<D>,
+    threshold: &crate::MeasurementConstraint<D>,
+) -> bool {
+    let Some(measurement) = artifact
+        .inner
+        .measurements
+        .iter()
+        .find(|measurement| measurement.metric == threshold.metric)
+    else {
+        return false;
+    };
+    let Ok(ordering) = domain.measurements().compare(
+        threshold.metric,
+        &measurement.observation,
+        &threshold.threshold,
+    ) else {
+        return false;
+    };
+    matches!(
+        (threshold.relation, ordering),
+        (
+            ThresholdRelation::AtMost,
+            MetricOrdering::Less | MetricOrdering::Equal
+        ) | (
+            ThresholdRelation::AtLeast,
+            MetricOrdering::Greater | MetricOrdering::Equal
+        )
+    )
 }
 
 fn dominates<D: DomainDefinition>(
