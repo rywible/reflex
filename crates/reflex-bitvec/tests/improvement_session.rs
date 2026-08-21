@@ -121,11 +121,8 @@ fn resume_rejects_corrupt_verification_metadata() {
     );
 
     assert!(
-        matches!(
-            result,
-            Err(SessionError::CorruptBundle | SessionError::InvalidSeed)
-        ),
-        "Resume must parse and replay the stored Verification Record"
+        matches!(result, Err(SessionError::CorruptBundle)),
+        "Resume must reject bytes that fail bundle integrity before replay"
     );
     std::fs::remove_file(bundle_path).ok();
 }

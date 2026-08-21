@@ -86,7 +86,7 @@ pub struct MeasurementWriter<'a, M, O> {
 }
 
 impl<'a, M, O> MeasurementWriter<'a, M, O> {
-    pub(crate) fn new(output: &'a mut Vec<Measurement<M, O>>) -> Self {
+    pub fn new(output: &'a mut Vec<Measurement<M, O>>) -> Self {
         Self { output }
     }
 

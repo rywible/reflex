@@ -127,6 +127,13 @@ impl std::error::Error for RequestError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ArtifactKey(pub(crate) [u8; 32]);
 
+impl ArtifactKey {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 pub(crate) struct VerifiedArtifactRecord<D: DomainDefinition> {
     pub key: ArtifactKey,
     pub artifact: D::Artifact,

@@ -4,6 +4,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 use crate::bundle::DomainBundle;
 use crate::domain::{
     ApplicationWriter, Candidate, CandidateWriter, DomainDefinition, OperatorAlgebra,
@@ -134,6 +136,7 @@ where
     }
 
     let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
+    let semantic_identity = domain.semantic_identity();
     let mut verified = Vec::with_capacity(pending.len());
     for ((artifact, verification), measurements) in
         pending.into_iter().zip(measurements_by_artifact)
@@ -145,7 +148,7 @@ where
             .map_err(SessionError::Domain)?;
         verified.push(VerifiedArtifact {
             inner: Arc::new(VerifiedArtifactRecord {
-                key: ArtifactKey(stable_digest(&canonical)),
+                key: ArtifactKey(stable_digest(semantic_identity.as_str(), &canonical)),
                 artifact,
                 verification,
                 measurements,
@@ -234,8 +237,16 @@ fn load_bundle<D: DomainDefinition>(
     source: &std::path::Path,
 ) -> Result<Vec<StoredArtifact<D>>, SessionError<D::Error>> {
     let bytes = std::fs::read(source).map_err(SessionError::Durability)?;
-    let mut input = bytes.as_slice();
-    if take_bundle(&mut input, 8)? != b"REFLEX\0\x01" {
+    if bytes.len() < 32 {
+        return Err(SessionError::CorruptBundle);
+    }
+    let content_len = bytes.len() - 32;
+    let (content, stored_checksum) = bytes.split_at(content_len);
+    if Sha256::digest(content)[..] != *stored_checksum {
+        return Err(SessionError::CorruptBundle);
+    }
+    let mut input = content;
+    if take_bundle(&mut input, 8)? != b"REFLEX\0\x02" {
         return Err(SessionError::CorruptBundle);
     }
     let identity = take_sized(&mut input)?;
@@ -571,7 +582,7 @@ fn publish_bundle<D: DomainDefinition>(
     artifacts: &[VerifiedArtifact<D>],
 ) -> Result<u64, SessionError<D::Error>> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"REFLEX\0\x01");
+    bytes.extend_from_slice(b"REFLEX\0\x02");
     push_bytes(&mut bytes, domain.semantic_identity().as_str().as_bytes());
     push_u64(&mut bytes, artifacts.len() as u64);
     let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
@@ -600,6 +611,8 @@ fn publish_bundle<D: DomainDefinition>(
         push_bytes(&mut bytes, &encoded);
         push_u64(&mut bytes, artifact.inner.verification.kernel_revision.0);
     }
+    let checksum = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&checksum);
     let durable_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if durable_bytes > request.resources.durable_bytes.get() {
         return Err(SessionError::Resource);
@@ -635,16 +648,11 @@ fn push_bytes(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
-fn stable_digest(bytes: &[u8]) -> [u8; 32] {
-    let mut output = [0_u8; 32];
-    for lane in 0..4_u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ lane.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        let start = usize::try_from(lane * 8).expect("four digest lanes fit usize");
-        output[start..start + 8].copy_from_slice(&hash.to_le_bytes());
-    }
-    output
+fn stable_digest(semantic_identity: &str, canonical_artifact: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"reflex-artifact-v1\0");
+    digest.update((semantic_identity.len() as u64).to_le_bytes());
+    digest.update(semantic_identity.as_bytes());
+    digest.update(canonical_artifact);
+    digest.finalize().into()
 }

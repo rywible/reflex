@@ -1,5 +1,6 @@
 //! Fixed-width expression optimization for Reflex.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use reflex::domain::{
@@ -19,7 +20,7 @@ pub struct Expression {
     nodes: Vec<Node>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Node {
     Input,
     Constant(u8),
@@ -47,19 +48,43 @@ impl Expression {
     ///
     /// Panics if the combined expression exceeds the `u32` node-ID space.
     pub fn xor(left: Self, right: Self) -> Self {
-        let left_len = u32::try_from(left.nodes.len()).expect("expression exceeds u32 node IDs");
         let mut nodes = left.nodes;
-        let left_root = left_len - 1;
-        let right_root = left_len
-            + u32::try_from(right.nodes.len()).expect("expression exceeds u32 node IDs")
-            - 1;
-        nodes.extend(
-            right
-                .nodes
-                .into_iter()
-                .map(|node| shift_node(node, left_len)),
-        );
-        nodes.push(Node::Xor(left_root, right_root));
+        let left_root = u32::try_from(nodes.len() - 1).expect("expression exceeds u32 node IDs");
+        let mut interned = nodes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, node)| {
+                (
+                    node,
+                    u32::try_from(index).expect("expression exceeds u32 node IDs"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut right_ids = Vec::with_capacity(right.nodes.len());
+        for node in right.nodes {
+            let remapped = match node {
+                Node::Input => Node::Input,
+                Node::Constant(value) => Node::Constant(value),
+                Node::Xor(left, right) => {
+                    Node::Xor(right_ids[left as usize], right_ids[right as usize])
+                }
+            };
+            let id = if let Some(id) = interned.get(&remapped) {
+                *id
+            } else {
+                let id = u32::try_from(nodes.len()).expect("expression exceeds u32 node IDs");
+                nodes.push(remapped);
+                interned.insert(remapped, id);
+                id
+            };
+            right_ids.push(id);
+        }
+        let right_root = *right_ids.last().expect("Expression is never empty");
+        let root = Node::Xor(left_root, right_root);
+        if !interned.contains_key(&root) {
+            nodes.push(root);
+        }
         Self { nodes }
     }
 
@@ -156,6 +181,7 @@ impl Expression {
             return Err(BitVecError::InvalidEncoding);
         }
         let mut nodes = Vec::with_capacity(count);
+        let mut seen = HashSet::with_capacity(count);
         for index in 0..count {
             let tag = take(&mut bytes, 1)?[0];
             let node = match tag {
@@ -171,20 +197,15 @@ impl Expression {
                 }
                 _ => return Err(BitVecError::InvalidEncoding),
             };
+            if !seen.insert(node) {
+                return Err(BitVecError::InvalidEncoding);
+            }
             nodes.push(node);
         }
         if !bytes.is_empty() {
             return Err(BitVecError::InvalidEncoding);
         }
         Ok(Self { nodes })
-    }
-}
-
-fn shift_node(node: Node, offset: u32) -> Node {
-    match node {
-        Node::Input => Node::Input,
-        Node::Constant(value) => Node::Constant(value),
-        Node::Xor(left, right) => Node::Xor(left + offset, right + offset),
     }
 }
 
@@ -578,8 +599,9 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         (): &mut Self::Scratch,
     ) -> Result<(), BitVecError> {
         for request in requests.requests() {
+            let expected = truth_table(request.seed);
             let evidence = truth_table(request.candidate);
-            if &evidence == request.claim {
+            if &expected == request.claim && evidence == expected {
                 output.push(Verdict::Accepted { evidence });
             } else {
                 output.push(Verdict::Refuted);

@@ -115,7 +115,7 @@ pub struct SeedWriter<'a, D: DomainDefinition> {
 }
 
 impl<'a, D: DomainDefinition> SeedWriter<'a, D> {
-    pub(crate) fn new(output: &'a mut Vec<Seed<D>>) -> Self {
+    pub fn new(output: &'a mut Vec<Seed<D>>) -> Self {
         Self { output }
     }
 
@@ -201,7 +201,7 @@ pub struct ApplicationWriter<'a, A> {
 }
 
 impl<'a, A> ApplicationWriter<'a, A> {
-    pub(crate) fn new(output: &'a mut Vec<A>) -> Self {
+    pub fn new(output: &'a mut Vec<A>) -> Self {
         Self { output }
     }
 
@@ -220,7 +220,7 @@ pub struct CandidateWriter<'a, D: DomainDefinition> {
 }
 
 impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
-    pub(crate) fn new(output: &'a mut Vec<Candidate<D>>) -> Self {
+    pub fn new(output: &'a mut Vec<Candidate<D>>) -> Self {
         Self { output }
     }
 
@@ -308,7 +308,7 @@ pub struct VerdictWriter<'a, E> {
 }
 
 impl<'a, E> VerdictWriter<'a, E> {
-    pub(crate) fn new(output: &'a mut Vec<Verdict<E>>) -> Self {
+    pub fn new(output: &'a mut Vec<Verdict<E>>) -> Self {
         Self { output }
     }
 
@@ -322,7 +322,7 @@ pub struct ReplayVerdictWriter<'a> {
 }
 
 impl<'a> ReplayVerdictWriter<'a> {
-    pub(crate) fn new(output: &'a mut Vec<bool>) -> Self {
+    pub fn new(output: &'a mut Vec<bool>) -> Self {
         Self { output }
     }
 
