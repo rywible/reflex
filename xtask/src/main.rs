@@ -569,14 +569,27 @@ fn cpu_description() -> String {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|cpuinfo| {
-            cpuinfo.lines().find_map(|line| {
-                ["model name", "Hardware", "Processor"]
-                    .iter()
-                    .find_map(|field| line.strip_prefix(field))
-                    .and_then(|value| value.strip_prefix([' ', ':']))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
+            let fields = cpuinfo
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .collect::<BTreeMap<_, _>>();
+            [
+                "model name",
+                "Hardware",
+                "Processor",
+                "CPU implementer",
+                "CPU architecture",
+                "CPU part",
+                "CPU variant",
+                "CPU revision",
+            ]
+            .into_iter()
+            .filter_map(|name| fields.get(name).map(|value| format!("{name}={value}")))
+            .reduce(|mut description, field| {
+                description.push_str("; ");
+                description.push_str(&field);
+                description
             })
         })
         .unwrap_or_else(|| "unavailable".into())
