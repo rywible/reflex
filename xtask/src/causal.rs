@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
 use reflex::{
-    BundlePlan, Completion, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
-    NonZeroDuration, Objective, OptimizationGoal, Preference, ResourceEnvelope, StructuralProtocol,
-    improve,
+    BundlePlan, Completion, Direction, DomainDefinition, GoalSet, ImprovementRequest,
+    MeasurementConstraint, NonEmpty, NonZeroDuration, Objective, OptimizationGoal, Preference,
+    ResourceEnvelope, StructuralProtocol, SuccessCondition, ThresholdRelation, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,12 @@ use sha2::{Digest, Sha256};
 type AnyError = Box<dyn std::error::Error>;
 type BundleSegment = (u8, u32, Vec<u8>);
 
-const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v1";
+const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v2";
 const EXPECTED_SPEC_SHA256: &str =
-    "543bf37e7524f9a19ae805fb86530f2f1b0230a5a39e5e57a1c2f4fc7ba3a112";
+    "1a5b592bdb7e74c98deebefa2a35ff5c196fcbfb94e9a1df86b1f6e906cfbb5e";
+const CONSUMED_V1_REPORT: &str = "docs/experiments/u8-causal-confirmation-v1.json";
+const CONSUMED_V1_AUDIT_SHA256: &str =
+    "7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c";
 const CASES_PER_REPLICATE: usize = 8_190;
 const REPLICATES: usize = 10;
 const VERIFICATION_REQUESTS: u64 = 10_500;
@@ -35,16 +38,16 @@ const DERIVED_THRESHOLD: i64 = 200;
 const RESAMPLES: usize = 10_000;
 const PILOT_EXCLUSION_CASES: usize = 8_190;
 const AUDIT_SEEDS: [&str; REPLICATES] = [
-    "da49cba9d1f643d939b4d2e79a0db0373a919064220e1539ff456ed233b1cd1a",
-    "1cc32faac177ba96dd5f2f98e1f456d7e0df22b8e3f4cc948c42542982b6d149",
-    "9bb7890620cfc3e132d60947249382b9129b8a4416cdcdce9d2144d5dc3ce448",
-    "7747357fdf9dc7a1acb8ec471c828c676b5361fc79a4ecbc64e69978cd7a754e",
-    "c0d86946b2a44725fcb387a72aa346fe173920e6e65405a419f1817b8b99f6cb",
-    "bfcfa641fabcb18bc4b622e9522de584f6d23c14449977948d6bde72805a9154",
-    "5974721b09eea2cdf580ce8c6a81a62502c8584fd206ce6afe25f04fe6b52e88",
-    "4974ee7f9af502e94564419a0c99ad81ffaf1e272f367ee887bae11813bad33f",
-    "0b1d1d901d4245a4f56ebceaa9ed1e0c3e8a68455b1cc30b36339a5f6ab0388e",
-    "14722cbabd38d4c34835e649ef6e30b1817ea345ad270efdb263592898e301b8",
+    "906d1974ccf1099f64d9e0639a5efce3d29384ae885593629578bc5835c8d104",
+    "00d3853231f26710ab9e306e8eb9d96ae591e7f8f027a0d6cdbaf952c9cc23e5",
+    "a9759234f7a951c34ed52b323252e6c371d95c244b25279826d86e37347f4865",
+    "c0b157a1c3be22935408d1dd179cbfe8a0e110bcbd307243372534bdab40802e",
+    "824c0b32a492a8e4f628f1c27d2846036e3c8b109d90c16845995280c6c152e3",
+    "489d2d972a34c72c1e983de6713d9bf73bf1dd9ec509867ea6c4326664e78830",
+    "a205f1c8633c6e4047403920ef6adc0847dc926ac6f90a8fd7b21dd44c3cd2ab",
+    "713402eae0bc27c693833426116783e5b41a2313ebd6db1c515d5aa3578c966e",
+    "7cd06e785070e1a57cb4c4ef9495fc789e7a1b15c11f8e09296b1ff7280bf8d7",
+    "e1e0603d17f9e955c0c09d2b9ac4644c94a39b48920017e05b7c5787c792cd6f",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -79,12 +82,19 @@ struct CorpusRecord {
     semantic_sha256: String,
 }
 
+#[derive(Deserialize)]
+struct ConsumedReport {
+    audit_corpus_sha256: String,
+    audit_corpora: Vec<Vec<CorpusRecord>>,
+}
+
 #[derive(Debug, Serialize)]
 struct ExperimentSpec {
     version: &'static str,
     hypothesis: &'static str,
     domain_identity: &'static str,
     development_corpus: &'static str,
+    consumed_audit_corpus: &'static str,
     training_generator: &'static str,
     training_verification_requests: u64,
     pilot_exclusion_cases: usize,
@@ -227,7 +237,7 @@ struct Report {
 pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     let (output, specification, specification_sha256, environment) =
         confirm_configuration(arguments)?;
-    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v1");
+    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v2");
     if work.exists() {
         return Err(format!(
             "causal work directory already exists; preserve and inspect it before proceeding: {}",
@@ -347,7 +357,7 @@ fn confirm_configuration(
         return Err("the causal harness must run with --release".into());
     }
     let output = match arguments {
-        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v1.json"),
+        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v2.json"),
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-confirm accepts only an optional --output PATH".into()),
     };
@@ -415,7 +425,7 @@ pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
     let revisions = revision_ids(&std::fs::read(&target)?)?;
     let recovered = improve(
         BitVecDomain::unary_u8(),
-        request(
+        recovery_request(
             seeds,
             1_000_000,
             BundlePlan::Resume {
@@ -423,11 +433,11 @@ pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
                 target: target.clone(),
             },
         )?,
-        |_| ControlFlow::Break(()),
+        |_| ControlFlow::Continue(()),
     )?;
     let (recovery_count, recovery_aggregates, recovery_artifact_sha256) =
         audit_outcome(&recovered, &audit_origins);
-    if recovered.completion() != Completion::StoppedByObserver
+    if recovered.completion() != Completion::SuccessConditionsSatisfied
         || recovery_count != pareto_artifacts
         || recovery_aggregates != aggregates
         || recovery_artifact_sha256 != audit_artifact_sha256
@@ -504,7 +514,8 @@ fn specification() -> ExperimentSpec {
         version: SPEC_VERSION,
         hypothesis: "under equal evaluation envelopes, shared consolidated Reflex improves unseen unary u8 semantic Campaigns more than isolated Bootstrap",
         domain_identity: "reflex-bitvec/u8/unary/xor-add-rotl/v2",
-        development_corpus: "all x xor c semantics plus the first 8190 enumerated add/rotate pilot groups",
+        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, and every consumed v1 audit semantic group",
+        consumed_audit_corpus: "docs/experiments/u8-causal-confirmation-v1.json with audit corpus sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c",
         training_generator: "96 refuted Seeds xor(input,c) for c=1..96 followed by 96 useful Seeds xor(xor(xor(input,c),0),0) for c=97..192",
         training_verification_requests: 100_000,
         pilot_exclusion_cases: PILOT_EXCLUSION_CASES,
@@ -512,7 +523,7 @@ fn specification() -> ExperimentSpec {
         audit_generator: "sha256(seed || little-endian counter) rejection sampling into globally unique add/rotate truth-table groups; ordinal-balanced surface categories",
         audit_surface_categories: "bytes map to c1=(b0 mod 255)+1,r1=(b1 mod 7)+1,c2=(b2 mod 255)+1,r2=(b3 mod 7)+1; accepted ordinal category cycles [xor(base,31),xor(base,0),xor(xor(base,0),0)] where base=rotl(add(rotl(add(input,c1),r1),c2),r2)",
         semantic_group_digest: "sha256('reflex-u8-semantic-function-v1\\0' || outputs for inputs 0..255 in ascending order)",
-        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, and every audit group accepted by an earlier replicate",
+        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1 audit truth-table group, and every v2 audit group accepted by an earlier replicate",
         audit_exposure: "build and validate all training and ablation bundles before generating any audit corpus; execute immediately after generation and publish every record",
         audit_seeds: AUDIT_SEEDS.to_vec(),
         independent_replicates: REPLICATES,
@@ -550,7 +561,7 @@ fn specification() -> ExperimentSpec {
         mode: "frozen evaluation; post-audit adaptation is discarded",
         pareto_scope: "analyze exactly final Pareto Artifacts whose origin key is one of the replicate's audit Seeds; training Artifacts are excluded from outcomes",
         anytime_trace: "record audit-origin Pareto aggregate totals at observer sequence 1, every 256th sequence, and the final sequence",
-        recovery: "resume each completed output with the same Seeds and a 1000000-request replay envelope; stop at initial observer delivery; require StoppedByObserver plus identical audit count, aggregates, and Artifact-key digest",
+        recovery: "resume each completed output with the same Seeds, a 1000000-request replay envelope, and a trivially satisfied NodeCount<=u64::MAX Success Condition; require SuccessConditionsSatisfied before search plus identical audit count, aggregates, and Artifact-key digest",
     }
 }
 
@@ -596,6 +607,7 @@ fn training_seeds() -> Vec<Expression> {
 fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
     let mut excluded = development_semantics();
     excluded.extend(pilot_semantics());
+    excluded.extend(consumed_v1_semantics()?);
     let mut global = excluded.clone();
     let mut corpora = Vec::with_capacity(REPLICATES);
     for seed in AUDIT_SEEDS {
@@ -629,6 +641,32 @@ fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
         return Err("audit Semantic Split contains overlap".into());
     }
     Ok(corpora)
+}
+
+fn consumed_v1_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("xtask manifest must have a workspace parent")?;
+    let report: ConsumedReport =
+        serde_json::from_slice(&std::fs::read(workspace.join(CONSUMED_V1_REPORT))?)?;
+    if report.audit_corpus_sha256 != CONSUMED_V1_AUDIT_SHA256
+        || hash_json(&report.audit_corpora)? != CONSUMED_V1_AUDIT_SHA256
+        || report.audit_corpora.len() != REPLICATES
+        || report
+            .audit_corpora
+            .iter()
+            .any(|corpus| corpus.len() != CASES_PER_REPLICATE)
+    {
+        return Err("consumed v1 audit corpus does not match its registered identity".into());
+    }
+    let mut semantics = BTreeSet::new();
+    for record in report.audit_corpora.into_iter().flatten() {
+        let registered = decode_hex_32(&record.semantic_sha256)?;
+        if truth_digest(&expression(&record)) != registered || !semantics.insert(registered) {
+            return Err("consumed v1 audit corpus is invalid or semantically duplicated".into());
+        }
+    }
+    Ok(semantics)
 }
 
 fn development_semantics() -> BTreeSet<[u8; 32]> {
@@ -706,6 +744,23 @@ fn request(
     verification_requests: u64,
     bundle: BundlePlan,
 ) -> Result<ImprovementRequest<BitVecDomain>, AnyError> {
+    request_with_success(seeds, verification_requests, bundle, false)
+}
+
+fn recovery_request(
+    seeds: Vec<Expression>,
+    verification_requests: u64,
+    bundle: BundlePlan,
+) -> Result<ImprovementRequest<BitVecDomain>, AnyError> {
+    request_with_success(seeds, verification_requests, bundle, true)
+}
+
+fn request_with_success(
+    seeds: Vec<Expression>,
+    verification_requests: u64,
+    bundle: BundlePlan,
+    stop_after_replay: bool,
+) -> Result<ImprovementRequest<BitVecDomain>, AnyError> {
     let metrics = NonEmpty::try_from_iter([
         Metric::NodeCount,
         Metric::Depth,
@@ -722,8 +777,15 @@ fn request(
     )
     .map_err(|_| "objective iterator must be non-empty")?;
     let preference = Preference::tiered(NonEmpty::one(metrics), [])?;
+    let success = stop_after_replay.then(|| {
+        SuccessCondition::all(NonEmpty::one(MeasurementConstraint::new(
+            Metric::NodeCount,
+            ThresholdRelation::AtMost,
+            u64::MAX,
+        )))
+    });
     Ok(ImprovementRequest::new(
-        GoalSet::one(OptimizationGoal::new([], objectives, preference, None)?),
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, success)?),
         SeedScope::new(
             NonEmpty::try_from_iter(seeds).map_err(|_| "causal run seeds must be non-empty")?,
         ),
@@ -1357,5 +1419,84 @@ mod tests {
         let first = bootstrap_lower(&effects, Treatment::Bootstrap);
         assert_eq!(first, bootstrap_lower(&effects, Treatment::Bootstrap));
         assert!((500..=1_400).contains(&first));
+    }
+
+    #[test]
+    fn completed_recovery_replays_without_resuming_search() {
+        let target = std::env::temp_dir().join(format!(
+            "reflex-causal-recovery-development-{}.bundle",
+            std::process::id()
+        ));
+        let seed = Expression::xor(
+            Expression::xor(Expression::input(), Expression::constant(0)),
+            Expression::constant(0),
+        );
+        let origins = BTreeSet::from([artifact_key(&seed).unwrap()]);
+        let original = improve(
+            BitVecDomain::unary_u8(),
+            request(
+                vec![seed.clone()],
+                64,
+                BundlePlan::Fresh {
+                    target: target.clone(),
+                },
+            )
+            .unwrap(),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        let expected = audit_outcome(&original, &origins);
+        let recovered = improve(
+            BitVecDomain::unary_u8(),
+            recovery_request(
+                vec![seed],
+                10_000,
+                BundlePlan::Resume {
+                    source: target.clone(),
+                    target: target.clone(),
+                },
+            )
+            .unwrap(),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.completion(),
+            Completion::SuccessConditionsSatisfied
+        );
+        assert_eq!(audit_outcome(&recovered, &origins), expected);
+        std::fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn consumed_v1_audit_is_complete_and_content_addressed() {
+        assert_eq!(
+            consumed_v1_semantics().unwrap().len(),
+            REPLICATES * CASES_PER_REPLICATE
+        );
+    }
+
+    #[test]
+    fn treatment_ablations_pass_production_import() {
+        let directory = std::env::temp_dir().join(format!(
+            "reflex-causal-ablation-development-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let full = directory.join("full.bundle");
+        let bootstrap = directory.join("bootstrap.bundle");
+        let no_model = directory.join("no-model.bundle");
+        let no_derived = directory.join("no-derived.bundle");
+        build_training_bundles(&full, &bootstrap).unwrap();
+        let bootstrap_revision = revision_ids(&std::fs::read(&bootstrap).unwrap()).unwrap().1;
+        ablate_bundle(&full, &no_model, Some(&bootstrap), false).unwrap();
+        ablate_bundle(&full, &no_derived, None, true).unwrap();
+        validate_treatment_bundle(&no_model).unwrap();
+        validate_treatment_bundle(&no_derived).unwrap();
+        assert_eq!(
+            revision_ids(&std::fs::read(&no_model).unwrap()).unwrap().1,
+            bootstrap_revision
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
