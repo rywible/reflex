@@ -6,6 +6,7 @@ pub mod goal;
 pub mod measurement;
 pub mod session;
 
+mod resource;
 mod runtime;
 
 pub use bundle::{BundlePlan, DomainBundle};
@@ -25,5 +26,6 @@ pub use measurement::{
 };
 pub use session::{
     ArtifactKey, Completion, ImprovementRequest, NonZeroDuration, ParetoSnapshot, ParetoUpdate,
-    RequestError, ResourceEnvelope, SessionError, SessionOutcome, VerifiedArtifact, improve,
+    RequestError, ResourceEnvelope, ResourceUsage, SessionError, SessionOutcome, VerifiedArtifact,
+    improve,
 };

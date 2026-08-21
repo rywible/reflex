@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use atomic_write_file::AtomicWriteFile;
 use sha2::{Digest, Sha256};
 
 use crate::bundle::DomainBundle;
@@ -18,24 +17,59 @@ use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
 use crate::measurement::{
     Measurement, MeasurementSpace, MeasurementWriter, MetricOrdering, VerifiedBatch,
 };
+use crate::resource::ProductionResourceMeter;
 use crate::session::{
-    ArtifactKey, Completion, ImprovementRequest, ParetoSnapshot, ParetoUpdate, ResourceUsage,
-    SessionError, SessionOutcome, VerifiedArtifact, VerifiedArtifactRecord,
+    ArtifactKey, Completion, ImprovementRequest, ParetoSnapshot, ParetoUpdate, SessionError,
+    SessionOutcome, VerifiedArtifact, VerifiedArtifactRecord,
 };
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type StoredArtifact<D> = (<D as DomainDefinition>::Artifact, VerificationRecord<D>);
 type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize);
+const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+pub(crate) fn improve<D, O>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    observer: O,
+) -> Result<SessionOutcome<D>, SessionError<D::Error>>
+where
+    D: DomainDefinition,
+    O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()> + Send,
+{
+    let resource_meter =
+        ProductionResourceMeter::start(&request.resources).map_err(|()| SessionError::Resource)?;
+    let worker_resident_bytes =
+        (request.resources.worker_threads.get() as u64).saturating_mul(WORKER_STACK_BYTES as u64);
+    if !resource_meter.observe_resident(worker_resident_bytes) {
+        return Err(SessionError::Resource);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(request.resources.worker_threads.get())
+        .stack_size(WORKER_STACK_BYTES)
+        .thread_name(|index| format!("reflex-worker-{index}"))
+        .build()
+        .map_err(|_| SessionError::Resource)?;
+    pool.install(move || {
+        improve_on_workers(
+            domain,
+            request,
+            observer,
+            &resource_meter,
+            worker_resident_bytes,
+        )
+    })
+}
 
 #[expect(
     clippy::too_many_lines,
     reason = "the Runtime Controller keeps one Session epoch legible as a single orchestration path"
 )]
-pub(crate) fn improve<D, O>(
+fn improve_on_workers<D, O>(
     domain: &D,
     request: &ImprovementRequest<D>,
     mut observer: O,
+    resource_meter: &ProductionResourceMeter,
+    worker_resident_bytes: u64,
 ) -> Result<SessionOutcome<D>, SessionError<D::Error>>
 where
     D: DomainDefinition,
@@ -45,13 +79,12 @@ where
     let recovered_stored = request
         .bundle
         .source()
-        .map(|source| load_bundle(domain, source))
+        .map(|source| decode_bundle(domain, source))
         .transpose()?
         .unwrap_or_default();
     let recovered_replays = recovered_stored.len();
     let mut seeds = read_seeds(domain, &request.seeds)?;
     let seed_replays = seeds.len();
-    replay_seeds(domain, &seeds)?;
     if seeds.is_empty() {
         return Err(SessionError::InvalidSeed);
     }
@@ -63,6 +96,20 @@ where
     if required_replays > verification_budget {
         return Err(SessionError::Resource);
     }
+    if resource_meter
+        .time_exhausted()
+        .map_err(|()| SessionError::Resource)?
+    {
+        return Err(SessionError::Resource);
+    }
+    replay_stored(domain, &recovered_stored)?;
+    if resource_meter
+        .time_exhausted()
+        .map_err(|()| SessionError::Resource)?
+    {
+        return Err(SessionError::Resource);
+    }
+    replay_seeds(domain, &seeds)?;
     let environment = crate::MeasurementEnvironment::local_process();
     let recovered = materialize(domain, recovered_stored, &environment)?;
     let recovered_keys = recovered
@@ -77,16 +124,10 @@ where
     let mut known = recovered;
     extend_unique(&mut known, roots.iter().cloned());
     let mut pareto = pareto_union(domain, &request.goals, &known);
-    let mut sequence = 0_u64;
-    let mut stopped_by_observer =
-        deliver_delta(&mut observer, &mut sequence, &recovered_keys, &pareto);
-    let mut success_conditions_satisfied = all_success_conditions_satisfied(
-        domain,
-        &request.goals,
-        &goal_frontiers(domain, &request.goals, &known),
-    );
-    let mut verification_requests = required_replays;
-    let mut verification_budget_exhausted = false;
+    let mut checkpoint = encode_bundle(domain, &pareto)?;
+    if checkpoint.len() as u64 > request.resources.durable_bytes.get() {
+        return Err(SessionError::Resource);
+    }
     let mut frontier = roots
         .iter()
         .cloned()
@@ -99,9 +140,73 @@ where
         .iter()
         .map(crate::OperatorDescriptor::operator)
         .collect::<Vec<_>>();
+    let initial_resident = worker_resident_bytes.saturating_add(resident_state_bytes(
+        &known,
+        &roots,
+        &pareto,
+        &frontier,
+        &recovered_keys,
+        &operators,
+        &checkpoint,
+    ));
+    if !resource_meter.observe_resident(initial_resident) {
+        return Err(SessionError::Resource);
+    }
+    let mut sequence = 0_u64;
+    let initial_delivery = deliver_delta(
+        &mut observer,
+        &mut sequence,
+        &recovered_keys,
+        &pareto,
+        resource_meter,
+        initial_resident,
+    );
+    let mut stopped_by_observer = initial_delivery.stopped();
+    let mut success_conditions_satisfied = all_success_conditions_satisfied(
+        domain,
+        &request.goals,
+        &goal_frontiers(domain, &request.goals, &known),
+    );
+    let mut time_exhausted = resource_meter
+        .time_exhausted()
+        .map_err(|()| SessionError::Resource)?;
+    let mut verification_requests = required_replays;
+    let mut verification_budget_exhausted = false;
+    let mut durable_budget_exhausted = false;
+    let mut resident_budget_exhausted = initial_delivery.resource_exhausted();
     let mut operator_scratch = <D::Operators as OperatorAlgebra<D>>::Scratch::default();
 
-    while !stopped_by_observer && !success_conditions_satisfied && !frontier.is_empty() {
+    while !stopped_by_observer
+        && !success_conditions_satisfied
+        && !time_exhausted
+        && !resident_budget_exhausted
+        && !frontier.is_empty()
+    {
+        let resident_before_epoch = worker_resident_bytes
+            .saturating_add(resident_state_bytes(
+                &known,
+                &roots,
+                &pareto,
+                &frontier,
+                &recovered_keys,
+                &operators,
+                &checkpoint,
+            ))
+            .saturating_add(
+                (frontier.len() as u64).saturating_mul(std::mem::size_of::<&D::Artifact>() as u64),
+            )
+            .saturating_add(
+                (frontier.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
+            );
+        if !resource_meter.observe_resident(resident_before_epoch) {
+            resident_budget_exhausted = true;
+            break;
+        }
+        let remaining_verifications = verification_budget.saturating_sub(verification_requests);
+        if remaining_verifications == 0 {
+            verification_budget_exhausted = true;
+            break;
+        }
         let parents = frontier
             .iter()
             .map(|(artifact, _)| artifact.artifact())
@@ -132,10 +237,21 @@ where
         if candidates.is_empty() {
             break;
         }
-        let remaining = verification_budget
-            .checked_sub(verification_requests)
-            .and_then(|remaining| usize::try_from(remaining).ok())
-            .unwrap_or(0);
+        let transient_resident = resident_before_epoch
+            .saturating_add(vector_bytes(&applications))
+            .saturating_add(vector_bytes(&candidates));
+        if !resource_meter.observe_resident(transient_resident) {
+            resident_budget_exhausted = true;
+            break;
+        }
+        if resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        {
+            time_exhausted = true;
+            break;
+        }
+        let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
         if candidates.len() > remaining {
             candidates.truncate(remaining);
             verification_budget_exhausted = true;
@@ -146,6 +262,13 @@ where
         verification_requests +=
             u64::try_from(candidates.len()).map_err(|_| SessionError::Resource)?;
         let accepted_stored = verify_candidates(domain, &roots, &origins, candidates)?;
+        if resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?
+        {
+            time_exhausted = true;
+            break;
+        }
         let accepted_origins = accepted_stored
             .iter()
             .map(|(_, origin)| *origin)
@@ -158,6 +281,7 @@ where
                 .collect(),
             &environment,
         )?;
+        let prior_known_len = known.len();
         frontier.clear();
         for (artifact, origin) in accepted.into_iter().zip(accepted_origins) {
             if !known.iter().any(|known| known.key() == artifact.key()) {
@@ -169,39 +293,118 @@ where
             break;
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
-        pareto = pareto_union(domain, &request.goals, &known);
-        stopped_by_observer = deliver_delta(&mut observer, &mut sequence, &previous_keys, &pareto);
+        let proposed_pareto = pareto_union(domain, &request.goals, &known);
+        let proposed_checkpoint = encode_bundle(domain, &proposed_pareto)?;
+        if proposed_checkpoint.len() as u64 > request.resources.durable_bytes.get() {
+            known.truncate(prior_known_len);
+            frontier.clear();
+            durable_budget_exhausted = true;
+            break;
+        }
+        let proposed_resident = worker_resident_bytes.saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &proposed_pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &proposed_checkpoint,
+        ));
+        if !resource_meter.observe_resident(proposed_resident) {
+            known.truncate(prior_known_len);
+            frontier.clear();
+            resident_budget_exhausted = true;
+            break;
+        }
+        let delivery = deliver_delta(
+            &mut observer,
+            &mut sequence,
+            &previous_keys,
+            &proposed_pareto,
+            resource_meter,
+            proposed_resident,
+        );
+        if delivery.resource_exhausted() {
+            known.truncate(prior_known_len);
+            frontier.clear();
+            resident_budget_exhausted = true;
+            break;
+        }
+        pareto = proposed_pareto;
+        checkpoint = proposed_checkpoint;
+        stopped_by_observer = delivery.stopped();
         success_conditions_satisfied = all_success_conditions_satisfied(
             domain,
             &request.goals,
             &goal_frontiers(domain, &request.goals, &known),
         );
+        time_exhausted = resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?;
         if verification_budget_exhausted {
             break;
         }
     }
 
-    let completion = if stopped_by_observer {
+    let mut completion = if stopped_by_observer {
         Completion::StoppedByObserver
     } else if success_conditions_satisfied {
         Completion::SuccessConditionsSatisfied
-    } else if verification_budget_exhausted {
+    } else if verification_budget_exhausted
+        || durable_budget_exhausted
+        || resident_budget_exhausted
+        || time_exhausted
+    {
         Completion::ResourceEnvelopeExhausted
     } else {
         Completion::NoEligibleWork
     };
 
-    let durable_bytes = publish_bundle(domain, request, &pareto)?;
+    let durable_bytes = publish_bundle(request, &checkpoint)?;
+    let usage = resource_meter
+        .usage(verification_requests, durable_bytes)
+        .map_err(|()| SessionError::Resource)?;
+    if matches!(completion, Completion::NoEligibleWork)
+        && (usage.elapsed_time >= request.resources.elapsed_time.get()
+            || usage.cpu_time >= request.resources.cpu_time.get())
+    {
+        completion = Completion::ResourceEnvelopeExhausted;
+    }
     let target = request.bundle.target().to_path_buf();
     Ok(SessionOutcome {
         completion,
         pareto: ParetoSnapshot { artifacts: pareto },
-        usage: ResourceUsage {
-            verification_requests,
-            durable_bytes,
-        },
+        usage,
         bundle: DomainBundle::published(target),
     })
+}
+
+fn resident_state_bytes<D: DomainDefinition, O>(
+    known: &Vec<VerifiedArtifact<D>>,
+    roots: &Vec<VerifiedArtifact<D>>,
+    pareto: &Vec<VerifiedArtifact<D>>,
+    frontier: &Vec<(VerifiedArtifact<D>, usize)>,
+    recovered_keys: &Vec<ArtifactKey>,
+    operators: &Vec<O>,
+    checkpoint: &Vec<u8>,
+) -> u64 {
+    let records = known.iter().fold(0_u64, |bytes, artifact| {
+        bytes
+            .saturating_add(std::mem::size_of::<VerifiedArtifactRecord<D>>() as u64)
+            .saturating_add(vector_bytes(&artifact.inner.measurements))
+    });
+    records
+        .saturating_add(vector_bytes(known))
+        .saturating_add(vector_bytes(roots))
+        .saturating_add(vector_bytes(pareto))
+        .saturating_add(vector_bytes(frontier))
+        .saturating_add(vector_bytes(recovered_keys))
+        .saturating_add(vector_bytes(operators))
+        .saturating_add(vector_bytes(checkpoint))
+}
+
+fn vector_bytes<T>(values: &Vec<T>) -> u64 {
+    (values.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
 }
 
 fn retain_novel_candidates<D: DomainDefinition>(
@@ -322,12 +525,31 @@ fn pareto_union<D: DomainDefinition>(
     pareto
 }
 
+#[derive(Clone, Copy)]
+enum DeltaDelivery {
+    NoChange,
+    Delivered { stopped: bool },
+    ResourceExhausted,
+}
+
+impl DeltaDelivery {
+    fn stopped(self) -> bool {
+        matches!(self, Self::Delivered { stopped: true })
+    }
+
+    fn resource_exhausted(self) -> bool {
+        matches!(self, Self::ResourceExhausted)
+    }
+}
+
 fn deliver_delta<D, O>(
     observer: &mut O,
     sequence: &mut u64,
     previous: &[ArtifactKey],
     current: &[VerifiedArtifact<D>],
-) -> bool
+    resource_meter: &ProductionResourceMeter,
+    resident_state: u64,
+) -> DeltaDelivery
 where
     D: DomainDefinition,
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
@@ -343,15 +565,22 @@ where
         .copied()
         .collect::<Vec<_>>();
     if added.is_empty() && removed.is_empty() {
-        return false;
+        return DeltaDelivery::NoChange;
+    }
+    let resident_with_export = resident_state
+        .saturating_add(vector_bytes(&added))
+        .saturating_add(vector_bytes(&removed));
+    if !resource_meter.observe_resident(resident_with_export) {
+        return DeltaDelivery::ResourceExhausted;
     }
     *sequence += 1;
-    observer(ParetoUpdate {
+    let stopped = observer(ParetoUpdate {
         sequence: *sequence,
         added: &added,
         removed: &removed,
     })
-    .is_break()
+    .is_break();
+    DeltaDelivery::Delivered { stopped }
 }
 
 fn all_success_conditions_satisfied<D: DomainDefinition>(
@@ -372,7 +601,7 @@ fn all_success_conditions_satisfied<D: DomainDefinition>(
     })
 }
 
-fn load_bundle<D: DomainDefinition>(
+fn decode_bundle<D: DomainDefinition>(
     domain: &D,
     source: &std::path::Path,
 ) -> Result<Vec<StoredArtifact<D>>, SessionError<D::Error>> {
@@ -429,7 +658,14 @@ fn load_bundle<D: DomainDefinition>(
         return Err(SessionError::CorruptBundle);
     }
 
-    let replay_requests = recovered
+    Ok(recovered)
+}
+
+fn replay_stored<D: DomainDefinition>(
+    domain: &D,
+    stored: &[StoredArtifact<D>],
+) -> Result<(), SessionError<D::Error>> {
+    let replay_requests = stored
         .iter()
         .map(|(artifact, verification)| VerificationReplayRequest {
             artifact,
@@ -448,10 +684,10 @@ fn load_bundle<D: DomainDefinition>(
             &mut kernel_scratch,
         )
         .map_err(SessionError::Domain)?;
-    if replayed.len() != recovered.len() || replayed.iter().any(|accepted| !accepted) {
+    if replayed.len() != stored.len() || replayed.iter().any(|accepted| !accepted) {
         return Err(SessionError::InvalidSeed);
     }
-    Ok(recovered)
+    Ok(())
 }
 
 fn take_bundle<'a, E>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], SessionError<E>> {
@@ -727,11 +963,10 @@ fn dominates<D: DomainDefinition>(
     strictly_better
 }
 
-fn publish_bundle<D: DomainDefinition>(
+fn encode_bundle<D: DomainDefinition>(
     domain: &D,
-    request: &ImprovementRequest<D>,
     artifacts: &[VerifiedArtifact<D>],
-) -> Result<u64, SessionError<D::Error>> {
+) -> Result<Vec<u8>, SessionError<D::Error>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"REFLEX\0\x02");
     push_bytes(&mut bytes, domain.semantic_identity().as_str().as_bytes());
@@ -764,30 +999,21 @@ fn publish_bundle<D: DomainDefinition>(
     }
     let checksum = Sha256::digest(&bytes);
     bytes.extend_from_slice(&checksum);
-    let durable_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if durable_bytes > request.resources.durable_bytes.get() {
-        return Err(SessionError::Resource);
-    }
+    Ok(bytes)
+}
 
+fn publish_bundle<D: DomainDefinition>(
+    request: &ImprovementRequest<D>,
+    bytes: &[u8],
+) -> Result<u64, SessionError<D::Error>> {
     let target = request.bundle.target();
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = target.with_extension(format!("reflex-tmp-{}-{sequence}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(SessionError::Durability)?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(&temp);
+    let mut file = AtomicWriteFile::open(target).map_err(SessionError::Durability)?;
+    if let Err(error) = file.write_all(bytes) {
+        let _ = file.discard();
         return Err(SessionError::Durability(error));
     }
-    drop(file);
-    if let Err(error) = std::fs::rename(&temp, target) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(SessionError::Durability(error));
-    }
-    Ok(durable_bytes)
+    file.commit().map_err(SessionError::Durability)?;
+    u64::try_from(bytes.len()).map_err(|_| SessionError::Resource)
 }
 
 fn push_u64(output: &mut Vec<u8>, value: u64) {

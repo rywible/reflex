@@ -220,8 +220,12 @@ pub enum Completion {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResourceUsage {
+    pub worker_threads: usize,
+    pub resident_bytes: u64,
     pub verification_requests: u64,
     pub durable_bytes: u64,
+    pub elapsed_time: Duration,
+    pub cpu_time: Duration,
 }
 
 pub struct SessionOutcome<D: DomainDefinition> {
@@ -293,7 +297,7 @@ pub fn improve<D, O>(
 ) -> Result<SessionOutcome<D>, SessionError<D::Error>>
 where
     D: DomainDefinition,
-    O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
+    O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()> + Send,
 {
     crate::runtime::improve(&domain, &request, observer)
 }
