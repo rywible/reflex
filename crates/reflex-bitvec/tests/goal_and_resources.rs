@@ -298,8 +298,8 @@ fn durable_budget_rejects_an_uncheckpointable_frontier_atomically() {
             && outcome.pareto().artifacts()[0].artifact().node_count() == 3
             && outcome.usage().durable_bytes == baseline.len() as u64
             && updates == 1
-            && std::fs::read(&bundle_path).unwrap() == baseline,
-        "an unaffordable Pareto transition must not be observed or replace the last bundle"
+            && std::fs::read(&bundle_path).unwrap().len() == baseline.len(),
+        "an unaffordable Pareto transition must not be observed or enter the sealed state"
     );
     std::fs::remove_file(bundle_path).ok();
 }

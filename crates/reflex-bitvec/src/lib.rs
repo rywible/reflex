@@ -135,6 +135,14 @@ impl Expression {
         }
     }
 
+    fn probes_zero_from_nonzero_xor_constant(&self) -> bool {
+        let Some(Node::Xor(left, right)) = self.nodes.last().copied() else {
+            return false;
+        };
+        matches!(self.nodes[left as usize], Node::Constant(value) if value != 0)
+            || matches!(self.nodes[right as usize], Node::Constant(value) if value != 0)
+    }
+
     fn subexpression(&self, root: u32) -> Self {
         fn copy_node(source: &Expression, id: u32, output: &mut Vec<Node>) -> u32 {
             let node = match source.nodes[id as usize] {
@@ -510,6 +518,7 @@ impl SeedSource<BitVecDomain> for ExpressionSeeds {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PrimitiveOperator {
     SimplifyXorIdentity,
+    ProbeZero,
 }
 
 #[derive(Clone)]
@@ -525,10 +534,13 @@ pub struct ExpressionOperators {
 impl ExpressionOperators {
     fn new() -> Self {
         Self {
-            catalog: vec![OperatorDescriptor::new(
-                PrimitiveOperator::SimplifyXorIdentity,
-                SymbolId::new("simplify-xor-identity"),
-            )],
+            catalog: vec![
+                OperatorDescriptor::new(
+                    PrimitiveOperator::SimplifyXorIdentity,
+                    SymbolId::new("simplify-xor-identity"),
+                ),
+                OperatorDescriptor::new(PrimitiveOperator::ProbeZero, SymbolId::new("probe-zero")),
+            ],
         }
     }
 }
@@ -557,6 +569,16 @@ impl OperatorAlgebra<BitVecDomain> for ExpressionOperators {
                     output.push(Application {
                         source_index,
                         candidate,
+                    });
+                }
+            }
+        }
+        if requests.operators().contains(&PrimitiveOperator::ProbeZero) {
+            for (source_index, artifact) in requests.artifacts().iter().enumerate() {
+                if artifact.probes_zero_from_nonzero_xor_constant() {
+                    output.push(Application {
+                        source_index,
+                        candidate: Expression::constant(0),
                     });
                 }
             }

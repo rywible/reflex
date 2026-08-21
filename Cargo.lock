@@ -216,6 +216,7 @@ name = "reflex-bitvec"
 version = "0.1.0"
 dependencies = [
  "reflex",
+ "sha2",
 ]
 
 [[package]]

@@ -10,3 +10,6 @@ reflex = { path = "../reflex" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sha2 = { version = "0.11", default-features = false }

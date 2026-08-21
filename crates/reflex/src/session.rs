@@ -124,7 +124,7 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ArtifactKey(pub(crate) [u8; 32]);
 
 impl ArtifactKey {
@@ -138,6 +138,8 @@ pub(crate) struct VerifiedArtifactRecord<D: DomainDefinition> {
     pub key: ArtifactKey,
     pub artifact: D::Artifact,
     pub verification: VerificationRecord<D>,
+    pub origin_key: ArtifactKey,
+    pub parent_key: Option<ArtifactKey>,
     pub measurements: Vec<Measurement<D::Metric, D::Observation>>,
     pub environment: MeasurementEnvironment,
 }
@@ -163,6 +165,21 @@ impl<D: DomainDefinition> VerifiedArtifact<D> {
     #[must_use]
     pub fn artifact(&self) -> &D::Artifact {
         &self.inner.artifact
+    }
+
+    #[must_use]
+    pub fn verification(&self) -> &VerificationRecord<D> {
+        &self.inner.verification
+    }
+
+    #[must_use]
+    pub fn origin_key(&self) -> ArtifactKey {
+        self.inner.origin_key
+    }
+
+    #[must_use]
+    pub fn parent_key(&self) -> Option<ArtifactKey> {
+        self.inner.parent_key
     }
 
     #[must_use]

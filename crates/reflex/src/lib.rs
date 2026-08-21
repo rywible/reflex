@@ -6,6 +6,7 @@ pub mod goal;
 pub mod measurement;
 pub mod session;
 
+mod durability;
 mod resource;
 mod runtime;
 
