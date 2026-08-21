@@ -19,16 +19,16 @@ use sha2::{Digest, Sha256};
 type AnyError = Box<dyn std::error::Error>;
 type BundleSegment = (u8, u32, Vec<u8>);
 
-const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v3";
+const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v4";
 const EXPECTED_SPEC_SHA256: &str =
-    "32d8beccdbd2d42135dc6b5b345819e7d217f831e04dd8945ba657408f5a11eb";
-const BOOTSTRAP_COMPARATOR_REPORT: &str = "docs/baselines/bootstrap-reference-domain-v5.json";
+    "0740f47b468148090e13f7e81ced137c38c21ddb2f4906cac2305e58192d60fb";
+const BOOTSTRAP_COMPARATOR_REPORT: &str = "docs/baselines/bootstrap-reference-domain-v6.json";
 const BOOTSTRAP_COMPARATOR_FILE_SHA256: &str =
-    "86815912731844b5364428be606f6d471fb8dd84759e33fb5abe7919afaefe71";
+    "2d8b477eab19e29a38a1821ba33fa8bcdf7c4414658d11e2d77d60f7a45863d1";
 const BOOTSTRAP_COMPARATOR_CONTENT_SHA256: &str =
-    "d5ebcd52766d5163ca04027c9937a0628b9dab28d80de656d7109f4755cd0dd5";
+    "03ec7da8c56391626057611ec4ca1ddae5f6bacc38b46ae961bb441cdb1a60f7";
 const BOOTSTRAP_COMPARATOR_PROTOCOL_SHA256: &str =
-    "98bb32c2506224f908917ffe251926f2fafce5178430c5ceaf6a4ed8f0eaada4";
+    "64c4b2a3eab20845cdba4ce267f673330a12d656f4bb9595200ad869bde4e2a1";
 const BOOTSTRAP_COMPARATOR_SEMANTIC_SHA256: &str =
     "ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582";
 const CONSUMED_V1_REPORT: &str = "docs/experiments/u8-causal-confirmation-v1.json";
@@ -37,6 +37,9 @@ const CONSUMED_V1_AUDIT_SHA256: &str =
 const CONSUMED_V2_REPORT: &str = "docs/experiments/u8-causal-confirmation-v2-consumed-audit.json";
 const CONSUMED_V2_AUDIT_SHA256: &str =
     "ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081";
+const CONSUMED_V3_REPORT: &str = "docs/experiments/u8-causal-confirmation-v3-consumed-audit.json";
+const CONSUMED_V3_AUDIT_SHA256: &str =
+    "585c9e7ec1f2c64fb34fb2d9a300e72d5d29c2ea3ff34fca250807c4d990aaaf";
 const CASES_PER_REPLICATE: usize = 8_190;
 const REPLICATES: usize = 10;
 const VERIFICATION_REQUESTS: u64 = 10_500;
@@ -50,16 +53,16 @@ const DERIVED_THRESHOLD: i64 = 200;
 const RESAMPLES: usize = 10_000;
 const PILOT_EXCLUSION_CASES: usize = 8_190;
 const AUDIT_SEEDS: [&str; REPLICATES] = [
-    "a0687f2adcf0fd2a34d6761c42d9c6c1619d02715138c663d4c42022cfb2132d",
-    "a80b9a65beba46ddeca2624db21043317aab1d1cfeebe8e1b1be58c9bede90e3",
-    "f11472a448c2bbeeafe8673c6e07bf169f6f96fd4a2278e4923bd547cc650b39",
-    "535fb3ca734393e84ed13dc80d8f36a3792149e48acec2048d490dbb7fc41ccf",
-    "4ec78f3889f50b73db8c8efcb11bef7a1ee96eb2c23edce81c37aa022ee3dbd4",
-    "7000b22c704e8c459f45fb6ed40d42bf8e78c5d52842c8b8fe633383c9c08f3e",
-    "e0c2f3d294006d111d9ef58cf3a5b5aa533e203d497a0575eb90adfc1edc432b",
-    "f620d2dae709d3520b294d0d3030e63bfea62fc865fd32124b3fde2d7cb2ea0a",
-    "0786d43ba8388e43174a646600fd126735e57c6b91039654a638ad3bcab8fbaf",
-    "61e2e198ae80182dbaf411ce91fa91bd78a1be882d8b7892761778731986e2ce",
+    "d8a9890703ee388a2a8eb606b9a5826a61132f384ee7df1b14211b6cc5a72a2c",
+    "6f435c6ec0cbe6a62da7d2be3b0edb0143f6640fd0d74fc0e3546f268c58d80b",
+    "6a0a757bf71c2fe6fa5e7df4fc8412d195c9cf62b13f24c314174ed51dbeaaaa",
+    "332e451f4cfc2916495e2bb6103df45b5549f44b2f27bfebf50d8c5c6047e317",
+    "69e1c7098c1fbbf812b512e8e6145723068eb62fbcdb0b515b718570cc183f7e",
+    "818efd8d4cd1fcf3618be432cb1304536bd9079c4c5979a06379c263c9a442d9",
+    "91ad3c732adb8c38f5e719b3203f03e6d8b44ecd02d7c2845b17dd52d2377dc8",
+    "d99882fa5c98ea23a2aa6bcb638ee7ea648c28f52c1a166a4861597046524015",
+    "db7c06243ecf884de153d6e1fb656e04fcda76e9768de74fb76a5751ee34a253",
+    "6531f7a7b3027ceeaf29ee39b62383bea6787ec6ac422a6fe79933f75070fd53",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -312,7 +315,7 @@ struct Report {
 pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     let (output, specification, specification_sha256, environment) =
         confirm_configuration(arguments)?;
-    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v3");
+    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v4");
     if work.exists() {
         return Err(format!(
             "causal work directory already exists; preserve and inspect it before proceeding: {}",
@@ -484,7 +487,7 @@ fn confirm_configuration(
         return Err("the causal harness must run with --release".into());
     }
     let output = match arguments {
-        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v3.json"),
+        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v4.json"),
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-confirm accepts only an optional --output PATH".into()),
     };
@@ -676,9 +679,9 @@ fn specification() -> ExperimentSpec {
         version: SPEC_VERSION,
         hypothesis: "under equal evaluation envelopes, shared consolidated Reflex improves unseen unary u8 semantic Campaigns more than isolated Bootstrap",
         domain_identity: "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v3",
-        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, every consumed v1 audit semantic group, and every consumed v2 audit semantic group",
-        consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c and v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081",
-        bootstrap_comparator: "reflex-bootstrap-baseline-v5 report file sha256 86815912731844b5364428be606f6d471fb8dd84759e33fb5abe7919afaefe71; protocol sha256 98bb32c2506224f908917ffe251926f2fafce5178430c5ceaf6a4ed8f0eaada4; content sha256 d5ebcd52766d5163ca04027c9937a0628b9dab28d80de656d7109f4755cd0dd5; semantic outcome sha256 ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582",
+        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, and every consumed v1, v2, and v3 audit semantic group",
+        consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c; v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081; v3 audit sha256 585c9e7ec1f2c64fb34fb2d9a300e72d5d29c2ea3ff34fca250807c4d990aaaf",
+        bootstrap_comparator: "reflex-bootstrap-baseline-v6 report file sha256 2d8b477eab19e29a38a1821ba33fa8bcdf7c4414658d11e2d77d60f7a45863d1; protocol sha256 64c4b2a3eab20845cdba4ce267f673330a12d656f4bb9595200ad869bde4e2a1; content sha256 03ec7da8c56391626057611ec4ca1ddae5f6bacc38b46ae961bb441cdb1a60f7; semantic outcome sha256 ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582",
         training_generator: "96 refuted Seeds xor(input,c) for c=1..96 followed by 96 useful Seeds xor(xor(xor(input,c),0),0) for c=97..192",
         training_verification_requests: 100_000,
         pilot_exclusion_cases: PILOT_EXCLUSION_CASES,
@@ -686,7 +689,7 @@ fn specification() -> ExperimentSpec {
         audit_generator: "sha256(seed || little-endian counter) rejection sampling into globally unique add/rotate truth-table groups; ordinal-balanced surface categories",
         audit_surface_categories: "bytes map to c1=(b0 mod 255)+1,r1=(b1 mod 7)+1,c2=(b2 mod 255)+1,r2=(b3 mod 7)+1; accepted ordinal category cycles [xor(base,31),xor(base,0),xor(xor(base,0),0)] where base=rotl(add(rotl(add(input,c1),r1),c2),r2)",
         semantic_group_digest: "sha256('reflex-u8-semantic-function-v1\\0' || outputs for inputs 0..255 in ascending order)",
-        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1 and v2 audit truth-table group, and every v3 audit group accepted by an earlier replicate",
+        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1, v2, and v3 audit truth-table group, and every v4 audit group accepted by an earlier replicate",
         audit_exposure: "build and validate all training and ablation bundles before generating any audit corpus; persist the complete corpus artifact and every per-replicate corpus before the first assignment; execute immediately after generation and publish every record",
         audit_seeds: AUDIT_SEEDS.to_vec(),
         independent_replicates: REPLICATES,
@@ -811,6 +814,7 @@ fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
     excluded.extend(pilot_semantics());
     excluded.extend(consumed_v1_semantics()?);
     excluded.extend(consumed_v2_semantics()?);
+    excluded.extend(consumed_v3_semantics()?);
     let mut global = excluded.clone();
     let mut corpora = Vec::with_capacity(REPLICATES);
     for seed in AUDIT_SEEDS {
@@ -852,6 +856,10 @@ fn consumed_v1_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
 
 fn consumed_v2_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
     consumed_semantics(CONSUMED_V2_REPORT, CONSUMED_V2_AUDIT_SHA256)
+}
+
+fn consumed_v3_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    consumed_semantics(CONSUMED_V3_REPORT, CONSUMED_V3_AUDIT_SHA256)
 }
 
 fn consumed_semantics(
@@ -1761,6 +1769,14 @@ mod tests {
     fn consumed_v2_audit_is_complete_and_content_addressed() {
         assert_eq!(
             consumed_v2_semantics().unwrap().len(),
+            REPLICATES * CASES_PER_REPLICATE
+        );
+    }
+
+    #[test]
+    fn consumed_v3_audit_is_complete_and_content_addressed() {
+        assert_eq!(
+            consumed_v3_semantics().unwrap().len(),
             REPLICATES * CASES_PER_REPLICATE
         );
     }
