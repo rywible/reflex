@@ -15,7 +15,7 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v1";
+const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v2";
 const CORPUS_NAME: &str = "unary-u8-xor-development-v1";
 const EXPECTED_SEMANTIC_OUTCOME: &str =
     "8c5e4703787465fece63053886929642901c74fdbd02ff4412d0a15fca366130";
@@ -152,7 +152,7 @@ fn run() -> Result<(), AnyError> {
 fn parse_output(arguments: &[String]) -> Result<PathBuf, AnyError> {
     match arguments {
         [] => Ok(PathBuf::from(
-            "docs/baselines/bootstrap-reference-domain.json",
+            "docs/baselines/bootstrap-reference-domain-v2.json",
         )),
         [flag, path] if flag == "--output" => Ok(PathBuf::from(path)),
         _ => Err("baseline accepts only an optional --output PATH".into()),
@@ -660,7 +660,7 @@ mod tests {
         };
         assert_eq!(
             hash_json(&protocol).unwrap(),
-            "344cd94cae2acd93e39d7a5ce0691cad73786265b84b0fb9a5dab1b34d2e6541"
+            "9a7883c6898e80afec03b8b873fbaf263b55eefc219cadcd00977a43984fd403"
         );
     }
 
