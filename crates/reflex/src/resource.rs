@@ -12,7 +12,11 @@ pub(crate) struct ProductionResourceMeter {
     cpu_limit: Duration,
     worker_limit: usize,
     resident_limit: u64,
+    durable_limit: u64,
     peak_resident: Cell<u64>,
+    peak_durable: Cell<u64>,
+    elapsed_before: Cell<Duration>,
+    cpu_before: Cell<Duration>,
 }
 
 impl ProductionResourceMeter {
@@ -24,8 +28,28 @@ impl ProductionResourceMeter {
             cpu_limit: resources.cpu_time().get(),
             worker_limit: resources.worker_threads().get(),
             resident_limit: resources.resident_bytes().get(),
+            durable_limit: resources.durable_bytes().get(),
             peak_resident: Cell::new(0),
+            peak_durable: Cell::new(0),
+            elapsed_before: Cell::new(Duration::ZERO),
+            cpu_before: Cell::new(Duration::ZERO),
         })
+    }
+
+    pub(crate) fn resume(&self, usage: ResourceUsage) -> Result<(), ()> {
+        if usage.worker_threads != self.worker_limit
+            || usage.resident_bytes > self.resident_limit
+            || usage.durable_bytes > self.durable_limit
+        {
+            return Err(());
+        }
+        self.peak_resident
+            .set(self.peak_resident.get().max(usage.resident_bytes));
+        self.peak_durable
+            .set(self.peak_durable.get().max(usage.durable_bytes));
+        self.elapsed_before.set(usage.elapsed_time);
+        self.cpu_before.set(usage.cpu_time);
+        Ok(())
     }
 
     pub(crate) fn observe_resident(&self, bytes: u64) -> bool {
@@ -37,8 +61,16 @@ impl ProductionResourceMeter {
     }
 
     pub(crate) fn time_exhausted(&self) -> Result<bool, ()> {
-        Ok(self.wall_started.elapsed() >= self.elapsed_limit
-            || self.cpu_started.try_elapsed().map_err(|_| ())? >= self.cpu_limit)
+        Ok(self
+            .elapsed_before
+            .get()
+            .saturating_add(self.wall_started.elapsed())
+            >= self.elapsed_limit
+            || self
+                .cpu_before
+                .get()
+                .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?)
+                >= self.cpu_limit)
     }
 
     pub(crate) fn usage(
@@ -50,9 +82,15 @@ impl ProductionResourceMeter {
             worker_threads: self.worker_limit,
             resident_bytes: self.peak_resident.get(),
             verification_requests,
-            durable_bytes,
-            elapsed_time: self.wall_started.elapsed(),
-            cpu_time: self.cpu_started.try_elapsed().map_err(|_| ())?,
+            durable_bytes: self.peak_durable.get().max(durable_bytes),
+            elapsed_time: self
+                .elapsed_before
+                .get()
+                .saturating_add(self.wall_started.elapsed()),
+            cpu_time: self
+                .cpu_before
+                .get()
+                .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?),
         })
     }
 }

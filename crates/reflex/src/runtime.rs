@@ -1,9 +1,9 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use atomic_write_file::AtomicWriteFile;
 use sha2::{Digest, Sha256};
 
 use crate::bundle::DomainBundle;
@@ -36,6 +36,7 @@ struct RecoveredBundle<D: DomainDefinition> {
     pareto_keys: Vec<ArtifactKey>,
     experience: Vec<ExperienceEntry>,
     revisions: Option<RevisionIds>,
+    interrupted_usage: Option<ResourceUsage>,
 }
 
 impl<D: DomainDefinition> Default for RecoveredBundle<D> {
@@ -45,6 +46,7 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
             pareto_keys: Vec::new(),
             experience: Vec::new(),
             revisions: None,
+            interrupted_usage: None,
         }
     }
 }
@@ -55,14 +57,14 @@ struct RevisionIds {
     model: [u8; 32],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ExperienceVerdict {
     Accepted = 1,
     Refuted = 2,
     Unknown = 3,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct ExperienceEntry {
     candidate_key: ArtifactKey,
     origin_key: ArtifactKey,
@@ -80,7 +82,16 @@ struct ReadSeeds<D: DomainDefinition> {
     seeds: Vec<Seed<D>>,
     encoded_cursor: Vec<u8>,
 }
+
+#[derive(Clone, Copy)]
+enum SessionSeal {
+    Interrupted(ResourceUsage),
+    Completed(Completion, ResourceUsage),
+}
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+const DURABILITY_STACK_BYTES: usize = 512 * 1024;
+#[cfg(debug_assertions)]
+static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn improve<D, O>(
     domain: &D,
@@ -93,8 +104,9 @@ where
 {
     let resource_meter =
         ProductionResourceMeter::start(&request.resources).map_err(|()| SessionError::Resource)?;
-    let worker_resident_bytes =
-        (request.resources.worker_threads.get() as u64).saturating_mul(WORKER_STACK_BYTES as u64);
+    let worker_resident_bytes = (request.resources.worker_threads.get() as u64)
+        .saturating_mul(WORKER_STACK_BYTES as u64)
+        .saturating_add(DURABILITY_STACK_BYTES as u64);
     if !resource_meter.observe_resident(worker_resident_bytes) {
         return Err(SessionError::Resource);
     }
@@ -134,13 +146,19 @@ where
     let recovered_bundle = request
         .bundle
         .source()
-        .map(|source| decode_bundle(domain, source))
+        .map(|source| decode_bundle(domain, request, source))
         .transpose()?
         .unwrap_or_default();
     let recovered_keys = recovered_bundle.pareto_keys;
     let recovered_stored = recovered_bundle.artifacts;
     let mut experience = recovered_bundle.experience;
     let recovered_revisions = recovered_bundle.revisions;
+    let prior_usage = recovered_bundle.interrupted_usage.unwrap_or_default();
+    if recovered_bundle.interrupted_usage.is_some() {
+        resource_meter
+            .resume(prior_usage)
+            .map_err(|()| SessionError::Resource)?;
+    }
     let recovered_replays = recovered_stored.len();
     let ReadSeeds {
         mut seeds,
@@ -155,7 +173,11 @@ where
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(SessionError::Resource)?;
     let verification_budget = request.resources.verification_requests.get();
-    if required_replays > verification_budget {
+    let mut verification_requests = prior_usage
+        .verification_requests
+        .checked_add(required_replays)
+        .ok_or(SessionError::Resource)?;
+    if verification_requests > verification_budget {
         return Err(SessionError::Resource);
     }
     if resource_meter
@@ -210,6 +232,9 @@ where
     let mut known = recovered.clone();
     extend_unique(&mut known, roots.iter().cloned());
     let mut pareto = pareto_union(domain, &request.goals, &known);
+    let initial_usage = resource_meter
+        .usage(verification_requests, 0)
+        .map_err(|()| SessionError::Resource)?;
     let mut checkpoint = encode_bundle(
         domain,
         request,
@@ -217,7 +242,7 @@ where
         &known,
         &pareto,
         &experience,
-        None,
+        SessionSeal::Interrupted(initial_usage),
     )?;
     if checkpoint.len() as u64 > request.resources.durable_bytes.get() {
         return Err(SessionError::Resource);
@@ -257,6 +282,12 @@ where
     if !resource_meter.observe_resident(initial_resident) {
         return Err(SessionError::Resource);
     }
+    let mut durability = durability::CheckpointWriter::start(request.bundle.target().to_path_buf())
+        .map_err(SessionError::Durability)?;
+    durability
+        .submit(checkpoint.clone())
+        .and_then(|()| durability.barrier().map(|_| ()))
+        .map_err(SessionError::Durability)?;
     let mut sequence = 0_u64;
     let initial_delivery = deliver_delta(
         &mut observer,
@@ -275,7 +306,6 @@ where
     let mut time_exhausted = resource_meter
         .time_exhausted()
         .map_err(|()| SessionError::Resource)?;
-    let mut verification_requests = required_replays;
     let mut verification_budget_exhausted = false;
     let mut durable_budget_exhausted = false;
     let mut resident_budget_exhausted = initial_delivery.resource_exhausted();
@@ -338,7 +368,9 @@ where
                 &mut operator_scratch,
             )
             .map_err(SessionError::Domain)?;
-        candidates = retain_novel_candidates(domain, &known, candidates)?;
+        test_fault_point("candidate-created");
+        candidates =
+            retain_novel_candidates(domain, &known, &experience, &roots, &frontier, candidates)?;
         if candidates.is_empty() {
             break;
         }
@@ -371,8 +403,13 @@ where
             .map(|(artifact, _)| artifact.key())
             .collect::<Vec<_>>();
         let verification = verify_candidates(domain, &roots, &origins, &parent_keys, candidates)?;
+        test_fault_point("verdict-recorded");
         let prior_experience_len = experience.len();
-        experience.extend(verification.experience);
+        extend_unique_experience(&mut experience, verification.experience);
+        test_fault_point("experience-appended");
+        let checkpoint_usage = resource_meter
+            .usage(verification_requests, checkpoint.len() as u64)
+            .map_err(|()| SessionError::Resource)?;
         let experience_checkpoint = encode_bundle(
             domain,
             request,
@@ -380,7 +417,7 @@ where
             &known,
             &pareto,
             &experience,
-            None,
+            SessionSeal::Interrupted(checkpoint_usage),
         )?;
         if experience_checkpoint.len() as u64 > request.resources.durable_bytes.get() {
             experience.truncate(prior_experience_len);
@@ -388,6 +425,9 @@ where
             break;
         }
         checkpoint = experience_checkpoint;
+        durability
+            .submit(checkpoint.clone())
+            .map_err(SessionError::Durability)?;
         if resource_meter
             .time_exhausted()
             .map_err(|()| SessionError::Resource)?
@@ -409,6 +449,7 @@ where
                 .collect(),
             &environment,
         )?;
+        test_fault_point("measurement-completed");
         let prior_known_len = known.len();
         frontier.clear();
         for (artifact, origin) in accepted.into_iter().zip(accepted_origins) {
@@ -417,11 +458,15 @@ where
                 known.push(artifact);
             }
         }
+        test_fault_point("admission-completed");
         if frontier.is_empty() {
             break;
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
         let proposed_pareto = pareto_union(domain, &request.goals, &known);
+        let checkpoint_usage = resource_meter
+            .usage(verification_requests, checkpoint.len() as u64)
+            .map_err(|()| SessionError::Resource)?;
         let proposed_checkpoint = encode_bundle(
             domain,
             request,
@@ -429,7 +474,7 @@ where
             &known,
             &proposed_pareto,
             &experience,
-            None,
+            SessionSeal::Interrupted(checkpoint_usage),
         )?;
         if proposed_checkpoint.len() as u64 > request.resources.durable_bytes.get() {
             known.truncate(prior_known_len);
@@ -437,21 +482,28 @@ where
             durable_budget_exhausted = true;
             break;
         }
-        let proposed_resident = worker_resident_bytes.saturating_add(resident_state_bytes(
-            &known,
-            &roots,
-            &proposed_pareto,
-            &frontier,
-            &recovered_keys,
-            &operators,
-            &proposed_checkpoint,
-        ));
+        let proposed_resident = worker_resident_bytes
+            .saturating_add(resident_state_bytes(
+                &known,
+                &roots,
+                &proposed_pareto,
+                &frontier,
+                &recovered_keys,
+                &operators,
+                &proposed_checkpoint,
+            ))
+            .saturating_add(durability.pending_bytes());
         if !resource_meter.observe_resident(proposed_resident) {
             known.truncate(prior_known_len);
             frontier.clear();
             resident_budget_exhausted = true;
             break;
         }
+        durability
+            .submit(proposed_checkpoint.clone())
+            .and_then(|()| durability.barrier().map(|_| ()))
+            .map_err(SessionError::Durability)?;
+        test_fault_point("pareto-published");
         let delivery = deliver_delta(
             &mut observer,
             &mut sequence,
@@ -512,7 +564,7 @@ where
         &known,
         &pareto,
         &experience,
-        Some((completion, provisional_usage)),
+        SessionSeal::Completed(completion, provisional_usage),
     )?;
     let usage = resource_meter
         .usage(verification_requests, provisional_checkpoint.len() as u64)
@@ -524,12 +576,15 @@ where
         &known,
         &pareto,
         &experience,
-        Some((completion, usage)),
+        SessionSeal::Completed(completion, usage),
     )?;
     if checkpoint.len() as u64 > request.resources.durable_bytes.get() {
         return Err(SessionError::Resource);
     }
-    publish_bundle(request, &checkpoint)?;
+    durability
+        .submit(checkpoint.clone())
+        .map_err(SessionError::Durability)?;
+    durability.finish().map_err(SessionError::Durability)?;
     let target = request.bundle.target().to_path_buf();
     Ok(SessionOutcome {
         completion,
@@ -570,6 +625,9 @@ fn vector_bytes<T>(values: &Vec<T>) -> u64 {
 fn retain_novel_candidates<D: DomainDefinition>(
     domain: &D,
     known: &[VerifiedArtifact<D>],
+    experience: &[ExperienceEntry],
+    roots: &[VerifiedArtifact<D>],
+    frontier: &[(VerifiedArtifact<D>, usize)],
     candidates: Vec<Candidate<D>>,
 ) -> Result<Vec<Candidate<D>>, SessionError<D::Error>> {
     let mut keys = known
@@ -589,7 +647,19 @@ fn retain_novel_candidates<D: DomainDefinition>(
             ) {
                 Ok(()) => {
                     let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
-                    keys.insert(key).then_some(Ok(candidate))
+                    if !keys.insert(key) {
+                        return None;
+                    }
+                    let origin_key = roots[frontier[candidate.source_index].1].key();
+                    (!experience.iter().any(|entry| {
+                        entry.candidate_key == key
+                            && entry.origin_key == origin_key
+                            && matches!(
+                                entry.verdict,
+                                ExperienceVerdict::Refuted | ExperienceVerdict::Unknown
+                            )
+                    }))
+                    .then_some(Ok(candidate))
                 }
                 Err(error) => Some(Err(SessionError::Domain(error))),
             }
@@ -660,6 +730,17 @@ fn extend_unique<D: DomainDefinition>(
     for artifact in artifacts {
         if !known.iter().any(|known| known.key() == artifact.key()) {
             known.push(artifact);
+        }
+    }
+}
+
+fn extend_unique_experience(
+    experience: &mut Vec<ExperienceEntry>,
+    entries: impl IntoIterator<Item = ExperienceEntry>,
+) {
+    for entry in entries {
+        if !experience.contains(&entry) {
+            experience.push(entry);
         }
     }
 }
@@ -770,6 +851,7 @@ fn all_success_conditions_satisfied<D: DomainDefinition>(
 )]
 fn decode_bundle<D: DomainDefinition>(
     domain: &D,
+    request: &ImprovementRequest<D>,
     source: &std::path::Path,
 ) -> Result<RecoveredBundle<D>, SessionError<D::Error>> {
     let bytes = std::fs::read(source).map_err(SessionError::Durability)?;
@@ -777,8 +859,9 @@ fn decode_bundle<D: DomainDefinition>(
     if decoded.identity != domain.semantic_identity().as_str().as_bytes() {
         return Err(SessionError::IncompatibleBundle);
     }
-    validate_session(
+    let interrupted_usage = validate_session(
         domain,
+        request,
         decoded
             .segment(SegmentKind::Session)
             .map_err(|_| SessionError::CorruptBundle)?,
@@ -921,13 +1004,17 @@ fn decode_bundle<D: DomainDefinition>(
             3 => ExperienceVerdict::Unknown,
             _ => return Err(SessionError::CorruptBundle),
         };
-        experience.push(ExperienceEntry {
+        let entry = ExperienceEntry {
             candidate_key,
             origin_key,
             parent_key,
             canonical_candidate,
             verdict,
-        });
+        };
+        if experience.contains(&entry) {
+            return Err(SessionError::CorruptBundle);
+        }
+        experience.push(entry);
     }
     if take_bundle(&mut encoded_experience, 1)? != [0] || !encoded_experience.is_empty() {
         return Err(SessionError::CorruptBundle);
@@ -937,14 +1024,18 @@ fn decode_bundle<D: DomainDefinition>(
         pareto_keys,
         experience,
         revisions: Some(revisions),
+        interrupted_usage,
     })
 }
 
 fn validate_session<D: DomainDefinition>(
     domain: &D,
+    request: &ImprovementRequest<D>,
     mut input: &[u8],
-) -> Result<(), SessionError<D::Error>> {
-    if take_bundle(&mut input, 1)? != [1] {
+) -> Result<Option<ResourceUsage>, SessionError<D::Error>> {
+    let encoded_session = input;
+    let disposition = take_bundle(&mut input, 1)?[0];
+    if !matches!(disposition, 0 | 1) {
         return Err(SessionError::CorruptBundle);
     }
     let _goal_fingerprint = take_bundle(&mut input, 32)?;
@@ -991,19 +1082,44 @@ fn validate_session<D: DomainDefinition>(
     if read_bundle_u64(&mut input)? != domain.kernel().revision().0 {
         return Err(SessionError::IncompatibleBundle);
     }
+    let compatibility_prefix_len = encoded_session.len() - input.len();
     let environment = take_sized(&mut input)?;
-    if environment.is_empty() || !matches!(take_bundle(&mut input, 1)?[0], 1..=4) {
+    let completion = take_bundle(&mut input, 1)?[0];
+    if environment.is_empty() || !matches!((disposition, completion), (0, 0) | (1, 1..=4)) {
         return Err(SessionError::CorruptBundle);
     }
-    for _ in 0..4 {
-        read_bundle_u64(&mut input)?;
-    }
-    take_bundle(&mut input, 12)?;
-    take_bundle(&mut input, 12)?;
+    let worker_threads =
+        usize::try_from(read_bundle_u64(&mut input)?).map_err(|_| SessionError::CorruptBundle)?;
+    let resident_bytes = read_bundle_u64(&mut input)?;
+    let verification_requests = read_bundle_u64(&mut input)?;
+    let durable_bytes = read_bundle_u64(&mut input)?;
+    let elapsed_time = read_bundle_duration(&mut input)?;
+    let cpu_time = read_bundle_duration(&mut input)?;
     if !input.is_empty() {
         return Err(SessionError::CorruptBundle);
     }
-    Ok(())
+    let usage = ResourceUsage {
+        worker_threads,
+        resident_bytes,
+        verification_requests,
+        durable_bytes,
+        elapsed_time,
+        cpu_time,
+    };
+    if disposition == 0 {
+        let expected = encode_session(
+            domain,
+            request,
+            encoded_cursor,
+            SessionSeal::Interrupted(usage),
+        )?;
+        if expected.get(..compatibility_prefix_len)
+            != encoded_session.get(..compatibility_prefix_len)
+        {
+            return Err(SessionError::IncompatibleBundle);
+        }
+    }
+    Ok((disposition == 0).then_some(usage))
 }
 
 fn replay_stored<D: DomainDefinition>(
@@ -1049,6 +1165,19 @@ fn read_bundle_u64<E>(input: &mut &[u8]) -> Result<u64, SessionError<E>> {
     Ok(u64::from_le_bytes(
         bytes.try_into().expect("exactly eight bytes were taken"),
     ))
+}
+
+fn read_bundle_duration<E>(input: &mut &[u8]) -> Result<std::time::Duration, SessionError<E>> {
+    let seconds = read_bundle_u64(input)?;
+    let nanoseconds = u32::from_le_bytes(
+        take_bundle(input, 4)?
+            .try_into()
+            .expect("exactly four bytes were taken"),
+    );
+    if nanoseconds >= 1_000_000_000 {
+        return Err(SessionError::CorruptBundle);
+    }
+    Ok(std::time::Duration::new(seconds, nanoseconds))
 }
 
 fn take_sized<'a, E>(input: &mut &'a [u8]) -> Result<&'a [u8], SessionError<E>> {
@@ -1361,7 +1490,7 @@ fn encode_bundle<D: DomainDefinition>(
     artifacts: &[VerifiedArtifact<D>],
     pareto: &[VerifiedArtifact<D>],
     experience: &[ExperienceEntry],
-    session_outcome: Option<(Completion, ResourceUsage)>,
+    session_seal: SessionSeal,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
     let mut artifact_payload = Vec::new();
     push_u64(&mut artifact_payload, artifacts.len() as u64);
@@ -1409,6 +1538,7 @@ fn encode_bundle<D: DomainDefinition>(
     let mut revisions = Vec::with_capacity(64);
     revisions.extend_from_slice(&revision_ids.knowledge);
     revisions.extend_from_slice(&revision_ids.model);
+    test_fault_point("revision-sealed");
     let mut recovery = Vec::with_capacity(8 + pareto.len() * 32);
     push_u64(&mut recovery, pareto.len() as u64);
     for artifact in pareto {
@@ -1427,8 +1557,8 @@ fn encode_bundle<D: DomainDefinition>(
         encoded_experience.push(entry.verdict as u8);
     }
     encoded_experience.push(0);
-    let session = encode_session(domain, request, seed_cursor, session_outcome)?;
-    durability::seal(
+    let session = encode_session(domain, request, seed_cursor, session_seal)?;
+    let bundle = durability::seal(
         identity.as_str().as_bytes(),
         &[
             Segment {
@@ -1453,7 +1583,9 @@ fn encode_bundle<D: DomainDefinition>(
             },
         ],
     )
-    .map_err(|_| SessionError::Resource)
+    .map_err(|_| SessionError::Resource)?;
+    test_fault_point("manifest-sealed");
+    Ok(bundle)
 }
 
 fn revision_ids<D: DomainDefinition>(
@@ -1495,7 +1627,7 @@ fn encode_session<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
     seed_cursor: &[u8],
-    session_outcome: Option<(Completion, ResourceUsage)>,
+    session_seal: SessionSeal,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
     let mut scope = Vec::new();
     domain
@@ -1573,7 +1705,7 @@ fn encode_session<D: DomainDefinition>(
         }
     }
     let mut payload = Vec::new();
-    payload.push(1);
+    payload.push(u8::from(matches!(session_seal, SessionSeal::Completed(..))));
     payload.extend_from_slice(&Sha256::digest(&goals));
     payload.extend_from_slice(&Sha256::digest(&scope));
     push_bytes(&mut payload, &scope);
@@ -1592,8 +1724,11 @@ fn encode_session<D: DomainDefinition>(
             .identity()
             .as_bytes(),
     );
-    let usage = session_outcome.map_or_else(ResourceUsage::default, |(_, usage)| usage);
-    payload.push(match session_outcome.map(|(completion, _)| completion) {
+    let (completion, usage) = match session_seal {
+        SessionSeal::Interrupted(usage) => (None, usage),
+        SessionSeal::Completed(completion, usage) => (Some(completion), usage),
+    };
+    payload.push(match completion {
         None => 0,
         Some(Completion::ResourceEnvelopeExhausted) => 1,
         Some(Completion::SuccessConditionsSatisfied) => 2,
@@ -1629,20 +1764,6 @@ fn push_duration(output: &mut Vec<u8>, duration: std::time::Duration) {
     output.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
 }
 
-fn publish_bundle<D: DomainDefinition>(
-    request: &ImprovementRequest<D>,
-    bytes: &[u8],
-) -> Result<u64, SessionError<D::Error>> {
-    let target = request.bundle.target();
-    let mut file = AtomicWriteFile::open(target).map_err(SessionError::Durability)?;
-    if let Err(error) = file.write_all(bytes) {
-        let _ = file.discard();
-        return Err(SessionError::Durability(error));
-    }
-    file.commit().map_err(SessionError::Durability)?;
-    u64::try_from(bytes.len()).map_err(|_| SessionError::Resource)
-}
-
 fn push_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -1660,3 +1781,23 @@ fn stable_digest(semantic_identity: &str, canonical_artifact: &[u8]) -> [u8; 32]
     digest.update(canonical_artifact);
     digest.finalize().into()
 }
+
+#[cfg(debug_assertions)]
+fn test_fault_point(phase: &str) {
+    const PHASE_ENV: &str = "REFLEX_INTERNAL_TEST_FAULT_PHASE";
+    const OCCURRENCE_ENV: &str = "REFLEX_INTERNAL_TEST_FAULT_OCCURRENCE";
+    if std::env::var_os(PHASE_ENV).as_deref() != Some(std::ffi::OsStr::new(phase)) {
+        return;
+    }
+    let expected = std::env::var(OCCURRENCE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1);
+    if FAULT_OCCURRENCE.fetch_add(1, AtomicOrdering::Relaxed) + 1 == expected {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn test_fault_point(_: &str) {}
