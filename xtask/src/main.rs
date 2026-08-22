@@ -20,6 +20,7 @@ mod build;
 mod causal;
 mod harness;
 mod lean;
+mod lean_taste;
 mod performance;
 mod scaling;
 
@@ -198,8 +199,12 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean::fixed_latency(&arguments)
         }
+        Some("lean-taste-development") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_taste::run(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development> [arguments]"
                 .into(),
         ),
     }

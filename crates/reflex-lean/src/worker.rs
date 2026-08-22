@@ -10,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ast::{LeanEnvironmentIdentity, LeanExpr, LeanName};
-use crate::{
-    ARTIFACT_FORMAT_VERSION, KERNEL_CONTRACT_VERSION, LEAN_COMMIT, LEAN_RUNTIME_VERSION,
-    LEAN_TOOLCHAIN, LEAN_VERSION, MATHLIB_COMMIT,
-};
+use crate::{ARTIFACT_FORMAT_VERSION, KERNEL_CONTRACT_VERSION, LeanSnapshotPin};
 
 pub const PROTOCOL_VERSION: usize = 1;
 pub const DEFAULT_WORKER_RESIDENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -56,6 +53,7 @@ pub struct LeanWorkerConfig {
     pub mathlib_root: PathBuf,
     pub worker_source: PathBuf,
     pub resident_bytes: NonZeroU64,
+    pub snapshot: LeanSnapshotPin,
 }
 
 impl LeanWorkerConfig {
@@ -67,6 +65,19 @@ impl LeanWorkerConfig {
                 .join("worker/ReflexLeanWorker.lean"),
             resident_bytes: NonZeroU64::new(DEFAULT_WORKER_RESIDENT_BYTES)
                 .unwrap_or(NonZeroU64::MIN),
+            snapshot: LeanSnapshotPin::final_pre_2025(),
+        }
+    }
+
+    #[must_use]
+    pub fn for_snapshot(
+        lake_executable: impl Into<PathBuf>,
+        mathlib_root: impl Into<PathBuf>,
+        snapshot: LeanSnapshotPin,
+    ) -> Self {
+        Self {
+            snapshot,
+            ..Self::pinned(lake_executable, mathlib_root)
         }
     }
 
@@ -88,7 +99,16 @@ impl LeanWorkerConfig {
                 "Lean worker resident allowance is below the hard {MINIMUM_WORKER_RESIDENT_BYTES} byte minimum"
             )));
         }
-        verify_git_checkout(&self.mathlib_root, MATHLIB_COMMIT, "mathlib")?;
+        validate_snapshot_pin(&self.snapshot)?;
+        verify_git_checkout(&self.mathlib_root, &self.snapshot.mathlib_commit, "mathlib")?;
+        let selected_toolchain = std::fs::read_to_string(self.mathlib_root.join("lean-toolchain"))?;
+        if selected_toolchain.trim() != self.snapshot.lean_toolchain {
+            return Err(WorkerError::Protocol(format!(
+                "mathlib selects Lean toolchain {}, expected {}",
+                selected_toolchain.trim(),
+                self.snapshot.lean_toolchain
+            )));
+        }
         verify_manifest_dependencies(&self.mathlib_root)?;
         run_checked(
             &self.lake_executable,
@@ -102,10 +122,11 @@ impl LeanWorkerConfig {
             &self.mathlib_root,
             "Lean compiler identity",
         )?;
-        if lean_commit.trim() != LEAN_COMMIT {
+        if lean_commit.trim() != self.snapshot.lean_commit {
             return Err(WorkerError::Protocol(format!(
-                "Lean compiler is {}, expected {LEAN_COMMIT}",
-                lean_commit.trim()
+                "Lean compiler is {}, expected {}",
+                lean_commit.trim(),
+                self.snapshot.lean_commit
             )));
         }
         let lean_version = run_checked(
@@ -114,10 +135,11 @@ impl LeanWorkerConfig {
             &self.mathlib_root,
             "Lean compiler version",
         )?;
-        if !lean_version.contains(&format!("version {LEAN_VERSION},")) {
+        if !lean_version.contains(&format!("version {},", self.snapshot.lean_version)) {
             return Err(WorkerError::Protocol(format!(
-                "Lean compiler version differs from {LEAN_VERSION}: {}",
-                lean_version.trim()
+                "Lean compiler version differs from {}: {}",
+                self.snapshot.lean_version,
+                lean_version.trim(),
             )));
         }
         #[cfg(not(target_os = "linux"))]
@@ -137,9 +159,9 @@ impl LeanWorkerConfig {
     pub fn environment_identity(&self) -> Result<LeanEnvironmentIdentity, WorkerError> {
         let worker_source = std::fs::read(&self.worker_source)?;
         Ok(LeanEnvironmentIdentity {
-            mathlib_commit: MATHLIB_COMMIT.into(),
-            lean_toolchain: LEAN_TOOLCHAIN.into(),
-            lean_commit: LEAN_COMMIT.into(),
+            mathlib_commit: self.snapshot.mathlib_commit.clone(),
+            lean_toolchain: self.snapshot.lean_toolchain.clone(),
+            lean_commit: self.snapshot.lean_commit.clone(),
             artifact_format: ARTIFACT_FORMAT_VERSION,
             kernel_contract: KERNEL_CONTRACT_VERSION,
             worker_source_sha256: hex(&Sha256::digest(worker_source)),
@@ -156,7 +178,15 @@ impl LeanWorkerConfig {
             )
             .map(|value| value.trim_end().to_owned())
         };
-        let executable = PathBuf::from(value("LEAN")?);
+        let executable = PathBuf::from(
+            run_checked(
+                &self.lake_executable,
+                &["env", "which", "lean"],
+                &self.mathlib_root,
+                "Lake Lean executable resolution",
+            )?
+            .trim_end(),
+        );
         if !executable.is_file() {
             return Err(WorkerError::Protocol(format!(
                 "Lake resolved a missing Lean executable: {}",
@@ -485,8 +515,8 @@ impl LeanWorker {
             ));
         };
         if handshake.protocol_version != PROTOCOL_VERSION
-            || handshake.lean_version != LEAN_RUNTIME_VERSION
-            || handshake.lean_commit != LEAN_COMMIT
+            || handshake.lean_version != config.snapshot.lean_runtime_version
+            || handshake.lean_commit != config.snapshot.lean_commit
             || handshake.trust_level != 0
         {
             return Err(WorkerError::Protocol(
@@ -701,6 +731,36 @@ fn run_checked(
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn validate_snapshot_pin(snapshot: &LeanSnapshotPin) -> Result<(), WorkerError> {
+    let valid_commit = |value: &str| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_commit(&snapshot.mathlib_commit) || !valid_commit(&snapshot.lean_commit) {
+        return Err(WorkerError::Protocol(
+            "Lean snapshot commits must be canonical lowercase SHA-1 identities".into(),
+        ));
+    }
+    if !snapshot.lean_toolchain.starts_with("leanprover/lean4:v")
+        || snapshot.lean_version.is_empty()
+        || snapshot.lean_runtime_version.is_empty()
+        || [
+            snapshot.lean_toolchain.as_str(),
+            snapshot.lean_version.as_str(),
+            snapshot.lean_runtime_version.as_str(),
+        ]
+        .iter()
+        .any(|value| value.chars().any(char::is_whitespace))
+    {
+        return Err(WorkerError::Protocol(
+            "Lean snapshot toolchain and versions are not canonical".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_git_checkout(path: &Path, expected: &str, description: &str) -> Result<(), WorkerError> {

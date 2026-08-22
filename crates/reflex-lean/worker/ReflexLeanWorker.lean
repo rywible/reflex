@@ -1,6 +1,5 @@
 import Mathlib
 import Lean.Data.Json.Stream
-import Lean.Util.CollectAxioms
 
 open Lean
 
@@ -212,7 +211,7 @@ structure NameAnalysis where
   forbidden : Bool := false
   axioms : Array Name := #[]
 
-abbrev AnalysisCache := IO.Ref (Std.HashMap Name NameAnalysis)
+abbrev AnalysisCache := IO.Ref (Batteries.HashMap Name NameAnalysis)
 
 def mergeAnalysis (left right : NameAnalysis) : NameAnalysis := Id.run do
   let mut axioms : NameSet := {}
@@ -225,7 +224,7 @@ def mergeAnalysis (left right : NameAnalysis) : NameAnalysis := Id.run do
 
 partial def analyzeName (env : Environment) (cache : AnalysisCache) (visiting : NameSet)
     (name : Name) : IO NameAnalysis := do
-  if let some analysis := (← cache.get)[name]? then return analysis
+  if let some analysis := (← cache.get).find? name then return analysis
   if visiting.contains name then return {}
   let visiting := visiting.insert name
   let mut analysis : NameAnalysis := {}
@@ -267,41 +266,47 @@ def verifyOne (env : Environment) (cache : AnalysisCache) (item : VerificationIt
         let analysis := mergeAnalysis claimAnalysis (mergeAnalysis candidateAnalysis proofAnalysis)
         if analysis.forbidden then
           return { accepted := false, diagnostic := "unsafe, partial, sorry, or unknown dependency" }
-        match Kernel.check env {} claimProposition,
-            Kernel.check env {} candidateProposition,
-            Kernel.check env {} proofTerm with
-        | .ok claimType, .ok candidateType, .ok proofType =>
-            match Kernel.check env {} claimType, Kernel.check env {} candidateType with
-            | .error _, _ => return { accepted := false, diagnostic := "claim is not a well-formed type" }
-            | _, .error _ => return { accepted := false, diagnostic := "candidate claim is not a well-formed type" }
-            | .ok _, .ok _ =>
-                if !Kernel.isDefEqGuarded env {} candidateProposition claimProposition then
-                  return { accepted := false, diagnostic := "candidate claim differs from the seed claim" }
-                else if !Kernel.isDefEqGuarded env {} proofType candidateProposition then
-                  return { accepted := false, diagnostic := "proof type differs from the candidate claim" }
-                else
-                  let axioms := analysis.axioms
-                  let allowed := item.allowedAxioms.map WireName.toLean
-                  if axioms.any (· == ``sorryAx) then
-                    return { accepted := false, diagnostic := "sorryAx dependency is forbidden" }
-                  else if axioms.any fun ax => !allowed.contains ax then
-                    return { accepted := false, diagnostic := "proof introduced a new axiom" }
-                  else
-                    let dependencies := Id.run do
-                      let mut found : NameSet := {}
-                      for expression in #[candidateProposition, proofTerm] do
-                        for dependency in expression.getUsedConstants do
-                          found := found.insert dependency
-                      return sortedNames found.toArray
-                    let result : VerificationResult := {
-                      accepted := true
-                      dependencies := dependencies.map WireName.ofLean
-                      axioms := axioms.map WireName.ofLean
-                    }
-                    return result
-        | .error _, _, _ => return { accepted := false, diagnostic := "kernel rejected the claim" }
-        | _, .error _, _ => return { accepted := false, diagnostic := "kernel rejected the candidate claim" }
-        | _, _, .error _ => return { accepted := false, diagnostic := "kernel rejected the proof" }
+        let levelParams := (item.levelParams.map WireName.toLean).toList
+        let claimDeclaration : Declaration := .axiomDecl {
+          name := `_reflex.claim
+          levelParams
+          type := claimProposition
+          isUnsafe := false
+        }
+        let proofDeclaration : Declaration := .thmDecl {
+          name := `_reflex.candidate
+          levelParams
+          type := candidateProposition
+          value := proofTerm
+        }
+        match env.addDecl {} claimDeclaration with
+        | .error _ => return { accepted := false, diagnostic := "claim is not a well-formed type" }
+        | .ok _ =>
+          match env.addDecl {} proofDeclaration with
+          | .error _ => return { accepted := false, diagnostic := "candidate or proof did not kernel-check" }
+          | .ok _ =>
+            if !Kernel.isDefEqGuarded env {} candidateProposition claimProposition then
+              return { accepted := false, diagnostic := "candidate claim differs from the seed claim" }
+            else
+              let axioms := analysis.axioms
+              let allowed := item.allowedAxioms.map WireName.toLean
+              if axioms.any (· == ``sorryAx) then
+                return { accepted := false, diagnostic := "sorryAx dependency is forbidden" }
+              else if axioms.any fun ax => !allowed.contains ax then
+                return { accepted := false, diagnostic := "proof introduced a new axiom" }
+              else
+                let dependencies := Id.run do
+                  let mut found : NameSet := {}
+                  for expression in #[candidateProposition, proofTerm] do
+                    for dependency in expression.getUsedConstants do
+                      found := found.insert dependency
+                  return sortedNames found.toArray
+                let result : VerificationResult := {
+                  accepted := true
+                  dependencies := dependencies.map WireName.ofLean
+                  axioms := axioms.map WireName.ofLean
+                }
+                return result
   | .error diagnostic, _, _ => return { accepted := false, diagnostic }
   | _, .error diagnostic, _ => return { accepted := false, diagnostic }
   | _, _, .error diagnostic => return { accepted := false, diagnostic }

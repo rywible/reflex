@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use reflex_lean::LeanSnapshotPin;
 use reflex_lean::ast::LeanExpr;
 use reflex_lean::catalog::LeanCatalog;
 use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig, VerificationItem};
@@ -63,6 +64,7 @@ struct Arguments {
     output: PathBuf,
     offset: usize,
     count: usize,
+    snapshot: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -235,10 +237,7 @@ pub fn build_catalog(arguments: &[String]) -> Result<(), AnyError> {
     let arguments = parse(arguments)?;
     require_absent(&arguments.output, "Lean catalog")?;
     let started = Instant::now();
-    let worker = LeanWorker::start(&LeanWorkerConfig::pinned(
-        &arguments.lake,
-        &arguments.mathlib,
-    ))?;
+    let worker = LeanWorker::start(&worker_config(&arguments)?)?;
     let catalog = LeanCatalog::build(&worker, 4096)?;
     catalog.save_new(&arguments.output)?;
     println!(
@@ -278,10 +277,7 @@ pub fn run_development(arguments: &[String]) -> Result<(), AnyError> {
     let arguments = parse(arguments)?;
     require_absent(&arguments.output, "Lean development report")?;
     let started = Instant::now();
-    let worker = LeanWorker::start(&LeanWorkerConfig::pinned(
-        &arguments.lake,
-        &arguments.mathlib,
-    ))?;
+    let worker = LeanWorker::start(&worker_config(&arguments)?)?;
     let validation_and_cold_start_wall_ms = started.elapsed().as_millis();
     let scan_started = Instant::now();
     let mut fingerprints = Vec::new();
@@ -418,6 +414,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
     let mut output = None;
     let mut offset = 0;
     let mut count = 512;
+    let mut snapshot = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
@@ -430,6 +427,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
             "--output" => output = Some(PathBuf::from(value)),
             "--offset" => offset = value.parse()?,
             "--count" => count = value.parse()?,
+            "--snapshot" => snapshot = Some(value.clone()),
             _ => return Err(format!("unknown lean-development argument: {flag}").into()),
         }
         index += 2;
@@ -440,5 +438,38 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
         output: output.ok_or("lean-development requires --output PATH")?,
         offset,
         count,
+        snapshot,
     })
+}
+
+fn worker_config(arguments: &Arguments) -> Result<LeanWorkerConfig, AnyError> {
+    let Some(snapshot) = arguments.snapshot.as_deref() else {
+        return Ok(LeanWorkerConfig::pinned(
+            &arguments.lake,
+            &arguments.mathlib,
+        ));
+    };
+    let pin = match snapshot {
+        "2024-06-30" => LeanSnapshotPin::new(
+            "454c40501feacb5aef56e707d6b348fc68897dce",
+            "leanprover/lean4:v4.9.0-rc3",
+            "4.9.0-rc3",
+            "4.9.0",
+            "141856d6e6d808a85b9147a530294fee8e48e15f",
+        ),
+        "2024-09-30" => LeanSnapshotPin::new(
+            "37814caf0b1b93a00743c1dd7af97ceb6b092b40",
+            "leanprover/lean4:v4.12.0-rc1",
+            "4.12.0-rc1",
+            "4.12.0",
+            "e9e858a4484905a0bfe97c4f05c3924ead02eed8",
+        ),
+        "2024-12-31" => LeanSnapshotPin::final_pre_2025(),
+        _ => return Err(format!("unknown frozen Lean snapshot {snapshot}").into()),
+    };
+    Ok(LeanWorkerConfig::for_snapshot(
+        &arguments.lake,
+        &arguments.mathlib,
+        pin,
+    ))
 }

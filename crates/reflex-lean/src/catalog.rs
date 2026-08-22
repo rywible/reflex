@@ -356,6 +356,11 @@ impl DeclarationKind {
         }
     }
 
+    #[must_use]
+    pub const fn code(&self) -> u8 {
+        self.encode()
+    }
+
     const fn encode(&self) -> u8 {
         match self {
             Self::Axiom => 0,

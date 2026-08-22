@@ -124,9 +124,25 @@ _Avoid_: Selection Corpus, public benchmark, training data
 A Scientific Corpus drawn from a later time boundary than the training environment and sealed before implementation or protocol freeze; it tests whether earlier learned Potential predicts later independently created value without allowing future information into development.
 _Avoid_: Replay Corpus, migration fixture, current library
 
+**Temporal Snapshot Pair**:
+Two independently reproducible domain environments ordered in time, used to attribute later verified consequences to knowledge available in the earlier environment. Development pairs must end before any Temporal Audit Corpus boundary.
+_Avoid_: Random split, version diff, audit sample
+
+**Anticipation**:
+A replayable relationship in which an earlier Artifact predicts, subsumes, shortens, or unlocks independently introduced later verified work. Anticipation is one delayed consequence used to train Potential, not proof that the earlier Artifact was valuable in every context.
+_Avoid_: Popularity, hindsight score, citation count
+
+**Elegance Profile**:
+A multi-level collection of independently interpretable Measurements about an Artifact, its proof, its dependency family, and its corpus-level compression effects. It is never a universal scalar or a Verification judgment.
+_Avoid_: Elegance score, beauty reward, correctness
+
 **Proof Collapse**:
 A kernel-Verified replacement proof for the same Seed-relative proposition that improves one or more proof Measurements, especially by reusing a shorter or more general existing declaration.
 _Avoid_: theorem alias, unchecked simplification, proof deletion
+
+**Semantic Migration**:
+The explicit reconstruction of compatible knowledge under a new Semantic Identity by re-encoding and replaying every retained Artifact, then rebuilding all derived indexes, relationships, and learned state from surviving evidence.
+_Avoid_: Version upgrade, compatibility assumption, bundle copy
 
 **Artifact**:
 A verified domain object retained with its provenance and Verification Record as reusable knowledge for future search.
