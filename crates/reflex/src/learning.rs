@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-pub(crate) const FEATURE_COUNT: usize = 24;
+pub(crate) const BASE_FEATURE_COUNT: usize = 16;
+pub(crate) const FEATURE_COUNT: usize = BASE_FEATURE_COUNT + crate::domain::PROPOSAL_FEATURE_COUNT;
 pub(crate) const HEAD_COUNT: usize = 7;
 const FEATURE_REVISION: u32 = 2;
 const TARGET_REVISION: u32 = 1;
@@ -100,10 +101,10 @@ pub(crate) enum PromotionDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BootstrapComparison {
+enum OperationalPolicyComparison {
     InsufficientEvidence,
     ChallengerWins,
-    BootstrapWins,
+    IncumbentWins,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -191,7 +192,8 @@ impl LearningState {
         let selection = bounded_corpus(examples, true);
         if let Some(champion) = &self.champion {
             let predecessor_wins = if self.predecessor_is_bootstrap {
-                compare_bootstrap_policy(champion, &selection) == BootstrapComparison::BootstrapWins
+                compare_bootstrap_policy(champion, &selection)
+                    == OperationalPolicyComparison::IncumbentWins
             } else {
                 self.predecessor.as_ref().is_some_and(|predecessor| {
                     compare_learned_revisions(champion, predecessor, &selection)
@@ -217,7 +219,7 @@ impl LearningState {
             let calibration = compare_models(&FtrlModel::zero(), &challenger, &selection);
             if calibration == PromotionDecision::Promote
                 && compare_bootstrap_policy(&challenger, &selection)
-                    == BootstrapComparison::ChallengerWins
+                    == OperationalPolicyComparison::ChallengerWins
             {
                 PromotionDecision::Promote
             } else {
@@ -1084,7 +1086,7 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&Trainin
 fn compare_bootstrap_policy(
     challenger: &FtrlModel,
     selection: &[&TrainingExample],
-) -> BootstrapComparison {
+) -> OperationalPolicyComparison {
     compare_learned_policies(&FtrlModel::zero(), challenger, selection)
 }
 
@@ -1096,7 +1098,7 @@ fn compare_learned_revisions(
     match compare_models(incumbent, challenger, selection) {
         PromotionDecision::Promote
             if compare_learned_policies(incumbent, challenger, selection)
-                == BootstrapComparison::ChallengerWins =>
+                == OperationalPolicyComparison::ChallengerWins =>
         {
             PromotionDecision::Promote
         }
@@ -1111,9 +1113,9 @@ fn compare_learned_policies(
     incumbent: &FtrlModel,
     challenger: &FtrlModel,
     selection: &[&TrainingExample],
-) -> BootstrapComparison {
+) -> OperationalPolicyComparison {
     let Some(incumbent) = operational_discoveries(incumbent, selection) else {
-        return BootstrapComparison::InsufficientEvidence;
+        return OperationalPolicyComparison::InsufficientEvidence;
     };
     let challenger = operational_discoveries(challenger, selection)
         .expect("the same selection must produce the same evidence sufficiency");
@@ -1141,9 +1143,9 @@ fn compare_learned_policies(
         && global_noninferior
         && (within_claim_strictly_better || global_strictly_better)
     {
-        BootstrapComparison::ChallengerWins
+        OperationalPolicyComparison::ChallengerWins
     } else {
-        BootstrapComparison::BootstrapWins
+        OperationalPolicyComparison::IncumbentWins
     }
 }
 
@@ -1273,14 +1275,14 @@ pub(crate) fn cooperative_ranked_indices(
         take_unique(
             learned,
             &mut learned_cursor,
-            4.min(limit - output.len()),
+            usize::from(output.len() < limit),
             &mut output,
             &mut selected,
         );
         take_unique(
             bootstrap,
             &mut bootstrap_cursor,
-            2.min(limit - output.len()),
+            usize::from(output.len() < limit),
             &mut output,
             &mut selected,
         );
@@ -1956,7 +1958,7 @@ mod tests {
 
         assert_eq!(
             compare_bootstrap_policy(&challenger, &selection),
-            BootstrapComparison::BootstrapWins,
+            OperationalPolicyComparison::IncumbentWins,
             "better pointwise loss cannot replace Bootstrap without a better selected prefix"
         );
     }
@@ -1968,11 +1970,11 @@ mod tests {
 
         assert_eq!(
             cooperative_ranked_indices(&baseline, &learned, 10),
-            vec![9, 8, 7, 6, 0, 1, 5, 4, 3, 2]
+            vec![9, 0, 8, 1, 7, 2, 6, 3, 5, 4]
         );
         assert_eq!(
             cooperative_ranked_indices(&baseline, &learned, 6),
-            vec![9, 8, 7, 6, 0, 1]
+            vec![9, 0, 8, 1, 7, 2]
         );
     }
 
@@ -2003,7 +2005,7 @@ mod tests {
 
         assert_eq!(
             compare_bootstrap_policy(&challenger, &selection),
-            BootstrapComparison::ChallengerWins,
+            OperationalPolicyComparison::ChallengerWins,
             "the executed cooperative policy must retain its learned top-1 gain while protecting later Bootstrap work"
         );
     }
@@ -2058,7 +2060,7 @@ mod tests {
         );
         assert_eq!(
             compare_learned_policies(&champion, &challenger, &selection),
-            BootstrapComparison::BootstrapWins
+            OperationalPolicyComparison::IncumbentWins
         );
     }
 

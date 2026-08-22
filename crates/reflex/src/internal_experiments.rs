@@ -13,8 +13,11 @@ use crate::{DomainDefinition, ImprovementRequest, SessionError};
 #[derive(Clone, Debug)]
 pub struct CandidateFeatureComparison {
     pub examples: usize,
-    pub distinct_feature_vectors: usize,
-    pub mixed_verdict_feature_vectors: usize,
+    pub feature_count: usize,
+    pub claim_operator_feature_groups: usize,
+    pub mixed_verdict_claim_operator_feature_groups: usize,
+    pub accepted_examples_in_mixed_groups: usize,
+    pub accepted_examples: usize,
     pub proposal_informed_examples: usize,
     pub replay_claims: usize,
     pub selection_claims: usize,

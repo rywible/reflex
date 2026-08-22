@@ -45,6 +45,9 @@ use experience::{
 use goals::GoalEvaluator;
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
+const OPERATOR_FEATURE_START: usize = 5;
+const OPERATOR_FEATURE_END: usize = 13;
+
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
     verification: VerificationRecord<D>,
@@ -114,8 +117,10 @@ struct ShapeSummary<C> {
 
 #[cfg(feature = "internal-experiments")]
 struct CandidateFeatureDiagnostics {
-    distinct_vectors: usize,
-    mixed_verdict_vectors: usize,
+    groups: usize,
+    mixed_verdict_groups: usize,
+    accepted_in_mixed_groups: usize,
+    accepted_examples: usize,
     proposal_informed_examples: usize,
 }
 
@@ -246,8 +251,11 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         .map_err(|()| SessionError::CorruptBundle)?;
     Ok(crate::internal_experiments::CandidateFeatureComparison {
         examples: baseline_attempts.len(),
-        distinct_feature_vectors: diagnostics.distinct_vectors,
-        mixed_verdict_feature_vectors: diagnostics.mixed_verdict_vectors,
+        feature_count: crate::learning::FEATURE_COUNT,
+        claim_operator_feature_groups: diagnostics.groups,
+        mixed_verdict_claim_operator_feature_groups: diagnostics.mixed_verdict_groups,
+        accepted_examples_in_mixed_groups: diagnostics.accepted_in_mixed_groups,
+        accepted_examples: diagnostics.accepted_examples,
         proposal_informed_examples: diagnostics.proposal_informed_examples,
         replay_claims: comparison.replay_claims,
         selection_claims: comparison.selection_claims,
@@ -284,23 +292,44 @@ fn candidate_feature_diagnostics(
     attempts: &[AttemptObservation],
     entries: &[ExperienceEntry],
 ) -> CandidateFeatureDiagnostics {
-    let mut outcomes = HashMap::<[u32; crate::learning::FEATURE_COUNT], u8>::new();
-    for attempt in attempts {
+    assert_eq!(
+        attempts.len(),
+        entries.len(),
+        "Experience attempts and durable entries must remain paired"
+    );
+    let mut outcomes =
+        HashMap::<([u8; 32], Vec<u8>, [u32; crate::learning::FEATURE_COUNT]), (u8, usize)>::new();
+    let mut accepted_examples = 0;
+    for (attempt, entry) in attempts.iter().zip(entries) {
         let verdict = match attempt.verdict {
             crate::learning::VerdictTarget::Accepted => 1,
             crate::learning::VerdictTarget::Refuted => 2,
             crate::learning::VerdictTarget::Unknown => 4,
         };
-        *outcomes
-            .entry(attempt.features.0.map(f32::to_bits))
-            .or_default() |= verdict;
+        let accepted = usize::from(attempt.verdict == crate::learning::VerdictTarget::Accepted);
+        accepted_examples += accepted;
+        let group = outcomes
+            .entry((
+                attempt.claim,
+                entry.operator_symbol.clone(),
+                attempt.features.0.map(f32::to_bits),
+            ))
+            .or_default();
+        group.0 |= verdict;
+        group.1 += accepted;
     }
     CandidateFeatureDiagnostics {
-        distinct_vectors: outcomes.len(),
-        mixed_verdict_vectors: outcomes
+        groups: outcomes.len(),
+        mixed_verdict_groups: outcomes
             .values()
-            .filter(|verdicts| verdicts.count_ones() > 1)
+            .filter(|(verdicts, _)| verdicts.count_ones() > 1)
             .count(),
+        accepted_in_mixed_groups: outcomes
+            .values()
+            .filter(|(verdicts, _)| verdicts.count_ones() > 1)
+            .map(|(_, accepted)| *accepted)
+            .sum(),
+        accepted_examples,
         proposal_informed_examples: entries
             .iter()
             .filter(|entry| {
@@ -1407,7 +1436,7 @@ fn opportunity_features<D: DomainDefinition>(
     values[2] = (candidate_nodes / 1024.0).min(1.0);
     values[3] = reduction;
     values[4] = f32::from(u16::try_from(epoch).unwrap_or(u16::MAX)) / 1024.0;
-    values[5..13].copy_from_slice(&operator_features);
+    values[OPERATOR_FEATURE_START..OPERATOR_FEATURE_END].copy_from_slice(&operator_features);
     values[13] = reduction;
     values[14] = f32::from(candidate_nodes > parent_nodes);
     values[15] = (candidate_nodes / parent_nodes.max(1.0)).min(4.0) / 4.0;
@@ -1417,7 +1446,7 @@ fn opportunity_features<D: DomainDefinition>(
 }
 
 fn append_proposal_features(features: &mut Features, proposal: ProposalFeatures) {
-    features.0[16..].copy_from_slice(&proposal.as_array());
+    features.0[crate::learning::BASE_FEATURE_COUNT..].copy_from_slice(&proposal.as_array());
 }
 
 fn structural_node_count<D: DomainDefinition>(domain: &D, artifact: &D::Artifact) -> f32 {
@@ -1491,7 +1520,8 @@ fn structural_opportunity_features<C: Copy + Eq>(
     values[2] = (candidate_nodes / 1024.0).min(1.0);
     values[3] = reduction;
     values[4] = (candidate.node_count.ln_1p() / NODE_SCALE).min(1.0);
-    values[5..13].copy_from_slice(&operator_feature_values(operator_symbol));
+    values[OPERATOR_FEATURE_START..OPERATOR_FEATURE_END]
+        .copy_from_slice(&operator_feature_values(operator_symbol));
     values[13] = (candidate.depth.ln_1p() / DEPTH_SCALE).min(1.0);
     values[14] = parent
         .constructor_frequencies
@@ -3536,7 +3566,7 @@ mod tests {
 
         assert_eq!(combined.0[15].to_bits(), 7.0_f32.to_bits());
         assert_eq!(
-            &combined.0[16..],
+            &combined.0[crate::learning::BASE_FEATURE_COUNT..],
             &[1.0, 0.5, 0.25, 0.0, -0.25, -0.5, -0.75, -1.0]
         );
     }
