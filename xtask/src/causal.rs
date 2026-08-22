@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::harness::{
-    AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_file,
-    hash_json, hex, require_absent, require_clean, require_release,
+    AnyError, HostEnvironment, capture_child_with_environment, completion_name, duration_ns,
+    environment, hash_file, hash_json, hex, require_absent, require_clean, require_release,
 };
 
 const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v5";
@@ -45,6 +45,9 @@ const CONSUMED_V3_AUDIT_SHA256: &str =
 const CONSUMED_V4_REPORT: &str = "docs/experiments/u8-causal-confirmation-v4-consumed-audit.json";
 const CONSUMED_V4_AUDIT_SHA256: &str =
     "0eae44e4ca7a2ba050f02ab87c0e2de27fecde457d8744636e29afdd6d404787";
+const CONSUMED_V5_REPORT: &str = "docs/experiments/u8-causal-confirmation-v5-consumed-audit.json";
+const CONSUMED_V5_AUDIT_SHA256: &str =
+    "5e1e3ad15fb06719b79855fbd18ce057c8f536f9d5e53d8575e13c9c4671a2ce";
 const CASES_PER_REPLICATE: usize = 8_190;
 const REPLICATES: usize = 10;
 const VERIFICATION_REQUESTS: u64 = 10_500;
@@ -52,6 +55,8 @@ const RESIDENT_BYTES: u64 = 256 * 1024 * 1024;
 const DURABLE_BYTES: u64 = 256 * 1024 * 1024;
 const TIME_SECONDS: u64 = 60;
 const CHILD_TIMEOUT_SECONDS: u64 = 120;
+const HISTORICAL_V5_FULL_WALL_NS: u64 = 24_756_073_867;
+const HISTORICAL_V5_BOOTSTRAP_WALL_NS: u64 = 19_340_946_572;
 const BOOTSTRAP_THRESHOLD: i64 = 500;
 const MODEL_THRESHOLD: i64 = 250;
 const DERIVED_THRESHOLD: i64 = 200;
@@ -303,6 +308,166 @@ struct Report {
     confirmed: bool,
     reproduction_commands: Vec<&'static str>,
     content_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DevelopmentPerformanceReport {
+    schema: &'static str,
+    status: &'static str,
+    warning: &'static str,
+    environment: HostEnvironment,
+    source_audit_sha256: &'static str,
+    historical_full_wall_ns: u64,
+    historical_bootstrap_wall_ns: u64,
+    full_is_twice_as_fast_as_v5: bool,
+    full_is_faster_than_v5_bootstrap: bool,
+    outcomes_match_v5: bool,
+    phase_reports: BTreeMap<String, Vec<String>>,
+    runs: Vec<RecordedRun>,
+}
+
+pub(super) fn run_development_performance(arguments: &[String]) -> Result<(), AnyError> {
+    require_release("causal-development-performance")?;
+    let output = match arguments {
+        [flag, path] if flag == "--output" => PathBuf::from(path),
+        _ => return Err("causal-development-performance requires --output PATH".into()),
+    };
+    require_absent(&output, "development performance report")?;
+    let environment = environment()?;
+    let work = std::env::current_dir()?.join(format!(
+        "target/reflex-causal-development-performance-{}",
+        std::process::id()
+    ));
+    if work.exists() {
+        return Err(format!(
+            "development performance work already exists: {}",
+            work.display()
+        )
+        .into());
+    }
+    std::fs::create_dir(&work)?;
+    let full = work.join("full.bundle");
+    let bootstrap_revision = work.join("bootstrap-revision.bundle");
+    build_training_bundles(&full, &bootstrap_revision)?;
+    std::fs::remove_file(bootstrap_revision)?;
+    let consumed = load_consumed_report(CONSUMED_V5_REPORT, CONSUMED_V5_AUDIT_SHA256)?;
+    let corpus = consumed
+        .audit_corpora
+        .into_iter()
+        .next()
+        .ok_or("consumed v5 audit has no replicate")?;
+    let corpus_path = work.join("consumed-v5-replicate-0.json");
+    std::fs::write(&corpus_path, serde_json::to_vec(&corpus)?)?;
+    let executable = std::env::current_exe()?;
+    let mut runs = Vec::new();
+    let mut phase_reports = BTreeMap::new();
+    for (order, treatment) in [Treatment::Full, Treatment::Bootstrap]
+        .into_iter()
+        .enumerate()
+    {
+        let target = work.join(format!("result-{}.bundle", treatment.as_str()));
+        if treatment == Treatment::Full {
+            std::fs::copy(&full, &target)?;
+        }
+        let phase_prefix = work.join(format!("phase-{}", treatment.as_str()));
+        let (run, phases) = run_assignment_capture(
+            &executable,
+            0,
+            treatment,
+            order,
+            &corpus_path,
+            &target,
+            Some(&phase_prefix),
+        )?;
+        phase_reports.insert(treatment.as_str().into(), phases);
+        runs.push(run);
+        if target.is_file() {
+            std::fs::remove_file(target)?;
+        }
+    }
+    let full_result = runs
+        .iter()
+        .find(|run| run.treatment == Treatment::Full)
+        .and_then(|run| run.result.as_ref());
+    let full_is_twice_as_fast_as_v5 = full_result
+        .is_some_and(|result| result.wall_ns.saturating_mul(2) <= HISTORICAL_V5_FULL_WALL_NS);
+    let full_is_faster_than_v5_bootstrap =
+        full_result.is_some_and(|result| result.wall_ns < HISTORICAL_V5_BOOTSTRAP_WALL_NS);
+    let outcomes_match_v5 = runs.iter().all(v5_outcome_matches);
+    let report = DevelopmentPerformanceReport {
+        schema: "reflex-u8-development-performance-v1",
+        status: "development-only",
+        warning: "Consumed v5 data is Development Corpus; this report is not confirmation evidence.",
+        environment,
+        source_audit_sha256: CONSUMED_V5_AUDIT_SHA256,
+        historical_full_wall_ns: HISTORICAL_V5_FULL_WALL_NS,
+        historical_bootstrap_wall_ns: HISTORICAL_V5_BOOTSTRAP_WALL_NS,
+        full_is_twice_as_fast_as_v5,
+        full_is_faster_than_v5_bootstrap,
+        outcomes_match_v5,
+        phase_reports,
+        runs,
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+    std::fs::remove_file(full)?;
+    std::fs::remove_file(corpus_path)?;
+    std::fs::remove_dir(work)?;
+    println!("wrote {}", output.display());
+    if !report.full_is_twice_as_fast_as_v5
+        || !report.full_is_faster_than_v5_bootstrap
+        || !report.outcomes_match_v5
+        || report.runs.iter().any(|run| run.failure.is_some())
+    {
+        return Err("development Full performance or v5 semantic gate failed".into());
+    }
+    Ok(())
+}
+
+fn v5_outcome_matches(run: &RecordedRun) -> bool {
+    let Some(result) = run.result.as_ref() else {
+        return false;
+    };
+    let (aggregates, artifact, knowledge, model) = match run.treatment {
+        Treatment::Full => (
+            Aggregates {
+                node_count: 74_464,
+                depth: 50_521,
+                peak_live_temporaries: 24_576,
+                encoded_bytes: 420_675,
+                evaluator_operations: 74_464,
+                evaluation_nanoseconds: 0,
+            },
+            "b6ff0c64e1d1c5f757af661f9e4f61237d376cbaef3cc377aafc5781bc80bbf7",
+            "d37a3c443d3bd8716f3ea67c51ca64889f057aa708406de84a50cd7a60d27630",
+            "8d3aa2f6d589c13512bee7441054e6f36e2f518a466542e655bdc0761c46993c",
+        ),
+        Treatment::Bootstrap => (
+            Aggregates {
+                node_count: 76_381,
+                depth: 51_865,
+                peak_live_temporaries: 24_576,
+                encoded_bytes: 433_917,
+                evaluator_operations: 76_381,
+                evaluation_nanoseconds: 0,
+            },
+            "931db3adf299ec538b0544088e32639906799bba8500446c4394b8644a3d2ff9",
+            "49d0c999b3f2055aa593151fe27b27376d0e1722f03ec2978315a9a5b6ff4d26",
+            "c4770e92e369d55315a49fde7bebacc3662818173ab6025e90ed6f9f392acf3d",
+        ),
+        Treatment::NoModel | Treatment::NoDerived => return false,
+    };
+    result.evaluation_valid
+        && result.recovery_valid
+        && result.pareto_artifacts == CASES_PER_REPLICATE
+        && result
+            .aggregates
+            .same_deterministic_measurements(aggregates)
+        && result.audit_artifact_sha256 == artifact
+        && result.knowledge_revision == knowledge
+        && result.model_revision == model
 }
 
 pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
@@ -851,6 +1016,21 @@ fn consumed_semantics(
     report_path: &str,
     expected_audit_sha256: &str,
 ) -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    let report = load_consumed_report(report_path, expected_audit_sha256)?;
+    let mut semantics = BTreeSet::new();
+    for record in report.audit_corpora.into_iter().flatten() {
+        let registered = decode_hex_32(&record.semantic_sha256)?;
+        if truth_digest(&expression(&record)) != registered || !semantics.insert(registered) {
+            return Err("consumed audit corpus is invalid or semantically duplicated".into());
+        }
+    }
+    Ok(semantics)
+}
+
+fn load_consumed_report(
+    report_path: &str,
+    expected_audit_sha256: &str,
+) -> Result<ConsumedReport, AnyError> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("xtask manifest must have a workspace parent")?;
@@ -866,14 +1046,7 @@ fn consumed_semantics(
     {
         return Err("consumed audit corpus does not match its registered identity".into());
     }
-    let mut semantics = BTreeSet::new();
-    for record in report.audit_corpora.into_iter().flatten() {
-        let registered = decode_hex_32(&record.semantic_sha256)?;
-        if truth_digest(&expression(&record)) != registered || !semantics.insert(registered) {
-            return Err("consumed audit corpus is invalid or semantically duplicated".into());
-        }
-    }
-    Ok(semantics)
+    Ok(report)
 }
 
 fn development_semantics() -> BTreeSet<[u8; 32]> {
@@ -1208,6 +1381,21 @@ fn run_assignment(
     corpus: &Path,
     target: &Path,
 ) -> Result<RecordedRun, AnyError> {
+    run_assignment_capture(
+        executable, replicate, treatment, order, corpus, target, None,
+    )
+    .map(|(run, _)| run)
+}
+
+fn run_assignment_capture(
+    executable: &Path,
+    replicate: usize,
+    treatment: Treatment,
+    order: usize,
+    corpus: &Path,
+    target: &Path,
+    phase_report_prefix: Option<&Path>,
+) -> Result<(RecordedRun, Vec<String>), AnyError> {
     let arguments = [
         OsString::from("causal-child"),
         OsString::from("--replicate"),
@@ -1219,11 +1407,18 @@ fn run_assignment(
         OsString::from("--target"),
         target.as_os_str().to_owned(),
     ];
-    let capture = capture_child(
+    let child_environment = phase_report_prefix.map_or_else(Vec::new, |prefix| {
+        vec![(
+            OsString::from("REFLEX_INTERNAL_PHASE_REPORT_PREFIX"),
+            prefix.as_os_str().to_owned(),
+        )]
+    });
+    let capture = capture_child_with_environment(
         executable,
         &arguments,
         target,
         Some(Duration::from_secs(CHILD_TIMEOUT_SECONDS)),
+        &child_environment,
     )?;
     let (result, failure) = if capture.timed_out {
         (
@@ -1259,16 +1454,34 @@ fn run_assignment(
     } else {
         (None, Some(format!("child failed: {}", capture.stderr)))
     };
-    Ok(RecordedRun {
-        replicate,
-        treatment,
-        order,
-        exit_code: capture.status.code(),
-        stdout: capture.stdout,
-        stderr: capture.stderr,
-        result,
-        failure,
-    })
+    let phase_reports = phase_report_prefix.map_or_else(Vec::new, |prefix| {
+        (0..2_u32)
+            .filter_map(|ordinal| {
+                let mut path = prefix.to_path_buf();
+                path.set_extension(format!("{ordinal}.phase"));
+                let report = std::fs::read_to_string(&path).ok()?;
+                let _ = std::fs::remove_file(path);
+                Some(report)
+            })
+            .collect()
+    });
+    let failure = failure.or_else(|| {
+        (phase_report_prefix.is_some() && phase_reports.len() != 2)
+            .then(|| "instrumented child did not emit both aggregate phase reports".into())
+    });
+    Ok((
+        RecordedRun {
+            replicate,
+            treatment,
+            order,
+            exit_code: capture.status.code(),
+            stdout: capture.stdout,
+            stderr: capture.stderr,
+            result,
+            failure,
+        },
+        phase_reports,
+    ))
 }
 
 fn analyze(runs: &[RecordedRun], deviations: &mut Vec<String>) -> Vec<Contrast> {

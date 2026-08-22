@@ -156,6 +156,10 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             causal::materialize_audit(&arguments)
         }
+        Some("causal-development-performance") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            causal::run_development_performance(&arguments)
+        }
         Some("build-native") => {
             let arguments = arguments.collect::<Vec<_>>();
             build::build_native(&arguments)
@@ -169,7 +173,7 @@ fn run() -> Result<(), AnyError> {
             performance::run_instrumentation_overhead(&arguments)
         }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|build-native|perf-smoke|instrumentation-overhead> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead> [arguments]"
                 .into(),
         ),
     }

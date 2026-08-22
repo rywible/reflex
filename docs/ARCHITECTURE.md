@@ -858,6 +858,10 @@ Production binaries use optimization level 3, fat link-time optimization, one co
 
 `perf-smoke` is the bounded development diagnostic. It records the embedded build profile and flags, session wall and process CPU time, externally sampled process-tree CPU time and peak resident memory, semantic outcome, and recovery validity. It permits a dirty tree and labels its report development-only. It must never be presented as confirmation evidence or replace a frozen equal-budget protocol.
 
+`causal-development-performance` replays one consumed v5 corpus through Full and Bootstrap for bounded regression work. It rejects changes unless deterministic Measurements, Pareto artifact identity, Knowledge Revision, Model Revision, and recovery remain exact, Full is at least twice as fast as historical v5 Full, and Full beats historical v5 Bootstrap wall time. Consumed data remains Development Corpus: passing this gate is never confirmation evidence.
+
+Mechanical hot-path changes cache only derivable private state. Cached correctness-claim bytes remain the exact equality authority while their digest is only a grouping index; cached FTRL weights and square roots remain excluded from canonical Model Revision encoding. Bounded selection must reproduce the exact prefix of the complete total order. This keeps speedups from silently weakening correctness or changing durable identity.
+
 The private Runtime phase recorder is disabled by default and cannot be selected through the consumer or Domain Definition interfaces. Repository tooling activates it in child processes only through an internal environment variable. It takes coarse timestamps around setup, generation, selection, Verification, Measurement/Admission, consolidation, training, and finalization, while hot loops contribute only batch aggregate counters. `instrumentation-overhead` alternates disabled and enabled assignments in paired order and rejects median session-wall or process-CPU overhead of 1% or more.
 
 ## Performance gates before expansion

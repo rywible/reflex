@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
 
-use crate::domain::{DomainDefinition, VerificationKernel};
+use crate::domain::DomainDefinition;
 use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
 use crate::measurement::{MeasurementSpace, MetricOrdering};
 use crate::session::{GoalId, SessionError, VerifiedArtifact};
@@ -34,14 +35,21 @@ impl<'a, D: DomainDefinition> GoalEvaluator<'a, D> {
         self.goals
             .goals
             .iter()
-            .map(|goal| retain_pareto(self.domain, goal, known.to_vec()))
+            .map(|goal| retain_pareto(self.domain, goal, known))
             .collect()
     }
 
-    pub(super) fn pareto(&self, known: &[VerifiedArtifact<D>]) -> Vec<VerifiedArtifact<D>> {
+    pub(super) fn pareto_from_frontiers(
+        frontiers: &[Vec<VerifiedArtifact<D>>],
+    ) -> Vec<VerifiedArtifact<D>> {
         let mut pareto = Vec::new();
-        for frontier in self.frontiers(known) {
-            extend_unique(&mut pareto, frontier);
+        let mut keys = HashSet::new();
+        for frontier in frontiers {
+            for artifact in frontier {
+                if keys.insert(artifact.key()) {
+                    pareto.push(artifact.clone());
+                }
+            }
         }
         pareto
     }
@@ -55,10 +63,14 @@ impl<'a, D: DomainDefinition> GoalEvaluator<'a, D> {
             .iter()
             .zip(previous.iter().zip(current))
             .filter_map(|(id, (previous, current))| {
+                let current_keys = current
+                    .iter()
+                    .map(VerifiedArtifact::key)
+                    .collect::<HashSet<_>>();
                 let changed = previous.len() != current.len()
                     || previous
                         .iter()
-                        .any(|artifact| !current.iter().any(|item| item.key() == artifact.key()));
+                        .any(|artifact| !current_keys.contains(&artifact.key()));
                 changed.then_some(*id)
             })
             .collect()
@@ -452,28 +464,47 @@ fn compare_preference<D: DomainDefinition>(
 fn retain_pareto<D: DomainDefinition>(
     domain: &D,
     goal: &OptimizationGoal<D>,
-    artifacts: Vec<VerifiedArtifact<D>>,
+    artifacts: &[VerifiedArtifact<D>],
 ) -> Vec<VerifiedArtifact<D>> {
     let artifacts = artifacts
-        .into_iter()
+        .iter()
         .filter(|artifact| {
             goal.constraints
                 .iter()
                 .all(|constraint| threshold_satisfied(domain, artifact, constraint))
         })
+        .cloned()
         .collect::<Vec<_>>();
-    let dominated = (0..artifacts.len())
-        .map(|right| {
-            (0..artifacts.len()).any(|left| {
-                left != right && dominates(domain, goal, &artifacts[left], &artifacts[right])
-            })
-        })
+    let groups = artifacts
+        .iter()
+        .map(|artifact| artifact.inner.claim_digest)
         .collect::<Vec<_>>();
+    let retained = retain_nondominated(&groups, |left, right| {
+        dominates(domain, goal, &artifacts[left], &artifacts[right])
+    });
     artifacts
         .into_iter()
-        .zip(dominated)
-        .filter_map(|(artifact, dominated)| (!dominated).then_some(artifact))
+        .zip(retained)
+        .filter_map(|(artifact, retained)| retained.then_some(artifact))
         .collect()
+}
+
+fn retain_nondominated(
+    groups: &[[u8; 32]],
+    mut dominates: impl FnMut(usize, usize) -> bool,
+) -> Vec<bool> {
+    let mut retained = vec![true; groups.len()];
+    let mut indices = (0..groups.len()).collect::<Vec<_>>();
+    indices.sort_unstable_by_key(|index| groups[*index]);
+    for group in indices.chunk_by(|left, right| groups[*left] == groups[*right]) {
+        for right in group.iter().copied() {
+            retained[right] = !group
+                .iter()
+                .copied()
+                .any(|left| left != right && dominates(left, right));
+        }
+    }
+    retained
 }
 
 fn threshold_satisfied<D: DomainDefinition>(
@@ -561,30 +592,43 @@ fn dominates<D: DomainDefinition>(
 }
 
 fn same_correctness_claim<D: DomainDefinition>(
-    domain: &D,
+    _domain: &D,
     left: &VerifiedArtifact<D>,
     right: &VerifiedArtifact<D>,
 ) -> bool {
-    let mut left_claim = Vec::new();
-    let mut right_claim = Vec::new();
-    domain
-        .kernel()
-        .encode_claim(&left.inner.verification.claim, &mut left_claim)
-        .is_ok()
-        && domain
-            .kernel()
-            .encode_claim(&right.inner.verification.claim, &mut right_claim)
-            .is_ok()
-        && left_claim == right_claim
+    left.inner.claim_canonical == right.inner.claim_canonical
 }
 
-fn extend_unique<D: DomainDefinition>(
-    known: &mut Vec<VerifiedArtifact<D>>,
-    artifacts: impl IntoIterator<Item = VerifiedArtifact<D>>,
-) {
-    for artifact in artifacts {
-        if !known.iter().any(|known| known.key() == artifact.key()) {
-            known.push(artifact);
-        }
+#[cfg(test)]
+mod tests {
+    use super::retain_nondominated;
+
+    #[test]
+    fn claim_grouped_retention_matches_the_quadratic_definition_in_input_order() {
+        let groups = (0..257_u16)
+            .map(|index| {
+                let mut group = [0_u8; 32];
+                group[0] = u8::try_from(index % 17).unwrap();
+                group
+            })
+            .collect::<Vec<_>>();
+        let measurements = (0..groups.len())
+            .map(|index| {
+                let first = (index * 37 + index / 3) % 101;
+                let second = (index * 19 + index / 7) % 89;
+                (first, second)
+            })
+            .collect::<Vec<_>>();
+        let dominates = |left: usize, right: usize| {
+            groups[left] == groups[right]
+                && measurements[left].0 <= measurements[right].0
+                && measurements[left].1 <= measurements[right].1
+                && measurements[left] != measurements[right]
+        };
+        let expected = (0..groups.len())
+            .map(|right| (0..groups.len()).any(|left| left != right && dominates(left, right)))
+            .map(|dominated| !dominated)
+            .collect::<Vec<_>>();
+        assert_eq!(retain_nondominated(&groups, dominates), expected);
     }
 }

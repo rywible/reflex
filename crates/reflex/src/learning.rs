@@ -72,14 +72,17 @@ pub(crate) struct TrainingExample {
     pub(crate) key: [u8; 32],
     pub(crate) corpus_key: [u8; 32],
     pub(crate) features: Features,
+    active_features: u16,
     pub(crate) targets: Targets,
     pub(crate) role: CorpusRole,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FtrlModel {
-    z: [[f32; FEATURE_COUNT]; HEAD_COUNT],
-    n: [[f32; FEATURE_COUNT]; HEAD_COUNT],
+    z: [[f32; HEAD_COUNT]; FEATURE_COUNT],
+    n: [[f32; HEAD_COUNT]; FEATURE_COUNT],
+    sqrt_n: [[f32; HEAD_COUNT]; FEATURE_COUNT],
+    weights: [[f32; HEAD_COUNT]; FEATURE_COUNT],
     calibration_count: [u64; HEAD_COUNT],
     calibration_error: [f32; HEAD_COUNT],
 }
@@ -369,36 +372,50 @@ impl LearningState {
 impl FtrlModel {
     pub(crate) fn zero() -> Self {
         Self {
-            z: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
-            n: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
+            z: [[0.0; HEAD_COUNT]; FEATURE_COUNT],
+            n: [[0.0; HEAD_COUNT]; FEATURE_COUNT],
+            sqrt_n: [[0.0; HEAD_COUNT]; FEATURE_COUNT],
+            weights: [[0.0; HEAD_COUNT]; FEATURE_COUNT],
             calibration_count: [0; HEAD_COUNT],
             calibration_error: [0.0; HEAD_COUNT],
         }
     }
 
     fn predict(&self, features: Features) -> Targets {
-        let mut predictions = [0.0; HEAD_COUNT];
-        for (head, prediction) in predictions.iter_mut().enumerate() {
-            let weights = self.weights(head);
-            let linear = weights
-                .iter()
-                .zip(features.0)
-                .map(|(weight, feature)| weight * feature)
-                .sum::<f32>();
-            *prediction = sigmoid(linear);
+        let mut linear = [0.0_f32; HEAD_COUNT];
+        for (feature_index, feature) in features.0.iter().copied().enumerate() {
+            for (head, value) in linear.iter_mut().enumerate() {
+                *value += self.weights[feature_index][head] * feature;
+            }
         }
-        Targets(predictions)
+        sigmoid_heads(linear)
+    }
+
+    fn predict_active(&self, features: Features, mut active_features: u16) -> Targets {
+        let mut linear = [0.0_f32; HEAD_COUNT];
+        while active_features != 0 {
+            let feature_index = active_features.trailing_zeros() as usize;
+            active_features &= active_features - 1;
+            let feature = features.0[feature_index];
+            for (head, value) in linear.iter_mut().enumerate() {
+                *value += self.weights[feature_index][head] * feature;
+            }
+        }
+        sigmoid_heads(linear)
     }
 
     pub(crate) fn forecast(&self, features: Features) -> PotentialForecast {
-        let estimates = self.predict(features);
+        let mut linear = [0.0_f32; HEAD_COUNT];
+        let mut support = [0.0_f32; HEAD_COUNT];
+        for (feature_index, feature) in features.0.iter().copied().enumerate() {
+            for head in 0..HEAD_COUNT {
+                linear[head] += self.weights[feature_index][head] * feature;
+                support[head] += self.n[feature_index][head] * feature * feature;
+            }
+        }
+        let estimates = sigmoid_heads(linear);
         PotentialForecast(std::array::from_fn(|head| {
-            let support = self.n[head]
-                .iter()
-                .zip(features.0)
-                .map(|(accumulated_gradient, feature)| accumulated_gradient * feature * feature)
-                .sum::<f32>();
-            let epistemic = (1.0 / (1.0 + support.max(0.0))).sqrt();
+            let epistemic = (1.0 / (1.0 + support[head].max(0.0))).sqrt();
             let calibration_error = if self.calibration_count[head] == 0 {
                 1.0
             } else {
@@ -412,34 +429,73 @@ impl FtrlModel {
         }))
     }
 
+    pub(crate) fn forecast_batch(
+        &self,
+        features: &[Features],
+        output: &mut Vec<PotentialForecast>,
+    ) {
+        output.clear();
+        output.reserve(features.len());
+        let mut unique = HashMap::<[u32; FEATURE_COUNT], PotentialForecast>::with_capacity(
+            features.len().min(1_024),
+        );
+        for features in features {
+            let key = features.0.map(f32::to_bits);
+            let forecast = *unique
+                .entry(key)
+                .or_insert_with(|| self.forecast(*features));
+            output.push(forecast);
+        }
+    }
+
     pub(crate) fn update(&mut self, example: &TrainingExample) {
         const ALPHA: f32 = 0.1;
-        if !example.features.0.iter().all(|value| value.is_finite())
-            || !example
-                .targets
-                .0
-                .iter()
-                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-        {
-            return;
+        let predictions = self.predict_active(example.features, example.active_features);
+        let errors: [f32; HEAD_COUNT] =
+            std::array::from_fn(|head| predictions.0[head] - example.targets.0[head]);
+        let mut active_features = example.active_features;
+        while active_features != 0 {
+            let index = active_features.trailing_zeros() as usize;
+            active_features &= active_features - 1;
+            let feature = example.features.0[index];
+            let previous_n = self.n[index];
+            let previous_sqrt_n = self.sqrt_n[index];
+            let previous_z = self.z[index];
+            let previous_weights = self.weights[index];
+            let gradients = errors.map(|error| error * feature);
+            let next_n =
+                std::array::from_fn(|head| previous_n[head] + gradients[head] * gradients[head]);
+            let next_sqrt_n = next_n.map(f32::sqrt);
+            let next_z = std::array::from_fn(|head| {
+                let sigma = (next_sqrt_n[head] - previous_sqrt_n[head]) / ALPHA;
+                previous_z[head] + (gradients[head] - sigma * previous_weights[head])
+            });
+            self.n[index] = next_n;
+            self.sqrt_n[index] = next_sqrt_n;
+            self.z[index] = next_z;
+            self.weights[index] =
+                std::array::from_fn(|head| weight_from_state(next_z[head], next_sqrt_n[head]));
         }
-        let predictions = self.predict(example.features);
-        for head in 0..HEAD_COUNT {
-            let weights = self.weights(head);
-            for (index, (feature, weight)) in
-                example.features.0.iter().copied().zip(weights).enumerate()
-            {
-                let gradient = (predictions.0[head] - example.targets.0[head]) * feature;
-                let sigma = ((self.n[head][index] + gradient * gradient).sqrt()
-                    - self.n[head][index].sqrt())
-                    / ALPHA;
-                self.z[head][index] += gradient - sigma * weight;
-                self.n[head][index] += gradient * gradient;
+        self.calibration_count = self.calibration_count.map(|count| count.saturating_add(1));
+        if self
+            .calibration_count
+            .iter()
+            .all(|count| *count == self.calibration_count[0])
+        {
+            let count = f32::from(u16::try_from(self.calibration_count[0]).unwrap_or(u16::MAX));
+            self.calibration_error = std::array::from_fn(|head| {
+                let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
+                self.calibration_error[head]
+                    + (absolute_error - self.calibration_error[head]) / count
+            });
+        } else {
+            for head in 0..HEAD_COUNT {
+                let count =
+                    f32::from(u16::try_from(self.calibration_count[head]).unwrap_or(u16::MAX));
+                let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
+                self.calibration_error[head] +=
+                    (absolute_error - self.calibration_error[head]) / count;
             }
-            self.calibration_count[head] = self.calibration_count[head].saturating_add(1);
-            let count = f32::from(u16::try_from(self.calibration_count[head]).unwrap_or(u16::MAX));
-            let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
-            self.calibration_error[head] += (absolute_error - self.calibration_error[head]) / count;
         }
     }
 
@@ -450,9 +506,9 @@ impl FtrlModel {
         output.extend_from_slice(&TARGET_REVISION.to_le_bytes());
         output.extend_from_slice(&CALIBRATION_REVISION.to_le_bytes());
         for values in [&self.z, &self.n] {
-            for head in values {
-                for value in head {
-                    output.extend_from_slice(&value.to_bits().to_le_bytes());
+            for head in 0..HEAD_COUNT {
+                for feature in values {
+                    output.extend_from_slice(&feature[head].to_bits().to_le_bytes());
                 }
             }
         }
@@ -479,12 +535,12 @@ impl FtrlModel {
         }
         let mut model = Self::zero();
         for (state_index, values) in [&mut model.z, &mut model.n].into_iter().enumerate() {
-            for head in values {
-                for value in head {
+            for head in 0..HEAD_COUNT {
+                for feature in values.iter_mut() {
                     let (encoded, remainder) = input.split_at(4);
                     input = remainder;
-                    *value = f32::from_bits(u32::from_le_bytes(encoded.try_into().unwrap()));
-                    if !value.is_finite() || state_index == 1 && *value < 0.0 {
+                    feature[head] = f32::from_bits(u32::from_le_bytes(encoded.try_into().unwrap()));
+                    if !feature[head].is_finite() || state_index == 1 && feature[head] < 0.0 {
                         return Err(());
                     }
                 }
@@ -506,23 +562,26 @@ impl FtrlModel {
         if !input.is_empty() {
             return Err(());
         }
+        model.rebuild_cache();
         Ok(model)
     }
 
-    fn weights(&self, head: usize) -> [f32; FEATURE_COUNT] {
-        const ALPHA: f32 = 0.1;
-        const BETA: f32 = 1.0;
-        const L1: f32 = 0.0;
-        const L2: f32 = 1.0;
-        std::array::from_fn(|index| {
-            let z = self.z[head][index];
-            if z.abs() <= L1 {
-                0.0
-            } else {
-                -(z - z.signum() * L1) / ((BETA + self.n[head][index].sqrt()) / ALPHA + L2)
+    fn rebuild_cache(&mut self) {
+        for index in 0..FEATURE_COUNT {
+            for head in 0..HEAD_COUNT {
+                let sqrt_n = self.n[index][head].sqrt();
+                self.sqrt_n[index][head] = sqrt_n;
+                self.weights[index][head] = weight_from_state(self.z[index][head], sqrt_n);
             }
-        })
+        }
     }
+}
+
+fn weight_from_state(z: f32, sqrt_n: f32) -> f32 {
+    const ALPHA: f32 = 0.1;
+    const BETA: f32 = 1.0;
+    const L2: f32 = 1.0;
+    -z / ((BETA + sqrt_n) / ALPHA + L2)
 }
 
 pub(crate) fn derive_targets(
@@ -583,10 +642,25 @@ pub(crate) fn derive_targets(
                     (attempt.verification_cost / 16.0).clamp(0.0, 1.0),
                     f32::from(dead_end),
                 ]),
+                active_features: active_feature_mask(attempt.features),
                 role: assign_role(attempt.claim),
             }
         })
         .collect()
+}
+
+fn active_feature_mask(features: Features) -> u16 {
+    features
+        .0
+        .iter()
+        .enumerate()
+        .fold(0_u16, |mask, (index, feature)| {
+            if *feature == 0.0 {
+                mask
+            } else {
+                mask | (1_u16 << index)
+            }
+        })
 }
 
 pub(crate) fn assign_role(key: [u8; 32]) -> CorpusRole {
@@ -608,7 +682,7 @@ pub(crate) fn rotate_selection(examples: &mut [TrainingExample], maximum_uses: u
     }
 }
 
-fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<TrainingExample> {
+fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&TrainingExample> {
     let eligible = |example: &&TrainingExample| {
         matches!(example.role, CorpusRole::Selection { .. }) == selection
     };
@@ -619,7 +693,7 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<Training
     for example in examples.iter().filter(eligible) {
         if groups.insert(example.corpus_key) {
             selected_keys.insert(example.key);
-            corpus.push(example.clone());
+            corpus.push(example);
             if corpus.len() == MAX_REPLAY_BATCH {
                 break;
             }
@@ -628,7 +702,7 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<Training
     if corpus.len() < MAX_REPLAY_BATCH {
         for example in examples.iter().filter(eligible) {
             if groups.contains(&example.corpus_key) && selected_keys.insert(example.key) {
-                corpus.push(example.clone());
+                corpus.push(example);
                 if corpus.len() == MAX_REPLAY_BATCH {
                     break;
                 }
@@ -642,7 +716,7 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<Training
 pub(crate) fn compare_models(
     champion: &FtrlModel,
     challenger: &FtrlModel,
-    selection: &[TrainingExample],
+    selection: &[&TrainingExample],
 ) -> PromotionDecision {
     if selection
         .iter()
@@ -682,7 +756,7 @@ pub(crate) fn revision_digest(model: &FtrlModel) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn losses(model: &FtrlModel, selection: &[TrainingExample]) -> [f32; HEAD_COUNT] {
+fn losses(model: &FtrlModel, selection: &[&TrainingExample]) -> [f32; HEAD_COUNT] {
     let mut groups = BTreeMap::<[u8; 32], ([f32; HEAD_COUNT], u32)>::new();
     for example in selection {
         let prediction = model.predict(example.features);
@@ -716,6 +790,16 @@ fn sigmoid(value: f32) -> f32 {
         let exponential = value.exp();
         exponential / (1.0 + exponential)
     }
+}
+
+fn sigmoid_heads(linear: [f32; HEAD_COUNT]) -> Targets {
+    let mut predictions = [0.0_f32; HEAD_COUNT];
+    for head in 0..HEAD_COUNT {
+        predictions[head] = (0..head)
+            .find(|previous| linear[*previous].to_bits() == linear[head].to_bits())
+            .map_or_else(|| sigmoid(linear[head]), |previous| predictions[previous]);
+    }
+    Targets(predictions)
 }
 
 fn push_model(output: &mut Vec<u8>, model: Option<&FtrlModel>) {
@@ -775,6 +859,174 @@ fn target_map(examples: &[TrainingExample]) -> BTreeMap<[u8; 32], Targets> {
 mod tests {
     use super::*;
 
+    struct UncachedFtrlModel {
+        z: [[f32; FEATURE_COUNT]; HEAD_COUNT],
+        n: [[f32; FEATURE_COUNT]; HEAD_COUNT],
+        calibration_count: [u64; HEAD_COUNT],
+        calibration_error: [f32; HEAD_COUNT],
+    }
+
+    impl UncachedFtrlModel {
+        fn zero() -> Self {
+            Self {
+                z: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
+                n: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
+                calibration_count: [0; HEAD_COUNT],
+                calibration_error: [0.0; HEAD_COUNT],
+            }
+        }
+
+        fn weights(&self, head: usize) -> [f32; FEATURE_COUNT] {
+            const ALPHA: f32 = 0.1;
+            const BETA: f32 = 1.0;
+            const L1: f32 = 0.0;
+            const L2: f32 = 1.0;
+            std::array::from_fn(|index| {
+                let z = self.z[head][index];
+                if z.abs() <= L1 {
+                    0.0
+                } else {
+                    -(z - z.signum() * L1) / ((BETA + self.n[head][index].sqrt()) / ALPHA + L2)
+                }
+            })
+        }
+
+        fn predict(&self, features: Features) -> Targets {
+            let mut predictions = [0.0; HEAD_COUNT];
+            for (head, prediction) in predictions.iter_mut().enumerate() {
+                *prediction = sigmoid(
+                    self.weights(head)
+                        .iter()
+                        .zip(features.0)
+                        .map(|(weight, feature)| weight * feature)
+                        .sum(),
+                );
+            }
+            Targets(predictions)
+        }
+
+        fn update(&mut self, example: &TrainingExample) {
+            const ALPHA: f32 = 0.1;
+            let predictions = self.predict(example.features);
+            for head in 0..HEAD_COUNT {
+                let weights = self.weights(head);
+                for (index, (feature, weight)) in
+                    example.features.0.iter().copied().zip(weights).enumerate()
+                {
+                    let gradient = (predictions.0[head] - example.targets.0[head]) * feature;
+                    let sigma = ((self.n[head][index] + gradient * gradient).sqrt()
+                        - self.n[head][index].sqrt())
+                        / ALPHA;
+                    self.z[head][index] += gradient - sigma * weight;
+                    self.n[head][index] += gradient * gradient;
+                }
+                self.calibration_count[head] = self.calibration_count[head].saturating_add(1);
+                let count =
+                    f32::from(u16::try_from(self.calibration_count[head]).unwrap_or(u16::MAX));
+                let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
+                self.calibration_error[head] +=
+                    (absolute_error - self.calibration_error[head]) / count;
+            }
+        }
+
+        fn forecast(&self, features: Features) -> PotentialForecast {
+            let estimates = self.predict(features);
+            PotentialForecast(std::array::from_fn(|head| {
+                let support = self.n[head]
+                    .iter()
+                    .zip(features.0)
+                    .map(|(accumulated_gradient, feature)| accumulated_gradient * feature * feature)
+                    .sum::<f32>();
+                let epistemic = (1.0 / (1.0 + support.max(0.0))).sqrt();
+                let calibration_error = if self.calibration_count[head] == 0 {
+                    1.0
+                } else {
+                    self.calibration_error[head]
+                };
+                Forecast {
+                    estimate: estimates.0[head],
+                    calibration_error,
+                    uncertainty: epistemic.max(calibration_error).clamp(0.0, 1.0),
+                }
+            }))
+        }
+    }
+
+    fn reference_weights(model: &FtrlModel, head: usize) -> [f32; FEATURE_COUNT] {
+        const ALPHA: f32 = 0.1;
+        const BETA: f32 = 1.0;
+        const L1: f32 = 0.0;
+        const L2: f32 = 1.0;
+        std::array::from_fn(|index| {
+            let z = model.z[index][head];
+            if z.abs() <= L1 {
+                0.0
+            } else {
+                -(z - z.signum() * L1) / ((BETA + model.n[index][head].sqrt()) / ALPHA + L2)
+            }
+        })
+    }
+
+    fn reference_predict(model: &FtrlModel, features: Features) -> Targets {
+        let mut predictions = [0.0; HEAD_COUNT];
+        for (head, prediction) in predictions.iter_mut().enumerate() {
+            *prediction = sigmoid(
+                reference_weights(model, head)
+                    .iter()
+                    .zip(features.0)
+                    .map(|(weight, feature)| weight * feature)
+                    .sum(),
+            );
+        }
+        Targets(predictions)
+    }
+
+    fn reference_forecast(model: &FtrlModel, features: Features) -> PotentialForecast {
+        let estimates = reference_predict(model, features);
+        PotentialForecast(std::array::from_fn(|head| {
+            let support = features
+                .0
+                .iter()
+                .enumerate()
+                .map(|(index, feature)| model.n[index][head] * feature * feature)
+                .sum::<f32>();
+            let epistemic = (1.0 / (1.0 + support.max(0.0))).sqrt();
+            let calibration_error = if model.calibration_count[head] == 0 {
+                1.0
+            } else {
+                model.calibration_error[head]
+            };
+            Forecast {
+                estimate: estimates.0[head],
+                calibration_error,
+                uncertainty: epistemic.max(calibration_error).clamp(0.0, 1.0),
+            }
+        }))
+    }
+
+    fn reference_update(model: &mut FtrlModel, example: &TrainingExample) {
+        const ALPHA: f32 = 0.1;
+        let predictions = reference_predict(model, example.features);
+        for head in 0..HEAD_COUNT {
+            let weights = reference_weights(model, head);
+            for (index, (feature, weight)) in
+                example.features.0.iter().copied().zip(weights).enumerate()
+            {
+                let gradient = (predictions.0[head] - example.targets.0[head]) * feature;
+                let sigma = ((model.n[index][head] + gradient * gradient).sqrt()
+                    - model.n[index][head].sqrt())
+                    / ALPHA;
+                model.z[index][head] += gradient - sigma * weight;
+                model.n[index][head] += gradient * gradient;
+            }
+            model.calibration_count[head] = model.calibration_count[head].saturating_add(1);
+            let count = f32::from(u16::try_from(model.calibration_count[head]).unwrap_or(u16::MAX));
+            let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
+            model.calibration_error[head] +=
+                (absolute_error - model.calibration_error[head]) / count;
+        }
+    }
+
     fn features(operator_bucket: usize) -> Features {
         let mut values = [0.0; FEATURE_COUNT];
         values[0] = 1.0;
@@ -790,6 +1042,7 @@ mod tests {
             key: [key; 32],
             corpus_key: [key; 32],
             features: features(bucket),
+            active_features: active_feature_mask(features(bucket)),
             targets: Targets(targets),
             role,
         }
@@ -823,6 +1076,137 @@ mod tests {
         let mut incompatible = model.encode();
         incompatible[5..9].copy_from_slice(&2_u32.to_le_bytes());
         assert!(FtrlModel::decode(&incompatible).is_err());
+    }
+
+    #[test]
+    fn cached_ftrl_preserves_the_uncached_numerical_and_canonical_result() {
+        let examples = (0..64_u8)
+            .map(|key| {
+                example(
+                    key,
+                    usize::from(key % 8),
+                    key.is_multiple_of(3),
+                    CorpusRole::Replay,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cached = FtrlModel::zero();
+        let mut reference = FtrlModel::zero();
+        for _ in 0..8 {
+            for sample in &examples {
+                cached.update(sample);
+                reference_update(&mut reference, sample);
+            }
+        }
+        reference.rebuild_cache();
+        assert_eq!(cached.encode(), reference.encode());
+        for sample in &examples {
+            assert_eq!(
+                cached.predict(sample.features),
+                reference_predict(&reference, sample.features)
+            );
+            assert_eq!(
+                cached.forecast(sample.features),
+                reference_forecast(&reference, sample.features)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode development microbenchmark"]
+    fn cached_ftrl_training_and_forecasting_are_four_times_faster() {
+        const SAMPLES: usize = 5;
+        const TRAINING_UPDATES: usize = 20_000;
+        const FORECASTS: usize = 100_000;
+        let examples = (0..64_u8)
+            .map(|key| {
+                let mut example = example(
+                    key,
+                    usize::from(key % 8),
+                    key.is_multiple_of(3),
+                    CorpusRole::Replay,
+                );
+                example.features.0[1] = f32::from(key) / 255.0;
+                example.features.0[2] = f32::from(key.saturating_add(1)) / 255.0;
+                example.features.0[3] = f32::from(key) / 128.0 - 0.25;
+                example.features.0[4] = f32::from(key) / 1024.0;
+                example.features.0[13] = example.features.0[3];
+                example.features.0[14] = f32::from(key.is_multiple_of(2));
+                example.features.0[15] = f32::from(key) / 256.0;
+                example.active_features = active_feature_mask(example.features);
+                example
+            })
+            .collect::<Vec<_>>();
+        let mut trained = FtrlModel::zero();
+        let mut uncached_trained = UncachedFtrlModel::zero();
+        for sample in &examples {
+            trained.update(sample);
+            uncached_trained.update(sample);
+        }
+        let forecast_features = (0..FORECASTS)
+            .map(|index| examples[index % examples.len()].features)
+            .collect::<Vec<_>>();
+        let measure = |work: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            work();
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        };
+        let mut cached_training = Vec::new();
+        let mut reference_training = Vec::new();
+        let mut cached_forecasting = Vec::new();
+        let mut reference_forecasting = Vec::new();
+        for sample in 0..SAMPLES {
+            let mut run_cached_training = || {
+                let mut model = FtrlModel::zero();
+                for index in 0..TRAINING_UPDATES {
+                    model.update(std::hint::black_box(&examples[index % examples.len()]));
+                }
+                std::hint::black_box(model.encode());
+            };
+            let mut run_reference_training = || {
+                let mut model = UncachedFtrlModel::zero();
+                for index in 0..TRAINING_UPDATES {
+                    model.update(std::hint::black_box(&examples[index % examples.len()]));
+                }
+                std::hint::black_box(model);
+            };
+            let mut run_cached_forecasting = || {
+                let mut output = Vec::with_capacity(forecast_features.len());
+                trained.forecast_batch(std::hint::black_box(&forecast_features), &mut output);
+                std::hint::black_box(output);
+            };
+            let mut run_reference_forecasting = || {
+                for features in &forecast_features {
+                    std::hint::black_box(
+                        uncached_trained.forecast(std::hint::black_box(*features)),
+                    );
+                }
+            };
+            if sample.is_multiple_of(2) {
+                cached_training.push(measure(&mut run_cached_training));
+                reference_training.push(measure(&mut run_reference_training));
+                cached_forecasting.push(measure(&mut run_cached_forecasting));
+                reference_forecasting.push(measure(&mut run_reference_forecasting));
+            } else {
+                reference_training.push(measure(&mut run_reference_training));
+                cached_training.push(measure(&mut run_cached_training));
+                reference_forecasting.push(measure(&mut run_reference_forecasting));
+                cached_forecasting.push(measure(&mut run_cached_forecasting));
+            }
+        }
+        let median = |values: &mut Vec<u64>| {
+            values.sort_unstable();
+            values[values.len() / 2]
+        };
+        let cached_training = median(&mut cached_training);
+        let reference_training = median(&mut reference_training);
+        let cached_forecasting = median(&mut cached_forecasting);
+        let reference_forecasting = median(&mut reference_forecasting);
+        eprintln!(
+            "training: reference={reference_training}ns cached={cached_training}ns; forecasting: reference={reference_forecasting}ns cached={cached_forecasting}ns"
+        );
+        assert!(reference_training >= cached_training.saturating_mul(4));
+        assert!(reference_forecasting >= cached_forecasting.saturating_mul(4));
     }
 
     #[test]
@@ -904,7 +1288,6 @@ mod tests {
         let selection = examples
             .iter()
             .filter(|sample| matches!(sample.role, CorpusRole::Selection { .. }))
-            .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
             compare_models(&FtrlModel::zero(), &challenger, &selection),
@@ -958,8 +1341,9 @@ mod tests {
         let mut regressed = FtrlModel::zero();
         regressed.z[0][0] = 10.0;
         regressed.n[0][0] = 1.0;
-        regressed.z[6][0] = -10.0;
-        regressed.n[6][0] = 1.0;
+        regressed.z[0][6] = -10.0;
+        regressed.n[0][6] = 1.0;
+        regressed.rebuild_cache();
         let mut state = LearningState {
             generation: 1,
             champion: Some(regressed),
@@ -981,15 +1365,17 @@ mod tests {
 
     #[test]
     fn comparison_retains_incomparable_specialists_and_rejects_non_improvements() {
-        let selection = (0..8)
+        let selection_examples = (0..8)
             .map(|key| example(key, 0, true, CorpusRole::Selection { uses: 0 }))
             .collect::<Vec<_>>();
+        let selection = selection_examples.iter().collect::<Vec<_>>();
         let champion = FtrlModel::zero();
         let mut incomparable = FtrlModel::zero();
         incomparable.z[0][0] = -10.0;
         incomparable.n[0][0] = 1.0;
-        incomparable.z[1][0] = -10.0;
-        incomparable.n[1][0] = 1.0;
+        incomparable.z[0][1] = -10.0;
+        incomparable.n[0][1] = 1.0;
+        incomparable.rebuild_cache();
 
         assert_eq!(
             compare_models(&champion, &incomparable, &selection),

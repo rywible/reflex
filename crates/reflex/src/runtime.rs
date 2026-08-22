@@ -94,6 +94,11 @@ struct ProposedCandidate<D: DomainDefinition> {
     protected_derived: bool,
 }
 
+#[derive(Clone, Copy)]
+struct StructuralSummary {
+    node_count: f32,
+}
+
 struct ReadSeeds<D: DomainDefinition> {
     seeds: Vec<Seed<D>>,
     encoded_cursor: Vec<u8>,
@@ -272,7 +277,7 @@ where
     let mut known = recovered.clone();
     extend_unique(&mut known, roots.iter().cloned());
     let initial_goal_frontiers = goal_evaluator.frontiers(&known);
-    let mut pareto = goal_evaluator.pareto(&known);
+    let mut pareto = GoalEvaluator::<D>::pareto_from_frontiers(&initial_goal_frontiers);
     let initial_usage = resource_meter
         .usage(verification_requests, 0)
         .map_err(|()| SessionError::Resource)?;
@@ -398,6 +403,12 @@ where
             .iter()
             .map(|(artifact, _)| artifact.artifact())
             .collect::<Vec<_>>();
+        let parent_summaries = parents
+            .iter()
+            .map(|artifact| StructuralSummary {
+                node_count: structural_node_count(domain, artifact),
+            })
+            .collect::<Vec<_>>();
         let origins = frontier
             .iter()
             .map(|(_, origin)| *origin)
@@ -477,16 +488,17 @@ where
             application_bytes = application_bytes
                 .saturating_add(vector_bytes(&locations))
                 .saturating_add(vector_bytes(&applications));
+            let operator_bucket = operator_feature_bucket(descriptor.symbol().as_str());
             for candidate in operator_candidates {
-                let parent = frontier
+                let parent = parent_summaries
                     .get(candidate.source_index)
                     .ok_or(SessionError::InvalidSeed)?;
                 candidates.push(ProposedCandidate {
                     features: opportunity_features(
                         domain,
-                        parent.0.artifact(),
+                        *parent,
                         &candidate.artifact,
-                        descriptor.symbol().as_str(),
+                        operator_bucket,
                         sequence,
                     ),
                     candidate,
@@ -536,10 +548,12 @@ where
             &frontier,
             candidates,
         )?;
+        let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
         order_by_learned_potential(
             &goal_evaluator,
             &frontier,
             pinned_model.as_ref(),
+            remaining,
             &mut candidates,
         );
         instrumentation.selected(candidates.len());
@@ -564,7 +578,6 @@ where
             time_exhausted = true;
             break;
         }
-        let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
         if candidates.len() > remaining {
             candidates.truncate(remaining);
             verification_budget_exhausted = true;
@@ -685,8 +698,8 @@ where
             epoch.admit(artifact, origin);
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
-        let proposed_pareto = goal_evaluator.pareto(epoch.known());
         let proposed_goal_frontiers = goal_evaluator.frontiers(epoch.known());
+        let proposed_pareto = GoalEvaluator::<D>::pareto_from_frontiers(&proposed_goal_frontiers);
         let (staged_known, staged_entries, staged_consequences) = epoch.admission_state();
         record_admission_consequences(
             &goal_evaluator,
@@ -999,6 +1012,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
         bytes
             .saturating_add(std::mem::size_of::<VerifiedArtifactRecord<D>>() as u64)
             .saturating_add(artifact.inner.dynamic_resident_bytes)
+            .saturating_add(artifact.inner.claim_canonical.len() as u64)
             .saturating_add(artifact.inner.provenance.capacity() as u64)
             .saturating_add(vector_bytes(&artifact.inner.measurements))
     });
@@ -1056,16 +1070,13 @@ fn candidate_pipeline_reserve<D: DomainDefinition>(
 
 fn opportunity_features<D: DomainDefinition>(
     domain: &D,
-    parent: &D::Artifact,
+    parent: StructuralSummary,
     candidate: &D::Artifact,
-    operator_symbol: &str,
+    operator_bucket: usize,
     epoch: u64,
 ) -> Features {
-    let parent_nodes =
-        f32::from(u16::try_from(domain.structure().view(parent).node_count()).unwrap_or(u16::MAX));
-    let candidate_nodes = f32::from(
-        u16::try_from(domain.structure().view(candidate).node_count()).unwrap_or(u16::MAX),
-    );
+    let parent_nodes = parent.node_count;
+    let candidate_nodes = structural_node_count(domain, candidate);
     let reduction = ((parent_nodes - candidate_nodes) / parent_nodes.max(1.0)).clamp(-1.0, 1.0);
     let mut values = [0.0; crate::learning::FEATURE_COUNT];
     values[0] = 1.0;
@@ -1073,13 +1084,20 @@ fn opportunity_features<D: DomainDefinition>(
     values[2] = (candidate_nodes / 1024.0).min(1.0);
     values[3] = reduction;
     values[4] = f32::from(u16::try_from(epoch).unwrap_or(u16::MAX)) / 1024.0;
-    let operator_digest = Sha256::digest(operator_symbol.as_bytes());
-    let bucket = 5 + usize::from(operator_digest[0] % 8);
-    values[bucket] = 1.0;
-    values[13] = reduction * values[bucket];
+    values[operator_bucket] = 1.0;
+    values[13] = reduction * values[operator_bucket];
     values[14] = f32::from(candidate_nodes > parent_nodes);
     values[15] = (candidate_nodes / parent_nodes.max(1.0)).min(4.0) / 4.0;
     Features(values)
+}
+
+fn structural_node_count<D: DomainDefinition>(domain: &D, artifact: &D::Artifact) -> f32 {
+    f32::from(u16::try_from(domain.structure().view(artifact).node_count()).unwrap_or(u16::MAX))
+}
+
+fn operator_feature_bucket(operator_symbol: &str) -> usize {
+    let operator_digest = Sha256::digest(operator_symbol.as_bytes());
+    5 + usize::from(operator_digest[0] % 8)
 }
 
 fn append_derived_candidates<D: DomainDefinition>(
@@ -1167,13 +1185,22 @@ fn append_derived_candidates<D: DomainDefinition>(
         }
         let symbol = std::str::from_utf8(derived.symbol())
             .expect("canonical Derived Operator symbols are UTF-8");
+        let operator_bucket = operator_feature_bucket(symbol);
         emitted = emitted.saturating_add(current.len());
         for candidate in current {
             let parent = parents
                 .get(candidate.source_index)
                 .ok_or(SessionError::CorruptBundle)?;
             output.push(ProposedCandidate {
-                features: opportunity_features(domain, parent, &candidate.artifact, symbol, epoch),
+                features: opportunity_features(
+                    domain,
+                    StructuralSummary {
+                        node_count: structural_node_count(domain, parent),
+                    },
+                    &candidate.artifact,
+                    operator_bucket,
+                    epoch,
+                ),
                 candidate,
                 operator_symbol: derived.symbol().to_vec(),
                 epoch,
@@ -1188,6 +1215,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
     goals: &GoalEvaluator<'_, D>,
     frontier: &[(VerifiedArtifact<D>, usize)],
     model: Option<&FtrlModel>,
+    limit: usize,
     candidates: &mut Vec<ProposedCandidate<D>>,
 ) {
     if model.is_none() {
@@ -1205,20 +1233,22 @@ fn order_by_learned_potential<D: DomainDefinition>(
                     })
             })
         };
-        derived.sort_by(compare);
-        ordinary.sort_by(compare);
+        sort_prefix_by(&mut derived, limit, compare);
+        sort_prefix_by(&mut ordinary, limit, compare);
         let mut derived = derived.into_iter();
         let mut ordinary = ordinary.into_iter();
         loop {
             let before = candidates.len();
             candidates.extend(derived.by_ref().take(2));
             candidates.extend(ordinary.by_ref().take(6));
-            if candidates.len() == before {
+            if candidates.len() == before || candidates.len() >= limit {
                 break;
             }
         }
+        candidates.truncate(limit);
         return;
     }
+    let model = model.expect("the learned ordering branch requires a Model Revision");
     let mut derived_exploration = Vec::new();
     let mut ranked = Vec::new();
     let mut exploration = Vec::new();
@@ -1228,27 +1258,32 @@ fn order_by_learned_potential<D: DomainDefinition>(
         } else if index.is_multiple_of(8) {
             exploration.push(candidate);
         } else {
-            let forecast = model.map(|model| model.forecast(candidate.features));
-            ranked.push((candidate, forecast));
+            ranked.push(candidate);
         }
     }
-    ranked.sort_by(|(left, left_forecast), (right, right_forecast)| {
-        left_forecast
-            .zip(*right_forecast)
-            .map_or(Ordering::Equal, |(left, right)| {
-                compare_forecasts(left, right)
-            })
-            .then_with(|| goals.compare_parents(frontier, left, right))
-            .then_with(|| {
-                left.operator_symbol
-                    .cmp(&right.operator_symbol)
-                    .then_with(|| {
-                        left.candidate
-                            .source_index
-                            .cmp(&right.candidate.source_index)
-                    })
-            })
-    });
+    let ranked_features = ranked
+        .iter()
+        .map(|candidate| candidate.features)
+        .collect::<Vec<_>>();
+    let mut forecasts = Vec::with_capacity(ranked_features.len());
+    model.forecast_batch(&ranked_features, &mut forecasts);
+    let mut ranked = ranked.into_iter().zip(forecasts).collect::<Vec<_>>();
+    let compare =
+        |(left, left_forecast): &(ProposedCandidate<D>, PotentialForecast),
+         (right, right_forecast): &(ProposedCandidate<D>, PotentialForecast)| {
+            compare_forecasts(*left_forecast, *right_forecast)
+                .then_with(|| goals.compare_parents(frontier, left, right))
+                .then_with(|| {
+                    left.operator_symbol
+                        .cmp(&right.operator_symbol)
+                        .then_with(|| {
+                            left.candidate
+                                .source_index
+                                .cmp(&right.candidate.source_index)
+                        })
+                })
+        };
+    sort_prefix_by(&mut ranked, limit, compare);
     let mut ranked = ranked.into_iter().map(|(candidate, _)| candidate);
     let mut exploration = exploration.into_iter();
     let mut derived_exploration = derived_exploration.into_iter();
@@ -1259,9 +1294,26 @@ fn order_by_learned_potential<D: DomainDefinition>(
             candidates.push(candidate);
         }
         candidates.extend(ranked.by_ref().take(5));
-        if candidates.len() == before {
+        if candidates.len() == before || candidates.len() >= limit {
             break;
         }
+    }
+    candidates.truncate(limit);
+}
+
+fn sort_prefix_by<T>(
+    values: &mut Vec<T>,
+    limit: usize,
+    mut compare: impl FnMut(&T, &T) -> Ordering,
+) {
+    if limit == 0 {
+        values.clear();
+    } else if values.len() <= limit {
+        values.sort_unstable_by(compare);
+    } else {
+        let (prefix, _, _) = values.select_nth_unstable_by(limit, &mut compare);
+        prefix.sort_unstable_by(compare);
+        values.truncate(limit);
     }
 }
 
@@ -1415,6 +1467,13 @@ fn materialize<D: DomainDefinition>(
                 .encode_canonical(&stored.artifact, &mut canonical, &mut structure_scratch)
                 .map_err(SessionError::Domain)?;
             let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
+            let mut encoded_claim = Vec::new();
+            domain
+                .kernel()
+                .encode_claim(&stored.verification.claim, &mut encoded_claim)
+                .map_err(SessionError::Domain)?;
+            let claim_digest = Sha256::digest(&encoded_claim).into();
+            let claim_canonical = encoded_claim.into_boxed_slice();
             let dynamic_resident_bytes = domain
                 .structure()
                 .view(&stored.artifact)
@@ -1422,6 +1481,8 @@ fn materialize<D: DomainDefinition>(
             Ok(VerifiedArtifact {
                 inner: Arc::new(VerifiedArtifactRecord {
                     key,
+                    claim_digest,
+                    claim_canonical,
                     artifact: stored.artifact,
                     verification: stored.verification,
                     origin_key: stored.origin_key.unwrap_or(key),
@@ -1550,14 +1611,27 @@ where
     D: DomainDefinition,
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
 {
+    let index_bytes = (previous.len() as u64)
+        .saturating_add(current.len() as u64)
+        .saturating_mul(128);
+    if !resource_meter
+        .reserve(ResidentReservation::live(resident_state).with_transient(index_bytes))
+    {
+        return DeltaDelivery::ResourceExhausted;
+    }
+    let previous_keys = previous.iter().copied().collect::<HashSet<_>>();
+    let current_keys = current
+        .iter()
+        .map(VerifiedArtifact::key)
+        .collect::<HashSet<_>>();
     let added = current
         .iter()
-        .filter(|artifact| !previous.contains(&artifact.key()))
+        .filter(|artifact| !previous_keys.contains(&artifact.key()))
         .cloned()
         .collect::<Vec<_>>();
     let removed = previous
         .iter()
-        .filter(|key| !current.iter().any(|artifact| artifact.key() == **key))
+        .filter(|key| !current_keys.contains(key))
         .copied()
         .collect::<Vec<_>>();
     if added.is_empty() && removed.is_empty() {
@@ -1565,7 +1639,8 @@ where
     }
     let export_bytes = vector_bytes(&added)
         .saturating_add(vector_bytes(&removed))
-        .saturating_add(std::mem::size_of_val(affected_goals) as u64);
+        .saturating_add(std::mem::size_of_val(affected_goals) as u64)
+        .saturating_add(index_bytes);
     if !resource_meter
         .reserve(ResidentReservation::live(resident_state).with_transient(export_bytes))
     {
@@ -1819,9 +1894,11 @@ fn decode_bundle<D: DomainDefinition>(
             ) != attempt_id
             || opportunity_features(
                 domain,
-                &recovered[parent_index].artifact,
+                StructuralSummary {
+                    node_count: structural_node_count(domain, &recovered[parent_index].artifact),
+                },
                 &candidate_artifact,
-                operator,
+                operator_feature_bucket(operator),
                 epoch,
             ) != features
         {
@@ -2672,3 +2749,25 @@ fn test_fault_point(phase: &str) {
 #[cfg(not(debug_assertions))]
 #[inline(always)]
 fn test_fault_point(_: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_prefix_by;
+
+    #[test]
+    fn bounded_selection_matches_the_complete_total_order_prefix() {
+        for length in 0..257_usize {
+            let values = (0..length)
+                .map(|index| (index * 73 + 11) % 263)
+                .collect::<Vec<_>>();
+            for limit in [0, 1, 3, 8, 31, 128, 512] {
+                let mut expected = values.clone();
+                expected.sort_unstable();
+                expected.truncate(limit);
+                let mut actual = values.clone();
+                sort_prefix_by(&mut actual, limit, Ord::cmp);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+}

@@ -136,6 +136,8 @@ impl ArtifactKey {
 
 pub(crate) struct VerifiedArtifactRecord<D: DomainDefinition> {
     pub key: ArtifactKey,
+    pub claim_digest: [u8; 32],
+    pub claim_canonical: Box<[u8]>,
     pub artifact: D::Artifact,
     pub verification: VerificationRecord<D>,
     pub origin_key: ArtifactKey,
