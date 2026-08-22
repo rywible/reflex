@@ -21,7 +21,7 @@ use crate::harness::{
     require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v1";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v2";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -49,6 +49,14 @@ struct DevelopmentCorpus {
     training: usize,
     heldout: usize,
     heldout_seed_nodes: HashMap<String, usize>,
+    selected_artifacts: Vec<SelectedArtifact>,
+}
+
+#[derive(Serialize)]
+struct SelectedArtifact {
+    role: &'static str,
+    declaration: String,
+    proof_nodes: usize,
 }
 
 #[derive(Serialize)]
@@ -78,6 +86,7 @@ struct Report {
     status: &'static str,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
     bootstrap: TreatmentResult,
@@ -93,6 +102,7 @@ struct ReportInputs {
     host_isolation: HostIsolation,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
     bootstrap: TreatmentResult,
@@ -196,7 +206,7 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     let training_bundle = arguments.work.join("training.bundle");
     let full_bundle = arguments.work.join("full.bundle");
     let bootstrap_bundle = arguments.work.join("bootstrap.bundle");
-    let training_outcome = improve(
+    let training_usage = finish_training(improve(
         LeanDomain::new(prepared.config.clone(), prepared.corpus.clone())?,
         request(
             LeanSeedScope {
@@ -209,46 +219,43 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
             },
         )?,
         |_| ControlFlow::Continue(()),
-    )?;
-    let training_usage = usage(training_outcome.usage());
-    let full_outcome = improve(
-        LeanDomain::new(prepared.config.clone(), prepared.corpus.clone())?,
-        request(
-            LeanSeedScope {
-                start: prepared.training,
-                count: prepared.heldout,
-            },
-            arguments.verification_requests,
-            BundlePlan::Resume {
-                source: training_bundle,
-                target: full_bundle.clone(),
-            },
-        )?,
-        |_| ControlFlow::Continue(()),
-    )?;
-    let bootstrap_outcome = improve(
-        LeanDomain::new(prepared.config, prepared.corpus)?,
-        request(
-            LeanSeedScope {
-                start: prepared.training,
-                count: prepared.heldout,
-            },
-            arguments.verification_requests,
-            BundlePlan::Fresh {
-                target: bootstrap_bundle.clone(),
-            },
-        )?,
-        |_| ControlFlow::Continue(()),
-    )?;
-    let full = treatment(
+    )?);
+    let full = finish_treatment(
         "full",
-        &full_outcome,
+        improve(
+            LeanDomain::new(prepared.config.clone(), prepared.corpus.clone())?,
+            request(
+                LeanSeedScope {
+                    start: prepared.training,
+                    count: prepared.heldout,
+                },
+                arguments.verification_requests,
+                BundlePlan::Resume {
+                    source: training_bundle,
+                    target: full_bundle.clone(),
+                },
+            )?,
+            |_| ControlFlow::Continue(()),
+        )?,
         &prepared.heldout_seed_nodes,
         &full_bundle,
     )?;
-    let bootstrap = treatment(
+    let bootstrap = finish_treatment(
         "bootstrap",
-        &bootstrap_outcome,
+        improve(
+            LeanDomain::new(prepared.config, prepared.corpus)?,
+            request(
+                LeanSeedScope {
+                    start: prepared.training,
+                    count: prepared.heldout,
+                },
+                arguments.verification_requests,
+                BundlePlan::Fresh {
+                    target: bootstrap_bundle.clone(),
+                },
+            )?,
+            |_| ControlFlow::Continue(()),
+        )?,
         &prepared.heldout_seed_nodes,
         &bootstrap_bundle,
     )?;
@@ -259,6 +266,7 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
             host_isolation: isolation,
             training_artifacts: prepared.training,
             heldout_artifacts: prepared.heldout,
+            selected_artifacts: prepared.selected_artifacts,
             training_usage,
             full,
             bootstrap,
@@ -272,6 +280,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         host_isolation,
         training_artifacts,
         heldout_artifacts,
+        selected_artifacts,
         training_usage,
         full,
         bootstrap,
@@ -292,6 +301,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         status: "development-only; no 2026 exposure",
         training_artifacts,
         heldout_artifacts,
+        selected_artifacts,
         training_usage,
         full,
         bootstrap,
@@ -380,12 +390,27 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
             )
         })
         .collect();
+    let selected_artifacts = corpus
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| SelectedArtifact {
+            role: if index < training_count {
+                "training"
+            } else {
+                "heldout"
+            },
+            declaration: entry.name.to_string(),
+            proof_nodes: entry.artifact.proof_term.node_count(),
+        })
+        .collect();
     Ok(DevelopmentCorpus {
         config,
         corpus,
         training: training_count,
         heldout: heldout_count,
         heldout_seed_nodes,
+        selected_artifacts,
     })
 }
 
@@ -466,9 +491,15 @@ fn require_supervising_parent() -> Result<(), AnyError> {
     Ok(())
 }
 
-fn treatment(
+fn finish_training(outcome: reflex::SessionOutcome<LeanDomain>) -> Usage {
+    let summary = usage(outcome.usage());
+    drop(outcome);
+    summary
+}
+
+fn finish_treatment(
     name: &'static str,
-    outcome: &reflex::SessionOutcome<LeanDomain>,
+    outcome: reflex::SessionOutcome<LeanDomain>,
     seed_nodes: &HashMap<String, usize>,
     bundle: &Path,
 ) -> Result<TreatmentResult, AnyError> {
@@ -483,7 +514,7 @@ fn treatment(
                 .map(|seed| (*seed, artifact.artifact().proof_term.node_count()))
         })
         .collect::<Vec<_>>();
-    Ok(TreatmentResult {
+    let summary = TreatmentResult {
         treatment: name,
         completion: format!("{:?}", outcome.completion()),
         heldout_pareto_artifacts: heldout.len(),
@@ -497,7 +528,9 @@ fn treatment(
             .sum(),
         usage: usage(outcome.usage()),
         bundle_sha256: hash_file(bundle)?,
-    })
+    };
+    drop(outcome);
+    Ok(summary)
 }
 
 fn usage(usage: ResourceUsage) -> Usage {
