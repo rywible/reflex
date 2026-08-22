@@ -5,7 +5,9 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reflex::internal_experiments::compare_candidate_features;
+use reflex::internal_experiments::{
+    ExperienceVerdictInspection, compare_candidate_features, inspect_experience_segment,
+};
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, ParetoUpdate, Preference, ResourceEnvelope, ResourceUsage, improve,
@@ -1238,31 +1240,24 @@ fn learning_summary(bundle: &Path) -> Result<LearningSummary, AnyError> {
     learning_header(learning)
 }
 
-fn experience_summary(mut experience: &[u8]) -> Result<ExperienceSummary, AnyError> {
-    let entries = read_summary_u64(&mut experience)?;
+fn experience_summary(experience: &[u8]) -> Result<ExperienceSummary, AnyError> {
+    let experience = inspect_experience_segment(experience)
+        .map_err(|_| "Lean Bundle has malformed Experience framing")?;
+    let entries = u64::try_from(experience.attempts.len())?;
     let mut verdicts = [0_u64; 3];
     let mut claims = HashSet::new();
     let mut accepted_claims = HashSet::new();
-    for _ in 0..entries {
-        take_summary(&mut experience, 32 * 2)?;
-        let claim: [u8; 32] = take_summary(&mut experience, 32)?.try_into()?;
-        claims.insert(claim);
-        take_summary(&mut experience, 32 * 2)?;
-        take_summary_sized(&mut experience)?;
-        let verdict = take_summary(&mut experience, 1)?[0];
-        let Some(index) = verdict
-            .checked_sub(1)
-            .map(usize::from)
-            .filter(|index| *index < 3)
-        else {
-            return Err("Lean Bundle has an invalid Experience verdict".into());
+    for attempt in experience.attempts {
+        claims.insert(attempt.claim_digest);
+        let index = match attempt.verdict {
+            ExperienceVerdictInspection::Accepted => 0,
+            ExperienceVerdictInspection::Refuted => 1,
+            ExperienceVerdictInspection::Unknown => 2,
         };
         verdicts[index] = verdicts[index].saturating_add(1);
-        if verdict == 1 {
-            accepted_claims.insert(claim);
+        if attempt.verdict == ExperienceVerdictInspection::Accepted {
+            accepted_claims.insert(attempt.claim_digest);
         }
-        take_summary_sized(&mut experience)?;
-        take_summary(&mut experience, 16 * 4 + 4 + 8)?;
     }
     Ok(ExperienceSummary {
         entries,
@@ -1452,25 +1447,8 @@ mod tests {
     }
 
     #[test]
-    fn experience_summary_counts_all_three_verdicts_and_rejects_invalid_values() {
-        let encoded = |verdicts: &[u8]| {
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&(verdicts.len() as u64).to_le_bytes());
-            for verdict in verdicts {
-                bytes.extend_from_slice(&[0; 32 * 5]);
-                bytes.extend_from_slice(&0_u64.to_le_bytes());
-                bytes.push(*verdict);
-                bytes.extend_from_slice(&0_u64.to_le_bytes());
-                bytes.extend_from_slice(&[0; 16 * 4 + 4 + 8]);
-            }
-            bytes
-        };
-        let summary = experience_summary(&encoded(&[1, 2, 2, 3])).unwrap();
-        assert_eq!(summary.entries, 4);
-        assert_eq!(summary.claims, 1);
-        assert_eq!(summary.accepted_claims, 1);
-        assert_eq!(summary.verdicts, [1, 2, 1]);
-        assert!(experience_summary(&encoded(&[0])).is_err());
-        assert!(experience_summary(&encoded(&[4])).is_err());
+    fn experience_summary_rejects_malformed_framing() {
+        assert!(experience_summary(&[]).is_err());
+        assert!(experience_summary(&0_u64.to_le_bytes()).is_err());
     }
 }

@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Duration;
 
+use reflex::internal_experiments::{ExperienceVerdictInspection, inspect_experience_segment};
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, improve,
@@ -220,7 +221,7 @@ fn snapshot(path: &Path) -> Snapshot {
     let bundle = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
     let artifacts = bundle.segment(SegmentKind::Artifacts);
     let revisions = bundle.segment(SegmentKind::Revisions);
-    let experience = bundle.segment(SegmentKind::Experience);
+    let experience = inspect_experience_segment(bundle.segment(SegmentKind::Experience)).unwrap();
     let artifact_count =
         usize::try_from(u64::from_le_bytes(artifacts[..8].try_into().unwrap())).unwrap();
     let knowledge_length =
@@ -257,25 +258,20 @@ fn snapshot(path: &Path) -> Snapshot {
         });
     }
 
-    let mut input = experience;
-    let count = usize::try_from(read_u64(&mut input)).unwrap();
-    let mut attempts = Vec::with_capacity(count);
-    for _ in 0..count {
-        input = &input[160..];
-        let canonical_length = usize::try_from(read_u64(&mut input)).unwrap();
-        let canonical = take(&mut input, canonical_length).to_vec();
-        let nodes = u32::from_le_bytes(canonical[..4].try_into().unwrap());
-        let accepted = take(&mut input, 1)[0] == 1;
-        let operator_length = usize::try_from(read_u64(&mut input)).unwrap();
-        let operator = take(&mut input, operator_length).to_vec();
-        input = &input[8 * 4 + 24 * 4 + 4 + 8..];
-        attempts.push(Attempt {
-            canonical,
-            operator,
-            nodes,
-            accepted,
-        });
-    }
+    let attempts = experience
+        .attempts
+        .into_iter()
+        .map(|attempt| {
+            let canonical = attempt.canonical_candidate;
+            let nodes = u32::from_le_bytes(canonical[..4].try_into().unwrap());
+            Attempt {
+                canonical,
+                operator: attempt.operator_symbol,
+                nodes,
+                accepted: attempt.verdict == ExperienceVerdictInspection::Accepted,
+            }
+        })
+        .collect();
     Snapshot {
         artifact_count,
         knowledge_generation,

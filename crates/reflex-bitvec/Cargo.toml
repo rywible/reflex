@@ -13,5 +13,6 @@ reflex = { path = "../reflex" }
 workspace = true
 
 [dev-dependencies]
+reflex = { path = "../reflex", features = ["internal-experiments"] }
 reflex-bundle = { path = "../reflex-bundle" }
 sha2 = { version = "0.11", default-features = false }

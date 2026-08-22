@@ -38,10 +38,7 @@ mod scheduler;
 
 use bundle::RestartBundleCodec;
 use epoch::EpochTransition;
-use experience::{
-    EncodedMeasurement, ExperienceEntry, ExperienceLedger, ExperienceVerdict,
-    MeasurementObservation,
-};
+use experience::{ExperienceEntry, ExperienceLedger, ExperienceVerdict};
 use goals::GoalEvaluator;
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
@@ -189,6 +186,57 @@ where
             requirements,
         )
     })
+}
+
+#[cfg(feature = "internal-experiments")]
+pub(crate) fn inspect_experience_segment(
+    bytes: &[u8],
+) -> Result<crate::internal_experiments::ExperienceInspection, ()> {
+    let ledger = ExperienceLedger::decode(bytes)?;
+    Ok(crate::internal_experiments::ExperienceInspection {
+        attempts: ledger
+            .entries()
+            .iter()
+            .map(
+                |entry| crate::internal_experiments::ExperienceAttemptInspection {
+                    claim_digest: entry.claim_digest,
+                    canonical_candidate: entry.canonical_candidate.clone(),
+                    operator_symbol: entry.operator_symbol.clone(),
+                    verdict: match entry.verdict {
+                        ExperienceVerdict::Accepted => {
+                            crate::internal_experiments::ExperienceVerdictInspection::Accepted
+                        }
+                        ExperienceVerdict::Refuted => {
+                            crate::internal_experiments::ExperienceVerdictInspection::Refuted
+                        }
+                        ExperienceVerdict::Unknown => {
+                            crate::internal_experiments::ExperienceVerdictInspection::Unknown
+                        }
+                    },
+                    verification_requests: entry.verification_requests,
+                    epoch: entry.epoch,
+                },
+            )
+            .collect(),
+        consequence_count: ledger.consequences().len(),
+        measurements: ledger
+            .measurements()
+            .iter()
+            .map(
+                |measurement| crate::internal_experiments::ExperienceMeasurementInspection {
+                    environment: measurement.environment.clone(),
+                    value_count: measurement.values.len(),
+                },
+            )
+            .collect(),
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+pub(crate) fn force_first_experience_accepted(bytes: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut ledger = ExperienceLedger::decode(bytes)?;
+    ledger.force_first_accepted_for_test()?;
+    Ok(ledger.encode())
 }
 
 #[cfg(feature = "internal-experiments")]
@@ -2336,39 +2384,19 @@ fn decode_bundle<D: DomainDefinition>(
     if !recovery.is_empty() {
         return Err(SessionError::CorruptBundle);
     }
-    let mut encoded_experience = decoded.segment(SegmentKind::Experience);
-    let experience_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
-        .map_err(|_| SessionError::CorruptBundle)?;
-    if experience_count > encoded_experience.len().saturating_div(213) {
-        return Err(SessionError::CorruptBundle);
-    }
-    let mut experience = Vec::with_capacity(experience_count);
-    for _ in 0..experience_count {
-        let attempt_id: [u8; 32] = take_bundle(&mut encoded_experience, 32)?
-            .try_into()
-            .expect("exactly 32 Experience attempt ID bytes were taken");
-        let candidate_key = read_artifact_key(&mut encoded_experience)?;
-        let claim_digest: [u8; 32] = take_bundle(&mut encoded_experience, 32)?
-            .try_into()
-            .expect("exactly 32 Experience claim digest bytes were taken");
-        let origin_key = read_artifact_key(&mut encoded_experience)?;
-        let parent_key = read_artifact_key(&mut encoded_experience)?;
-        let canonical_candidate = take_sized(&mut encoded_experience)?.to_vec();
-        if ArtifactKey(stable_digest(identity.as_str(), &canonical_candidate)) != candidate_key {
+    let ledger = ExperienceLedger::decode(decoded.segment(SegmentKind::Experience))
+        .map_err(|()| SessionError::CorruptBundle)?;
+    for (entry_index, entry) in ledger.entries().iter().enumerate() {
+        if ArtifactKey(stable_digest(identity.as_str(), &entry.canonical_candidate))
+            != entry.candidate_key
+        {
             return Err(SessionError::CorruptBundle);
         }
         let candidate_artifact = domain
             .structure()
-            .decode_canonical(&canonical_candidate, &mut structure_scratch)
+            .decode_canonical(&entry.canonical_candidate, &mut structure_scratch)
             .map_err(|_| SessionError::CorruptBundle)?;
-        let verdict = match take_bundle(&mut encoded_experience, 1)?[0] {
-            1 => ExperienceVerdict::Accepted,
-            2 => ExperienceVerdict::Refuted,
-            3 => ExperienceVerdict::Unknown,
-            _ => return Err(SessionError::CorruptBundle),
-        };
-        let operator_symbol = take_sized(&mut encoded_experience)?.to_vec();
-        let operator = std::str::from_utf8(&operator_symbol)
+        let operator = std::str::from_utf8(&entry.operator_symbol)
             .ok()
             .filter(|operator| !operator.is_empty())
             .ok_or(SessionError::CorruptBundle)?;
@@ -2379,27 +2407,15 @@ fn decode_bundle<D: DomainDefinition>(
             .any(|descriptor| descriptor.symbol().as_str() == operator)
             && knowledge
                 .pinned_revision()
-                .resolve_operator(&operator_symbol)
+                .resolve_operator(&entry.operator_symbol)
                 .is_none()
         {
             return Err(SessionError::CorruptBundle);
         }
-        let mut proposal_values = [0.0; crate::domain::PROPOSAL_FEATURE_COUNT];
-        for value in &mut proposal_values {
-            *value = f32::from_bits(u32::from_le_bytes(
-                take_bundle(&mut encoded_experience, 4)?
-                    .try_into()
-                    .expect("exactly four proposal-feature bytes were taken"),
-            ));
-            if !value.is_finite() {
-                return Err(SessionError::CorruptBundle);
-            }
-        }
-        let proposal_features = ProposalFeatures::new(proposal_values);
-        let Some(origin_index) = recovered_index.get(&origin_key).copied() else {
+        let Some(origin_index) = recovered_index.get(&entry.origin_key).copied() else {
             return Err(SessionError::CorruptBundle);
         };
-        let Some(parent_index) = recovered_index.get(&parent_key).copied() else {
+        let Some(parent_index) = recovered_index.get(&entry.parent_key).copied() else {
             return Err(SessionError::CorruptBundle);
         };
         let origin = &recovered[origin_index];
@@ -2408,36 +2424,16 @@ fn decode_bundle<D: DomainDefinition>(
             .kernel()
             .encode_claim(&origin.verification.claim, &mut encoded_claim)
             .map_err(SessionError::Domain)?;
-        if <[u8; 32]>::from(Sha256::digest(encoded_claim)) != claim_digest {
-            return Err(SessionError::CorruptBundle);
-        }
-        let mut feature_values = [0.0; crate::learning::FEATURE_COUNT];
-        for value in &mut feature_values {
-            *value = f32::from_bits(u32::from_le_bytes(
-                take_bundle(&mut encoded_experience, 4)?
-                    .try_into()
-                    .expect("exactly four feature bytes were taken"),
-            ));
-            if !value.is_finite() {
-                return Err(SessionError::CorruptBundle);
-            }
-        }
-        let verification_requests = u32::from_le_bytes(
-            take_bundle(&mut encoded_experience, 4)?
-                .try_into()
-                .expect("exactly four verification-request bytes were taken"),
-        );
-        let epoch = read_bundle_u64(&mut encoded_experience)?;
-        let features = Features(feature_values);
-        if verification_requests != 1
+        if <[u8; 32]>::from(Sha256::digest(encoded_claim)) != entry.claim_digest
+            || entry.verification_requests != 1
             || attempt_digest(
-                candidate_key,
-                origin_key,
-                parent_key,
-                &operator_symbol,
-                epoch,
-                proposal_features,
-            ) != attempt_id
+                entry.candidate_key,
+                entry.origin_key,
+                entry.parent_key,
+                &entry.operator_symbol,
+                entry.epoch,
+                entry.proposal_features,
+            ) != entry.attempt_id
             || opportunity_features(
                 domain,
                 StructuralSummary {
@@ -2445,120 +2441,65 @@ fn decode_bundle<D: DomainDefinition>(
                 },
                 &candidate_artifact,
                 operator_feature_values(operator),
-                epoch,
-                proposal_features,
-            ) != features
-        {
-            return Err(SessionError::CorruptBundle);
-        }
-        let entry = ExperienceEntry {
-            attempt_id,
-            candidate_key,
-            claim_digest,
-            origin_key,
-            parent_key,
-            canonical_candidate,
-            verdict,
-            operator_symbol,
-            proposal_features,
-            features,
-            verification_requests,
-            epoch,
-        };
-        if experience
-            .iter()
-            .any(|known: &ExperienceEntry| known.attempt_id == entry.attempt_id)
-        {
-            return Err(SessionError::CorruptBundle);
-        }
-        experience.push(entry);
-    }
-    let consequence_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
-        .map_err(|_| SessionError::CorruptBundle)?;
-    if consequence_count > encoded_experience.len().saturating_div(33) {
-        return Err(SessionError::CorruptBundle);
-    }
-    let mut consequences = Vec::with_capacity(consequence_count);
-    for _ in 0..consequence_count {
-        let subject: [u8; 32] = take_bundle(&mut encoded_experience, 32)?
-            .try_into()
-            .expect("exactly 32 consequence-subject bytes were taken");
-        let kind = match take_bundle(&mut encoded_experience, 1)?[0] {
-            1 => ConsequenceKind::Admitted,
-            2 => ConsequenceKind::ParetoImprovement,
-            3 => ConsequenceKind::CrossGoalUse,
-            4 => ConsequenceKind::Compression,
-            _ => return Err(SessionError::CorruptBundle),
-        };
-        let consequence = ConsequenceObservation { subject, kind };
-        if !experience.iter().any(|entry| entry.attempt_id == subject)
-            || consequences.contains(&consequence)
-        {
-            return Err(SessionError::CorruptBundle);
-        }
-        consequences.push(consequence);
-    }
-    let measurement_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
-        .map_err(|_| SessionError::CorruptBundle)?;
-    if measurement_count > encoded_experience.len().saturating_div(48) {
-        return Err(SessionError::CorruptBundle);
-    }
-    let mut measurements = Vec::with_capacity(measurement_count);
-    for _ in 0..measurement_count {
-        let subject: [u8; 32] = take_bundle(&mut encoded_experience, 32)?
-            .try_into()
-            .expect("exactly 32 measurement-subject bytes were taken");
-        if !experience.iter().any(|entry| {
-            entry.attempt_id == subject && entry.verdict == ExperienceVerdict::Accepted
-        }) || measurements
-            .iter()
-            .any(|observation: &MeasurementObservation| observation.subject == subject)
-        {
-            return Err(SessionError::CorruptBundle);
-        }
-        let environment = take_sized(&mut encoded_experience)?.to_vec();
-        if environment.is_empty() || std::str::from_utf8(&environment).is_err() {
-            return Err(SessionError::CorruptBundle);
-        }
-        let value_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
-            .map_err(|_| SessionError::CorruptBundle)?;
-        if value_count == 0 || value_count > domain.measurements().schema().len() {
-            return Err(SessionError::CorruptBundle);
-        }
-        let mut values = Vec::with_capacity(value_count);
-        for _ in 0..value_count {
-            let metric_symbol = take_sized(&mut encoded_experience)?.to_vec();
-            let observation = take_sized(&mut encoded_experience)?.to_vec();
-            let Some(descriptor) = domain
-                .measurements()
-                .schema()
+                entry.epoch,
+                entry.proposal_features,
+            ) != entry.features
+            || ledger.entries()[..entry_index]
                 .iter()
-                .find(|descriptor| descriptor.symbol().as_str().as_bytes() == metric_symbol)
+                .any(|known| known.attempt_id == entry.attempt_id)
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+    }
+    for (consequence_index, consequence) in ledger.consequences().iter().enumerate() {
+        if !ledger
+            .entries()
+            .iter()
+            .any(|entry| entry.attempt_id == consequence.subject)
+            || ledger.consequences()[..consequence_index].contains(consequence)
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+    }
+    for (measurement_index, measurement) in ledger.measurements().iter().enumerate() {
+        if !ledger.entries().iter().any(|entry| {
+            entry.attempt_id == measurement.subject && entry.verdict == ExperienceVerdict::Accepted
+        }) || ledger.measurements()[..measurement_index]
+            .iter()
+            .any(|known| known.subject == measurement.subject)
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        if measurement.environment.is_empty()
+            || std::str::from_utf8(&measurement.environment).is_err()
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        if measurement.values.is_empty()
+            || measurement.values.len() > domain.measurements().schema().len()
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        for (value_index, value) in measurement.values.iter().enumerate() {
+            let Some(descriptor) =
+                domain.measurements().schema().iter().find(|descriptor| {
+                    descriptor.symbol().as_str().as_bytes() == value.metric_symbol
+                })
             else {
                 return Err(SessionError::CorruptBundle);
             };
-            if values
+            if measurement.values[..value_index]
                 .iter()
-                .any(|value: &EncodedMeasurement| value.metric_symbol == metric_symbol)
+                .any(|known| known.metric_symbol == value.metric_symbol)
                 || domain
                     .measurements()
-                    .decode_observation(descriptor.metric(), &observation)
+                    .decode_observation(descriptor.metric(), &value.observation)
                     .is_err()
             {
                 return Err(SessionError::CorruptBundle);
             }
-            values.push(EncodedMeasurement {
-                metric_symbol,
-                observation,
-            });
         }
-        measurements.push(MeasurementObservation {
-            subject,
-            environment,
-            values,
-        });
     }
-    let ledger = ExperienceLedger::from_parts(experience, consequences, measurements);
     let corpus_assignments = ledger
         .entries()
         .iter()
@@ -2575,8 +2516,7 @@ fn decode_bundle<D: DomainDefinition>(
         .map(|descriptor| descriptor.symbol().as_str().as_bytes().to_vec())
         .collect::<BTreeSet<_>>();
     let derivations = ledger.derivations(knowledge.pinned_revision(), &primitive_symbols)?;
-    if !encoded_experience.is_empty()
-        || !learning.corpus_is_valid(&corpus_assignments)
+    if !learning.corpus_is_valid(&corpus_assignments)
         || !knowledge.validate(&artifact_keys, &derivations, &primitive_symbols)
     {
         return Err(SessionError::CorruptBundle);
@@ -2918,14 +2858,6 @@ fn read_bundle_u64<E>(input: &mut &[u8]) -> Result<u64, SessionError<E>> {
     let bytes = take_bundle(input, 8)?;
     Ok(u64::from_le_bytes(
         bytes.try_into().expect("exactly eight bytes were taken"),
-    ))
-}
-
-fn read_artifact_key<E>(input: &mut &[u8]) -> Result<ArtifactKey, SessionError<E>> {
-    Ok(ArtifactKey(
-        take_bundle(input, 32)?
-            .try_into()
-            .expect("exactly 32 ArtifactKey bytes were taken"),
     ))
 }
 

@@ -2,6 +2,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
+use reflex::internal_experiments::{
+    ExperienceVerdictInspection, force_first_experience_accepted, inspect_experience_segment,
+};
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, SessionError, improve,
@@ -46,12 +49,8 @@ fn v3_bundle_segments_preserve_refuted_experience() {
     .unwrap();
     let bytes = std::fs::read(&bundle_path).unwrap();
     let decoded = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
-    let experience = decoded.segment(SegmentKind::Experience);
+    let experience = inspect_experience_segment(decoded.segment(SegmentKind::Experience)).unwrap();
     let segments = read_segments(&bytes);
-    let count = u64::from_le_bytes(experience[..8].try_into().unwrap());
-    let candidate_length =
-        usize::try_from(u64::from_le_bytes(experience[168..176].try_into().unwrap())).unwrap();
-    let verdict = experience[176 + candidate_length];
 
     assert!(
         &bytes[..8] == b"REFLEX\0\x03"
@@ -60,8 +59,8 @@ fn v3_bundle_segments_preserve_refuted_experience() {
                 .iter()
                 .map(|(_, version, _)| *version)
                 .eq([1, 4, 3, 3, 1])
-            && count == 1
-            && verdict == 2
+            && experience.attempts.len() == 1
+            && experience.attempts[0].verdict == ExperienceVerdictInspection::Refuted
             && outcome.usage().verification_requests == 2,
         "the canonical Experience segment retains an ordinary Refuted verdict"
     );
@@ -104,31 +103,18 @@ fn v3_experience_keeps_resource_admission_and_measurement_observations_separate(
 
     let bytes = std::fs::read(&bundle_path).unwrap();
     let decoded = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
-    let mut experience = decoded.segment(SegmentKind::Experience);
-    assert_eq!(read_u64(&mut experience), 1);
-    experience = &experience[160..];
-    let candidate_length = usize::try_from(read_u64(&mut experience)).unwrap();
-    experience = &experience[candidate_length..];
-    assert_eq!(experience[0], 1);
-    experience = &experience[1..];
-    let operator_length = usize::try_from(read_u64(&mut experience)).unwrap();
-    experience = &experience[operator_length + 8 * 4 + 24 * 4..];
-    let verification_requests = read_u32(&mut experience);
-    let _epoch = read_u64(&mut experience);
-    let consequence_count = usize::try_from(read_u64(&mut experience)).unwrap();
-    experience = &experience[consequence_count * 33..];
-    let measurement_count = read_u64(&mut experience);
-    experience = &experience[32..];
-    let environment_length = usize::try_from(read_u64(&mut experience)).unwrap();
-    experience = &experience[environment_length..];
-    let value_count = read_u64(&mut experience);
+    let experience = inspect_experience_segment(decoded.segment(SegmentKind::Experience)).unwrap();
+    assert_eq!(experience.attempts.len(), 1);
+    let attempt = &experience.attempts[0];
+    assert_eq!(attempt.verdict, ExperienceVerdictInspection::Accepted);
+    let measurement = &experience.measurements[0];
 
     assert!(
-        verification_requests == 1
-            && consequence_count >= 3
-            && measurement_count == 1
-            && environment_length > 0
-            && value_count == 6,
+        attempt.verification_requests == 1
+            && experience.consequence_count >= 3
+            && experience.measurements.len() == 1
+            && !measurement.environment.is_empty()
+            && measurement.value_count == 6,
         "the immutable attempt, delayed consequences, and encoded Measurements remain distinct records"
     );
     std::fs::remove_file(bundle_path).ok();
@@ -272,10 +258,8 @@ fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches(
     ));
 
     let mut false_verdict = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
-    let mut experience = false_verdict.segment(SegmentKind::Experience).to_vec();
-    let candidate_length =
-        usize::try_from(u64::from_le_bytes(experience[168..176].try_into().unwrap())).unwrap();
-    experience[176 + candidate_length] = 1;
+    let experience =
+        force_first_experience_accepted(false_verdict.segment(SegmentKind::Experience)).unwrap();
     false_verdict.replace_segment(SegmentKind::Experience, experience);
     std::fs::write(&bundle_path, false_verdict.encode()).unwrap();
     assert!(matches!(

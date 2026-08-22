@@ -9,6 +9,71 @@ use std::time::Duration;
 
 use crate::{DomainDefinition, ImprovementRequest, SessionError};
 
+/// Test-facing projection decoded through the production Experience codec.
+#[derive(Clone, Debug)]
+pub struct ExperienceInspection {
+    pub attempts: Vec<ExperienceAttemptInspection>,
+    pub consequence_count: usize,
+    pub measurements: Vec<ExperienceMeasurementInspection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExperienceAttemptInspection {
+    pub claim_digest: [u8; 32],
+    pub canonical_candidate: Vec<u8>,
+    pub operator_symbol: Vec<u8>,
+    pub verdict: ExperienceVerdictInspection,
+    pub verification_requests: u32,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExperienceVerdictInspection {
+    Accepted,
+    Refuted,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExperienceInspectionError;
+
+impl std::fmt::Display for ExperienceInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("malformed Experience segment")
+    }
+}
+
+impl std::error::Error for ExperienceInspectionError {}
+
+#[derive(Clone, Debug)]
+pub struct ExperienceMeasurementInspection {
+    pub environment: Vec<u8>,
+    pub value_count: usize,
+}
+
+/// Decodes an Experience segment without duplicating its durable layout.
+///
+/// # Errors
+///
+/// Returns `Err(())` when the segment framing is malformed.
+pub fn inspect_experience_segment(
+    bytes: &[u8],
+) -> Result<ExperienceInspection, ExperienceInspectionError> {
+    crate::runtime::inspect_experience_segment(bytes).map_err(|()| ExperienceInspectionError)
+}
+
+/// Re-encodes an Experience segment after forcing its first verdict to Accepted.
+///
+/// This deliberately test-only mutation lets corruption tests exercise semantic
+/// replay checks without learning private byte offsets.
+///
+/// # Errors
+///
+/// Returns `Err(())` when the segment is malformed or contains no attempts.
+pub fn force_first_experience_accepted(bytes: &[u8]) -> Result<Vec<u8>, ExperienceInspectionError> {
+    crate::runtime::force_first_experience_accepted(bytes).map_err(|()| ExperienceInspectionError)
+}
+
 /// Paired fixed-Experience comparison of two equal-capacity Candidate feature families.
 #[derive(Clone, Debug)]
 pub struct CandidateFeatureComparison {

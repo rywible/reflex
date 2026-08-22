@@ -10,6 +10,22 @@ use crate::session::{ArtifactKey, SessionError, VerifiedArtifact};
 
 use super::{push_bytes, push_u64};
 
+const DIGEST_BYTES: usize = 32;
+const SIZED_LENGTH_BYTES: usize = 8;
+const FLOAT_BYTES: usize = 4;
+const VERDICT_BYTES: usize = 1;
+const VERIFICATION_REQUEST_BYTES: usize = 4;
+const EPOCH_BYTES: usize = 8;
+const FIXED_ENTRY_BYTES: usize = DIGEST_BYTES * 5
+    + SIZED_LENGTH_BYTES * 2
+    + VERDICT_BYTES
+    + crate::domain::PROPOSAL_FEATURE_COUNT * FLOAT_BYTES
+    + crate::learning::FEATURE_COUNT * FLOAT_BYTES
+    + VERIFICATION_REQUEST_BYTES
+    + EPOCH_BYTES;
+const FIXED_CONSEQUENCE_BYTES: usize = DIGEST_BYTES + 1;
+const MINIMUM_MEASUREMENT_BYTES: usize = DIGEST_BYTES + SIZED_LENGTH_BYTES * 2;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ExperienceVerdict {
     Accepted = 1,
@@ -95,6 +111,115 @@ impl ExperienceLedger {
 
     pub(super) fn consequences(&self) -> &[ConsequenceObservation] {
         &self.consequences
+    }
+
+    pub(super) fn measurements(&self) -> &[MeasurementObservation] {
+        &self.measurements
+    }
+
+    #[cfg(feature = "internal-experiments")]
+    pub(super) fn force_first_accepted_for_test(&mut self) -> Result<(), ()> {
+        self.entries.first_mut().ok_or(()).map(|entry| {
+            entry.verdict = ExperienceVerdict::Accepted;
+        })
+    }
+
+    /// Decodes the complete private Experience segment framing.
+    ///
+    /// Domain-dependent semantic validation deliberately remains with restart,
+    /// but no caller needs to know byte offsets or record widths.
+    pub(super) fn decode(mut input: &[u8]) -> Result<Self, ()> {
+        let entry_count = read_usize(&mut input)?;
+        if entry_count > input.len().saturating_div(FIXED_ENTRY_BYTES) {
+            return Err(());
+        }
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let attempt_id = read_digest(&mut input)?;
+            let candidate_key = ArtifactKey(read_digest(&mut input)?);
+            let claim_digest = read_digest(&mut input)?;
+            let origin_key = ArtifactKey(read_digest(&mut input)?);
+            let parent_key = ArtifactKey(read_digest(&mut input)?);
+            let canonical_candidate = read_sized(&mut input)?.to_vec();
+            let verdict = match take(&mut input, 1)?[0] {
+                1 => ExperienceVerdict::Accepted,
+                2 => ExperienceVerdict::Refuted,
+                3 => ExperienceVerdict::Unknown,
+                _ => return Err(()),
+            };
+            let operator_symbol = read_sized(&mut input)?.to_vec();
+            let mut proposal_values = [0.0; crate::domain::PROPOSAL_FEATURE_COUNT];
+            read_finite_features(&mut input, &mut proposal_values)?;
+            let mut feature_values = [0.0; crate::learning::FEATURE_COUNT];
+            read_finite_features(&mut input, &mut feature_values)?;
+            let verification_requests = u32::from_le_bytes(
+                take(&mut input, VERIFICATION_REQUEST_BYTES)?
+                    .try_into()
+                    .map_err(|_| ())?,
+            );
+            let epoch = read_u64(&mut input)?;
+            entries.push(ExperienceEntry {
+                attempt_id,
+                candidate_key,
+                claim_digest,
+                origin_key,
+                parent_key,
+                canonical_candidate,
+                verdict,
+                operator_symbol,
+                proposal_features: ProposalFeatures::new(proposal_values),
+                features: Features(feature_values),
+                verification_requests,
+                epoch,
+            });
+        }
+
+        let consequence_count = read_usize(&mut input)?;
+        if consequence_count > input.len().saturating_div(FIXED_CONSEQUENCE_BYTES) {
+            return Err(());
+        }
+        let mut consequences = Vec::with_capacity(consequence_count);
+        for _ in 0..consequence_count {
+            let subject = read_digest(&mut input)?;
+            let kind = match take(&mut input, 1)?[0] {
+                1 => ConsequenceKind::Admitted,
+                2 => ConsequenceKind::ParetoImprovement,
+                3 => ConsequenceKind::CrossGoalUse,
+                4 => ConsequenceKind::Compression,
+                _ => return Err(()),
+            };
+            consequences.push(ConsequenceObservation { subject, kind });
+        }
+
+        let measurement_count = read_usize(&mut input)?;
+        if measurement_count > input.len().saturating_div(MINIMUM_MEASUREMENT_BYTES) {
+            return Err(());
+        }
+        let mut measurements = Vec::with_capacity(measurement_count);
+        for _ in 0..measurement_count {
+            let subject = read_digest(&mut input)?;
+            let environment = read_sized(&mut input)?.to_vec();
+            let value_count = read_usize(&mut input)?;
+            if value_count > input.len().saturating_div(SIZED_LENGTH_BYTES * 2) {
+                return Err(());
+            }
+            let mut values = Vec::with_capacity(value_count);
+            for _ in 0..value_count {
+                values.push(EncodedMeasurement {
+                    metric_symbol: read_sized(&mut input)?.to_vec(),
+                    observation: read_sized(&mut input)?.to_vec(),
+                });
+            }
+            measurements.push(MeasurementObservation {
+                subject,
+                environment,
+                values,
+            });
+        }
+        if !input.is_empty() {
+            return Err(());
+        }
+        Ok(Self::from_parts(entries, consequences, measurements))
     }
 
     pub(super) fn admission_observations(
@@ -321,6 +446,106 @@ impl ExperienceLedger {
     }
 }
 
+fn read_finite_features<const N: usize>(
+    input: &mut &[u8],
+    output: &mut [f32; N],
+) -> Result<(), ()> {
+    for value in output {
+        *value = f32::from_bits(u32::from_le_bytes(
+            take(input, FLOAT_BYTES)?.try_into().map_err(|_| ())?,
+        ));
+        if !value.is_finite() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn read_digest(input: &mut &[u8]) -> Result<[u8; DIGEST_BYTES], ()> {
+    take(input, DIGEST_BYTES)?.try_into().map_err(|_| ())
+}
+
+fn read_sized<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], ()> {
+    let length = read_usize(input)?;
+    take(input, length)
+}
+
+fn read_usize(input: &mut &[u8]) -> Result<usize, ()> {
+    usize::try_from(read_u64(input)?).map_err(|_| ())
+}
+
+fn read_u64(input: &mut &[u8]) -> Result<u64, ()> {
+    Ok(u64::from_le_bytes(
+        take(input, SIZED_LENGTH_BYTES)?
+            .try_into()
+            .map_err(|_| ())?,
+    ))
+}
+
+fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], ()> {
+    if input.len() < count {
+        return Err(());
+    }
+    let (value, remainder) = input.split_at(count);
+    *input = remainder;
+    Ok(value)
+}
+
 fn vector_bytes<T>(values: &Vec<T>) -> u64 {
     (values.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn experience_codec_round_trips_every_verdict_and_rejects_bad_framing() {
+        let verdicts = [
+            ExperienceVerdict::Accepted,
+            ExperienceVerdict::Refuted,
+            ExperienceVerdict::Unknown,
+        ];
+        let entries = verdicts
+            .into_iter()
+            .enumerate()
+            .map(|(index, verdict)| {
+                let marker = u8::try_from(index + 1).unwrap();
+                ExperienceEntry {
+                    attempt_id: [marker; 32],
+                    candidate_key: ArtifactKey([marker; 32]),
+                    claim_digest: [marker; 32],
+                    origin_key: ArtifactKey([marker; 32]),
+                    parent_key: ArtifactKey([marker; 32]),
+                    canonical_candidate: vec![marker],
+                    verdict,
+                    operator_symbol: vec![marker],
+                    proposal_features: ProposalFeatures::default(),
+                    features: Features([0.0; crate::learning::FEATURE_COUNT]),
+                    verification_requests: 1,
+                    epoch: u64::try_from(index).unwrap(),
+                }
+            })
+            .collect();
+        let ledger = ExperienceLedger::from_parts(entries, Vec::new(), Vec::new());
+        let encoded = ledger.encode();
+        let decoded = ExperienceLedger::decode(&encoded).unwrap();
+        assert!(decoded.entries() == ledger.entries());
+        assert_eq!(decoded.encode(), encoded);
+        assert!(ExperienceLedger::decode(&encoded[..encoded.len() - 1]).is_err());
+
+        let mut bad_verdict = encoded;
+        let first_verdict = 8 + 32 * 5 + 8 + 1;
+        bad_verdict[first_verdict] = 0;
+        assert!(ExperienceLedger::decode(&bad_verdict).is_err());
+
+        let mut hostile_value_count = Vec::new();
+        push_u64(&mut hostile_value_count, 0);
+        push_u64(&mut hostile_value_count, 0);
+        push_u64(&mut hostile_value_count, 1);
+        hostile_value_count.extend_from_slice(&[0; DIGEST_BYTES]);
+        push_bytes(&mut hostile_value_count, b"environment");
+        push_u64(&mut hostile_value_count, u64::MAX);
+        assert!(ExperienceLedger::decode(&hostile_value_count).is_err());
+    }
 }
