@@ -858,6 +858,18 @@ Structural Measurements are exact. Elapsed performance is empirical and never pa
 
 The Semantic Identity includes bit width, arity, operator semantics, shift behavior, canonical encoding, and Verification Kernel revision.
 
+## Lean proof-optimization domain
+
+`reflex-lean` is the second production Domain Definition. It pins the final pre-2025 mathlib default-branch commit and its exact Lean compiler, imports only that environment at trust level zero, and keeps search, ranking, learning, persistence, and resource control in safe Rust. A persistent local Lean process owns only domain-native indexing and kernel Verification.
+
+A Lean Artifact is a replay-complete elaborated core declaration: declaration name and universe parameters, proposition, actual proof body, direct statement-and-proof dependencies, allowed axioms, and the complete environment and kernel-contract identity. Candidates retain the Seed declaration identity. Verification checks that both claims are well-formed, asks the official kernel for definitional equality between Candidate and Seed propositions, kernel-checks the proof, and rejects sorry, new axioms, unsafe or partial dependencies, unknown constants, and unknown universe parameters.
+
+The binary declaration catalog includes the type, dependency edges, declaration kind, and local eligibility of every declaration exposed by the imported environment. A declaration enters the eligible subgraph only when all transitive dependencies are present and eligible. The compact catalog is checksummed and environment-bound; normal restoration loads it into RAM rather than rescanning Mathlib.
+
+Lean structural views follow the Runtime's canonical post-order convention: every child precedes its parent and the root is last. Primitive Operators cover exact proof substitution, directed application and composition, local rewriting, common-subproof factoring, structural anti-unification transfer, eta abstraction, beta/zeta normalization, and syntactic instantiation of general theorems. Every result remains a Candidate until the Lean kernel accepts it.
+
+The worker's configured memory is a hard Linux address-space ceiling, not an estimate. Because resident memory cannot exceed that ceiling, the Runtime conservatively charges the ceiling to the Resource Envelope on success and failure. The fixed Development suite separately gates cold restore and clean replay at 60 seconds, warm first kernel-certified Proof Collapse at 1 second p50 and 5 seconds p95, and exact proof-node improvement on five historical cases. Development timing never constitutes Scientific Confirmation.
+
 ## First production vertical slice
 
 The first implementation slice is deliberately end to end:

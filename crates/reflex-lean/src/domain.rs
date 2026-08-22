@@ -3,33 +3,32 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use reflex::domain::{
-    ReplayVerdictWriter, StructuralSchema, SymbolId, VerificationReplayRequest,
-};
+use reflex::domain::{ReplayVerdictWriter, StructuralSchema, SymbolId, VerificationReplayRequest};
 use reflex::{
     ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
     ExternalVerificationUsage, Incomparable, KernelRevision, MeasurementDescriptor,
     MeasurementEnvironment, MeasurementSpace, MeasurementWriter, MetricOrdering, OperatorAlgebra,
     OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter,
-    SemanticIdentity, StructuralProtocol, StructuralView, Verdict,
-    VerdictWriter, VerificationBatch, VerificationBatchOutcome, VerificationBatchReport,
-    VerificationKernel, VerificationRecord, VerificationReplayBatch, VerificationWorkerRequirements,
-    VerifiedBatch,
+    SemanticIdentity, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
+    VerificationBatch, VerificationBatchOutcome, VerificationBatchReport, VerificationKernel,
+    VerificationRecord, VerificationReplayBatch, VerificationWorkerRequirements, VerifiedBatch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ast::{
-    LeanArtifact, LeanBinderInfo, LeanEnvironmentIdentity, LeanExpr, LeanLevel, LeanLiteral,
-    LeanName,
+    LeanArtifact, LeanBinderInfo, LeanDeclarationIdentity, LeanEnvironmentIdentity, LeanExpr,
+    LeanLevel, LeanLiteral, LeanName,
 };
 use crate::worker::{
     IndexPage, IndexedTheorem, LeanWorker, LeanWorkerConfig, VerificationItem, WorkerError,
     WorkerUsage,
 };
-use crate::{LEAN_COMMIT, LEAN_TOOLCHAIN, MATHLIB_COMMIT};
+use crate::{
+    ARTIFACT_FORMAT_VERSION, KERNEL_CONTRACT_VERSION, LEAN_COMMIT, LEAN_TOOLCHAIN, MATHLIB_COMMIT,
+};
 
-const KERNEL_REVISION: KernelRevision = KernelRevision(1);
+const KERNEL_REVISION: KernelRevision = KernelRevision(2);
 
 #[derive(Debug)]
 pub enum LeanError {
@@ -69,7 +68,6 @@ pub struct LeanCorpusEntry {
     pub name: LeanName,
     pub artifact: LeanArtifact,
     pub evidence: LeanEvidence,
-    pub dependencies: Vec<LeanName>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,7 +93,9 @@ impl LeanCorpus {
         let items = theorems
             .iter()
             .map(|theorem| VerificationItem {
-                proposition: theorem.proposition.clone(),
+                level_params: theorem.level_params.clone(),
+                claim_proposition: theorem.proposition.clone(),
+                candidate_proposition: theorem.proposition.clone(),
                 proof_term: theorem.proof_term.clone(),
                 allowed_axioms: theorem.axioms.clone(),
             })
@@ -104,11 +104,22 @@ impl LeanCorpus {
         let mut entries = Vec::with_capacity(theorems.len());
         for (theorem, result) in theorems.into_iter().zip(results) {
             if !result.accepted {
-                continue;
+                return Err(LeanError::InvalidStructure(format!(
+                    "indexed theorem {} did not replay: {}",
+                    theorem.name, result.diagnostic
+                )));
             }
             let artifact = artifact_from_index(&environment, &theorem);
+            let dependencies = normalized_names(result.dependencies);
+            if artifact.dependencies != dependencies {
+                return Err(LeanError::InvalidStructure(format!(
+                    "indexed theorem {} reported different dependencies on replay",
+                    theorem.name
+                )));
+            }
             let evidence = LeanEvidence {
                 artifact_digest: artifact_digest(&artifact)?,
+                dependencies,
                 axioms: result.axioms,
                 environment: environment.clone(),
             };
@@ -116,7 +127,6 @@ impl LeanCorpus {
                 name: theorem.name,
                 artifact,
                 evidence,
-                dependencies: theorem.dependencies,
             });
         }
         Ok(Self { entries })
@@ -133,8 +143,13 @@ fn artifact_from_index(
 ) -> LeanArtifact {
     LeanArtifact {
         environment: environment.clone(),
+        declaration: LeanDeclarationIdentity {
+            name: theorem.name.clone(),
+            level_params: theorem.level_params.clone(),
+        },
         proposition: theorem.proposition.clone(),
         proof_term: theorem.proof_term.clone(),
+        dependencies: normalized_names(theorem.dependencies.clone()),
         allowed_axioms: theorem.axioms.clone(),
     }
 }
@@ -145,13 +160,14 @@ pub enum LeanMetric {
     ProofNodes,
     ProofDepth,
     EncodedBytes,
-    AxiomCount,
+    AllowedAxiomCount,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeanClaim {
     environment: LeanEnvironmentIdentity,
+    declaration: LeanDeclarationIdentity,
     proposition: LeanExpr,
     allowed_axioms: Vec<LeanName>,
 }
@@ -160,6 +176,7 @@ pub struct LeanClaim {
 #[serde(rename_all = "camelCase")]
 pub struct LeanEvidence {
     artifact_digest: [u8; 32],
+    dependencies: Vec<LeanName>,
     axioms: Vec<LeanName>,
     environment: LeanEnvironmentIdentity,
 }
@@ -183,7 +200,7 @@ pub struct LeanDomain {
 impl LeanDomain {
     pub fn new(config: LeanWorkerConfig, corpus: LeanCorpus) -> Result<Self, LeanError> {
         config.validate()?;
-        let environment = pinned_environment_identity();
+        let environment = config.environment_identity()?;
         if corpus
             .entries()
             .iter()
@@ -197,7 +214,7 @@ impl LeanDomain {
             .map(|entry| entry.artifact.clone())
             .collect::<Vec<_>>();
         Ok(Self {
-            environment,
+            environment: environment.clone(),
             structure: LeanStructure::new(),
             seeds: LeanSeeds {
                 entries: Arc::new(corpus.entries),
@@ -205,6 +222,7 @@ impl LeanDomain {
             operators: LeanOperators::new(substitutions),
             kernel: LeanKernel {
                 config,
+                environment: environment.clone(),
                 worker: Mutex::new(None),
             },
             measurements: LeanMeasurements::new(),
@@ -226,10 +244,13 @@ impl DomainDefinition for LeanDomain {
 
     fn semantic_identity(&self) -> SemanticIdentity {
         SemanticIdentity::new(format!(
-            "reflex-lean-v1:mathlib={}:toolchain={}:lean={}",
+            "reflex-lean-v2:mathlib={}:toolchain={}:lean={}:artifact={}:kernel={}:worker={}",
             self.environment.mathlib_commit,
             self.environment.lean_toolchain,
-            self.environment.lean_commit
+            self.environment.lean_commit,
+            self.environment.artifact_format,
+            self.environment.kernel_contract,
+            self.environment.worker_source_sha256,
         ))
     }
 
@@ -312,6 +333,7 @@ impl LeanStructure {
 #[serde(rename_all = "camelCase")]
 struct NodeImmediate {
     environment: LeanEnvironmentIdentity,
+    declaration: LeanDeclarationIdentity,
     proposition: LeanExpr,
     allowed_axioms: Vec<LeanName>,
     auxiliary: NodeAuxiliary,
@@ -320,21 +342,43 @@ struct NodeImmediate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum NodeAuxiliary {
-    BoundVariable { index: usize },
-    Sort { level: LeanLevel },
-    Constant { name: LeanName, levels: Vec<LeanLevel> },
+    BoundVariable {
+        index: usize,
+    },
+    Sort {
+        level: LeanLevel,
+    },
+    Constant {
+        name: LeanName,
+        levels: Vec<LeanLevel>,
+    },
     Application,
-    Lambda { name: LeanName, binder_info: LeanBinderInfo },
-    Forall { name: LeanName, binder_info: LeanBinderInfo },
-    Let { name: LeanName, non_dep: bool },
-    Literal { literal: LeanLiteral },
-    Projection { type_name: LeanName, index: usize },
+    Lambda {
+        name: LeanName,
+        binder_info: LeanBinderInfo,
+    },
+    Forall {
+        name: LeanName,
+        binder_info: LeanBinderInfo,
+    },
+    Let {
+        name: LeanName,
+        non_dep: bool,
+    },
+    Literal {
+        literal: LeanLiteral,
+    },
+    Projection {
+        type_name: LeanName,
+        index: usize,
+    },
 }
 
 pub struct LeanStructureView<'a> {
     artifact: &'a LeanArtifact,
     nodes: Vec<&'a LeanExpr>,
     children: Vec<Vec<usize>>,
+    preorder_indexes: Vec<usize>,
 }
 
 impl<'a> LeanStructureView<'a> {
@@ -343,56 +387,48 @@ impl<'a> LeanStructureView<'a> {
             expression: &'a LeanExpr,
             nodes: &mut Vec<&'a LeanExpr>,
             children: &mut Vec<Vec<usize>>,
+            preorder_indexes: &mut Vec<usize>,
+            next_preorder: &mut usize,
         ) -> usize {
+            let preorder = *next_preorder;
+            *next_preorder = next_preorder.saturating_add(1);
+            let mut child_indexes = Vec::new();
+            expression.for_each_child(|child| {
+                child_indexes.push(push(
+                    child,
+                    nodes,
+                    children,
+                    preorder_indexes,
+                    next_preorder,
+                ));
+            });
             let index = nodes.len();
             nodes.push(expression);
-            children.push(Vec::new());
-            match expression {
-                LeanExpr::App { function, argument } => {
-                    let function = push(function, nodes, children);
-                    let argument = push(argument, nodes, children);
-                    children[index].extend([function, argument]);
-                }
-                LeanExpr::Lam {
-                    binder_type, body, ..
-                }
-                | LeanExpr::ForallE {
-                    binder_type, body, ..
-                } => {
-                    let binder_type = push(binder_type, nodes, children);
-                    let body = push(body, nodes, children);
-                    children[index].extend([binder_type, body]);
-                }
-                LeanExpr::LetE {
-                    r#type,
-                    value,
-                    body,
-                    ..
-                } => {
-                    let r#type = push(r#type, nodes, children);
-                    let value = push(value, nodes, children);
-                    let body = push(body, nodes, children);
-                    children[index].extend([r#type, value, body]);
-                }
-                LeanExpr::Proj { subject, .. } => {
-                    let subject = push(subject, nodes, children);
-                    children[index].push(subject);
-                }
-                LeanExpr::Bvar { .. }
-                | LeanExpr::Sort { .. }
-                | LeanExpr::Const { .. }
-                | LeanExpr::Lit { .. } => {}
-            }
+            children.push(child_indexes);
+            preorder_indexes.push(preorder);
             index
         }
         let mut nodes = Vec::new();
         let mut children = Vec::new();
-        push(&artifact.proof_term, &mut nodes, &mut children);
+        let mut preorder_indexes = Vec::new();
+        let mut next_preorder = 0;
+        push(
+            &artifact.proof_term,
+            &mut nodes,
+            &mut children,
+            &mut preorder_indexes,
+            &mut next_preorder,
+        );
         Self {
             artifact,
             nodes,
             children,
+            preorder_indexes,
         }
+    }
+
+    fn preorder_index(&self, node: usize) -> Option<usize> {
+        self.preorder_indexes.get(node).copied()
     }
 }
 
@@ -413,7 +449,9 @@ impl StructuralView for LeanStructureView<'_> {
     }
 
     fn node_constructor(&self, node: usize) -> Option<Self::Constructor> {
-        self.nodes.get(node).map(|expression| constructor_of(expression))
+        self.nodes
+            .get(node)
+            .map(|expression| constructor_of(expression))
     }
 
     fn write_children(&self, node: usize, output: &mut Vec<usize>) -> bool {
@@ -431,6 +469,7 @@ impl StructuralView for LeanStructureView<'_> {
         };
         let immediate = NodeImmediate {
             environment: self.artifact.environment.clone(),
+            declaration: self.artifact.declaration.clone(),
             proposition: self.artifact.proposition.clone(),
             allowed_axioms: self.artifact.allowed_axioms.clone(),
             auxiliary: auxiliary_of(expression),
@@ -444,8 +483,7 @@ impl StructuralView for LeanStructureView<'_> {
     }
 
     fn dynamic_resident_bytes(&self) -> u64 {
-        serde_json::to_vec(self.artifact)
-            .map_or(u64::MAX, |bytes| bytes.len() as u64)
+        serde_json::to_vec(self.artifact).map_or(u64::MAX, |bytes| bytes.len() as u64)
     }
 }
 
@@ -480,9 +518,12 @@ impl StructuralProtocol<LeanDomain> for LeanStructure {
         );
         let immediate: NodeImmediate = decode_json(scratch)?;
         let proof_term = compose_expression(constructor, &immediate.auxiliary, children)?;
+        let dependencies = artifact_dependencies(&immediate.proposition, &proof_term);
         Ok(LeanArtifact {
             environment: immediate.environment,
+            declaration: immediate.declaration,
             proposition: immediate.proposition,
+            dependencies,
             proof_term,
             allowed_axioms: immediate.allowed_axioms,
         })
@@ -494,14 +535,17 @@ impl StructuralProtocol<LeanDomain> for LeanStructure {
         node: usize,
         _scratch: &mut Self::Scratch,
     ) -> Result<LeanArtifact, LeanError> {
-        let proof_term = artifact
-            .proof_term
-            .expression_at(node)
-            .ok_or_else(|| LeanError::InvalidStructure("node is out of range".into()))?
-            .clone();
+        let view = LeanStructureView::new(artifact);
+        let proof_term = (**view
+            .nodes
+            .get(node)
+            .ok_or_else(|| LeanError::InvalidStructure("node is out of range".into()))?)
+        .clone();
         Ok(LeanArtifact {
             environment: artifact.environment.clone(),
+            declaration: artifact.declaration.clone(),
             proposition: artifact.proposition.clone(),
+            dependencies: artifact_dependencies(&artifact.proposition, &proof_term),
             proof_term,
             allowed_axioms: artifact.allowed_axioms.clone(),
         })
@@ -517,13 +561,18 @@ impl StructuralProtocol<LeanDomain> for LeanStructure {
         if artifact.environment != replacement.environment {
             return Err(LeanError::IncompatibleEnvironment);
         }
+        let preorder = LeanStructureView::new(artifact)
+            .preorder_index(node)
+            .ok_or_else(|| LeanError::InvalidStructure("node is out of range".into()))?;
         let proof_term = artifact
             .proof_term
-            .replacing(node, &replacement.proof_term)
+            .replacing(preorder, &replacement.proof_term)
             .ok_or_else(|| LeanError::InvalidStructure("node is out of range".into()))?;
         Ok(LeanArtifact {
             environment: artifact.environment.clone(),
+            declaration: artifact.declaration.clone(),
             proposition: artifact.proposition.clone(),
+            dependencies: artifact_dependencies(&artifact.proposition, &proof_term),
             proof_term,
             allowed_axioms: artifact.allowed_axioms.clone(),
         })
@@ -610,7 +659,8 @@ fn compose_expression(
         .iter()
         .map(|artifact| artifact.proof_term.clone())
         .collect::<Vec<_>>();
-    let invalid = || LeanError::InvalidStructure("constructor payload or child arity differs".into());
+    let invalid =
+        || LeanError::InvalidStructure("constructor payload or child arity differs".into());
     match (constructor, auxiliary, expressions.as_slice()) {
         (LeanConstructor::BoundVariable, NodeAuxiliary::BoundVariable { index }, []) => {
             Ok(LeanExpr::Bvar { index: *index })
@@ -659,11 +709,9 @@ fn compose_expression(
                 non_dep: *non_dep,
             })
         }
-        (LeanConstructor::Literal, NodeAuxiliary::Literal { literal }, []) => {
-            Ok(LeanExpr::Lit {
-                literal: literal.clone(),
-            })
-        }
+        (LeanConstructor::Literal, NodeAuxiliary::Literal { literal }, []) => Ok(LeanExpr::Lit {
+            literal: literal.clone(),
+        }),
         (
             LeanConstructor::Projection,
             NodeAuxiliary::Projection { type_name, index },
@@ -696,7 +744,9 @@ impl SeedSource<LeanDomain> for LeanSeeds {
         if scope.start > self.entries.len()
             || scope.start.saturating_add(scope.count) > self.entries.len()
         {
-            return Err(LeanError::InvalidStructure("seed scope exceeds corpus".into()));
+            return Err(LeanError::InvalidStructure(
+                "seed scope exceeds corpus".into(),
+            ));
         }
         Ok(LeanSeedCursor {
             next: scope.start,
@@ -716,6 +766,7 @@ impl SeedSource<LeanDomain> for LeanSeeds {
         for entry in &self.entries[start..end] {
             let claim = LeanClaim {
                 environment: entry.artifact.environment.clone(),
+                declaration: entry.artifact.declaration.clone(),
                 proposition: entry.artifact.proposition.clone(),
                 allowed_axioms: entry.artifact.allowed_axioms.clone(),
             };
@@ -783,7 +834,8 @@ impl LeanOperators {
                 .or_insert_with(Vec::new)
                 .push(artifact.clone());
         }
-        let descriptor = |operator, symbol| OperatorDescriptor::new(operator, SymbolId::new(symbol));
+        let descriptor =
+            |operator, symbol| OperatorDescriptor::new(operator, SymbolId::new(symbol));
         Self {
             catalog: vec![
                 descriptor(LeanOperator::ProofSubstitution, "lean-proof-substitution"),
@@ -801,6 +853,191 @@ impl LeanOperators {
             ],
             substitutions_by_proposition,
             all_proofs: substitutions,
+        }
+    }
+
+    fn substitutions(
+        &self,
+        source_index: usize,
+        source: &LeanArtifact,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        let Some(substitutions) = self.substitutions_by_proposition.get(&source.proposition) else {
+            return;
+        };
+        for substitution in substitutions {
+            if output.is_full() {
+                return;
+            }
+            if substitution.proof_term != source.proof_term {
+                output.push(LeanApplication {
+                    source_index,
+                    candidate: candidate_with_proof(source, substitution.proof_term.clone()),
+                });
+            }
+        }
+    }
+
+    fn applications(
+        &self,
+        source_index: usize,
+        source: &LeanArtifact,
+        reverse: bool,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        for other in &self.all_proofs {
+            if output.is_full() {
+                return;
+            }
+            let (function, argument) = if reverse {
+                (other.proof_term.clone(), source.proof_term.clone())
+            } else {
+                (source.proof_term.clone(), other.proof_term.clone())
+            };
+            output.push(LeanApplication {
+                source_index,
+                candidate: candidate_with_proof(
+                    source,
+                    LeanExpr::App {
+                        function: Box::new(function),
+                        argument: Box::new(argument),
+                    },
+                ),
+            });
+        }
+    }
+
+    fn rewrites(
+        &self,
+        source_index: usize,
+        node: usize,
+        source: &LeanArtifact,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        let Some(node) = structural_preorder_index(source, node) else {
+            return;
+        };
+        for other in &self.all_proofs {
+            if output.is_full() {
+                return;
+            }
+            if let Some(proof_term) = source.proof_term.replacing(node, &other.proof_term) {
+                output.push(LeanApplication {
+                    source_index,
+                    candidate: candidate_with_proof(source, proof_term),
+                });
+            }
+        }
+    }
+
+    fn factorings(
+        &self,
+        source_index: usize,
+        source: &LeanArtifact,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        for shared in &self.all_proofs {
+            if output.is_full() {
+                return;
+            }
+            if shared.declaration.level_params != source.declaration.level_params
+                || shared.proof_term.node_count() < 2
+            {
+                continue;
+            }
+            let Some(body) = source.proof_term.factor_closed(&shared.proof_term) else {
+                continue;
+            };
+            let proof_term = LeanExpr::LetE {
+                name: LeanName::from_dotted("_reflex_shared"),
+                r#type: Box::new(shared.proposition.clone()),
+                value: Box::new(shared.proof_term.clone()),
+                body: Box::new(body),
+                non_dep: false,
+            };
+            output.push(LeanApplication {
+                source_index,
+                candidate: candidate_with_proof(source, proof_term),
+            });
+        }
+    }
+
+    fn anti_unifications(
+        &self,
+        source_index: usize,
+        node: usize,
+        source: &LeanArtifact,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        let Some(node) = structural_preorder_index(source, node) else {
+            return;
+        };
+        let Some(target) = source.proof_term.expression_at(node) else {
+            return;
+        };
+        for analogous in &self.all_proofs {
+            if output.is_full() {
+                return;
+            }
+            let Some((relative, replacement)) =
+                analogous_replacement(target, &analogous.proof_term)
+            else {
+                continue;
+            };
+            let Some(rewritten_target) = target.replacing(relative, &replacement) else {
+                continue;
+            };
+            let Some(proof_term) = source.proof_term.replacing(node, &rewritten_target) else {
+                continue;
+            };
+            output.push(LeanApplication {
+                source_index,
+                candidate: candidate_with_proof(source, proof_term),
+            });
+        }
+    }
+
+    fn contraction(
+        source_index: usize,
+        node: usize,
+        source: &LeanArtifact,
+        contract: fn(&LeanExpr) -> Option<LeanExpr>,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        let Some(node) = structural_preorder_index(source, node) else {
+            return;
+        };
+        if let Some(proof_term) = contracted_at(&source.proof_term, node, contract) {
+            output.push(LeanApplication {
+                source_index,
+                candidate: candidate_with_proof(source, proof_term),
+            });
+        }
+    }
+
+    fn generalizations(
+        &self,
+        source_index: usize,
+        source: &LeanArtifact,
+        output: &mut ApplicationWriter<'_, LeanApplication>,
+    ) {
+        for general in &self.all_proofs {
+            if output.is_full() {
+                return;
+            }
+            if general.declaration.level_params != source.declaration.level_params {
+                continue;
+            }
+            if let Some(proof_term) = generalized_application(
+                &general.proposition,
+                &general.proof_term,
+                &source.proposition,
+            ) {
+                output.push(LeanApplication {
+                    source_index,
+                    candidate: candidate_with_proof(source, proof_term),
+                });
+            }
         }
     }
 }
@@ -829,77 +1066,68 @@ impl OperatorAlgebra<LeanDomain> for LeanOperators {
             let source = requests
                 .artifacts()
                 .get(location.artifact_index())
-                .ok_or_else(|| LeanError::InvalidStructure("artifact index is out of range".into()))?;
+                .ok_or_else(|| {
+                    LeanError::InvalidStructure("artifact index is out of range".into())
+                })?;
             for operator in requests.operators() {
                 match operator {
-                    LeanOperator::ProofSubstitution if location.node_index() == 0 => {
-                        if let Some(substitutions) =
-                            self.substitutions_by_proposition.get(&source.proposition)
-                        {
-                            for substitution in substitutions {
-                                if output.is_full() {
-                                    return Ok(());
-                                }
-                                if substitution.proof_term != source.proof_term {
-                                    output.push(LeanApplication {
-                                        source_index: location.artifact_index(),
-                                        candidate: substitution.clone(),
-                                    });
-                                }
-                            }
-                        }
+                    LeanOperator::ProofSubstitution
+                        if is_root_location(source, location.node_index()) =>
+                    {
+                        self.substitutions(location.artifact_index(), source, output);
                     }
-                    LeanOperator::Application | LeanOperator::Composition => {
-                        for other in &self.all_proofs {
-                            if output.is_full() {
-                                return Ok(());
-                            }
-                            let (function, argument) = if *operator == LeanOperator::Application {
-                                (source.proof_term.clone(), other.proof_term.clone())
-                            } else {
-                                (other.proof_term.clone(), source.proof_term.clone())
-                            };
-                            output.push(LeanApplication {
-                                source_index: location.artifact_index(),
-                                candidate: LeanArtifact {
-                                    environment: source.environment.clone(),
-                                    proposition: source.proposition.clone(),
-                                    proof_term: LeanExpr::App {
-                                        function: Box::new(function),
-                                        argument: Box::new(argument),
-                                    },
-                                    allowed_axioms: source.allowed_axioms.clone(),
-                                },
-                            });
-                        }
+                    LeanOperator::Application
+                        if is_root_location(source, location.node_index()) =>
+                    {
+                        self.applications(location.artifact_index(), source, false, output);
                     }
-                    LeanOperator::Rewriting => {
-                        for other in &self.all_proofs {
-                            if output.is_full() {
-                                return Ok(());
-                            }
-                            if let Some(proof_term) = source
-                                .proof_term
-                                .replacing(location.node_index(), &other.proof_term)
-                            {
-                                output.push(LeanApplication {
-                                    source_index: location.artifact_index(),
-                                    candidate: LeanArtifact {
-                                        environment: source.environment.clone(),
-                                        proposition: source.proposition.clone(),
-                                        proof_term,
-                                        allowed_axioms: source.allowed_axioms.clone(),
-                                    },
-                                });
-                            }
-                        }
+                    LeanOperator::Composition
+                        if is_root_location(source, location.node_index()) =>
+                    {
+                        self.applications(location.artifact_index(), source, true, output);
+                    }
+                    LeanOperator::Rewriting => self.rewrites(
+                        location.artifact_index(),
+                        location.node_index(),
+                        source,
+                        output,
+                    ),
+                    LeanOperator::Factoring if is_root_location(source, location.node_index()) => {
+                        self.factorings(location.artifact_index(), source, output);
+                    }
+                    LeanOperator::AntiUnification => self.anti_unifications(
+                        location.artifact_index(),
+                        location.node_index(),
+                        source,
+                        output,
+                    ),
+                    LeanOperator::Abstraction => Self::contraction(
+                        location.artifact_index(),
+                        location.node_index(),
+                        source,
+                        LeanExpr::eta_contract,
+                        output,
+                    ),
+                    LeanOperator::Normalization => Self::contraction(
+                        location.artifact_index(),
+                        location.node_index(),
+                        source,
+                        LeanExpr::beta_or_zeta_contract,
+                        output,
+                    ),
+                    LeanOperator::VerifiedGeneralization
+                        if is_root_location(source, location.node_index()) =>
+                    {
+                        self.generalizations(location.artifact_index(), source, output);
                     }
                     LeanOperator::Factoring
-                    | LeanOperator::AntiUnification
-                    | LeanOperator::Abstraction
-                    | LeanOperator::Normalization
+                    | LeanOperator::Application
+                    | LeanOperator::Composition
                     | LeanOperator::VerifiedGeneralization
                     | LeanOperator::ProofSubstitution => {}
+                }
+                if output.is_full() {
+                    return Ok(());
                 }
             }
         }
@@ -921,6 +1149,7 @@ impl OperatorAlgebra<LeanDomain> for LeanOperators {
 
 pub struct LeanKernel {
     config: LeanWorkerConfig,
+    environment: LeanEnvironmentIdentity,
     worker: Mutex<Option<LeanWorker>>,
 }
 
@@ -946,13 +1175,14 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
         candidate: &LeanArtifact,
     ) -> Result<Self::Claim, LeanError> {
         if seed.environment != candidate.environment
-            || seed.environment != pinned_environment_identity()
-            || seed.proposition != candidate.proposition
+            || seed.environment != self.environment
+            || seed.declaration != candidate.declaration
         {
             return Err(LeanError::IncompatibleEnvironment);
         }
         Ok(LeanClaim {
             environment: seed.environment.clone(),
+            declaration: seed.declaration.clone(),
             proposition: seed.proposition.clone(),
             allowed_axioms: seed.allowed_axioms.clone(),
         })
@@ -968,22 +1198,22 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
         let items = requests
             .requests()
             .iter()
-            .map(|request| VerificationItem {
-                proposition: request.claim.proposition.clone(),
-                proof_term: request.candidate.proof_term.clone(),
-                allowed_axioms: request.claim.allowed_axioms.clone(),
-            })
+            .map(|request| verification_item(request.claim, request.candidate))
             .collect::<Vec<_>>();
         match self.verify_items(&items, requests.allowance().elapsed_time()) {
             Ok((results, usage)) => {
                 for (request, result) in requests.requests().iter().zip(results) {
+                    let dependencies = normalized_names(result.dependencies.clone());
                     if result.accepted
                         && request.claim.environment == request.candidate.environment
-                        && request.claim.proposition == request.candidate.proposition
+                        && request.claim.declaration == request.candidate.declaration
+                        && request.claim.allowed_axioms == request.candidate.allowed_axioms
+                        && request.candidate.dependencies == dependencies
                     {
                         let evidence = artifact_digest(request.candidate).map(|artifact_digest| {
                             LeanEvidence {
                                 artifact_digest,
+                                dependencies,
                                 axioms: result.axioms,
                                 environment: request.claim.environment.clone(),
                             }
@@ -1020,11 +1250,7 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
         let items = records
             .requests()
             .iter()
-            .map(|record| VerificationItem {
-                proposition: record.claim.proposition.clone(),
-                proof_term: record.artifact.proof_term.clone(),
-                allowed_axioms: record.claim.allowed_axioms.clone(),
-            })
+            .map(|record| verification_item(record.claim, record.artifact))
             .collect::<Vec<_>>();
         match self.verify_items(&items, records.allowance().elapsed_time()) {
             Ok((results, usage)) => {
@@ -1098,18 +1324,357 @@ fn replay_accepted(
     record: &VerificationReplayRequest<'_, LeanDomain, LeanClaim, LeanEvidence>,
     result: &crate::worker::VerificationResult,
 ) -> bool {
+    let dependencies = normalized_names(result.dependencies.clone());
     result.accepted
         && record.kernel_revision == KERNEL_REVISION
         && record.claim.environment == record.artifact.environment
-        && record.claim.proposition == record.artifact.proposition
+        && record.claim.declaration == record.artifact.declaration
+        && record.claim.allowed_axioms == record.artifact.allowed_axioms
         && record.evidence.environment == record.artifact.environment
+        && record.evidence.dependencies.as_slice() == dependencies.as_slice()
+        && record.artifact.dependencies.as_slice() == dependencies.as_slice()
         && record.evidence.axioms == result.axioms
-        && artifact_digest(record.artifact).is_ok_and(|digest| digest == record.evidence.artifact_digest)
+        && artifact_digest(record.artifact)
+            .is_ok_and(|digest| digest == record.evidence.artifact_digest)
+}
+
+fn verification_item(claim: &LeanClaim, artifact: &LeanArtifact) -> VerificationItem {
+    VerificationItem {
+        level_params: artifact.declaration.level_params.clone(),
+        claim_proposition: claim.proposition.clone(),
+        candidate_proposition: artifact.proposition.clone(),
+        proof_term: artifact.proof_term.clone(),
+        allowed_axioms: claim.allowed_axioms.clone(),
+    }
+}
+
+fn artifact_dependencies(proposition: &LeanExpr, proof_term: &LeanExpr) -> Vec<LeanName> {
+    let mut dependencies = proposition.used_constants();
+    dependencies.extend(proof_term.used_constants());
+    normalized_names(dependencies)
+}
+
+fn candidate_with_proof(source: &LeanArtifact, proof_term: LeanExpr) -> LeanArtifact {
+    LeanArtifact {
+        environment: source.environment.clone(),
+        declaration: source.declaration.clone(),
+        proposition: source.proposition.clone(),
+        dependencies: artifact_dependencies(&source.proposition, &proof_term),
+        proof_term,
+        allowed_axioms: source.allowed_axioms.clone(),
+    }
+}
+
+fn is_root_location(source: &LeanArtifact, node: usize) -> bool {
+    node.checked_add(1) == Some(source.proof_term.node_count())
+}
+
+fn structural_preorder_index(source: &LeanArtifact, node: usize) -> Option<usize> {
+    LeanStructureView::new(source).preorder_index(node)
+}
+
+fn contracted_at(
+    expression: &LeanExpr,
+    node: usize,
+    contract: fn(&LeanExpr) -> Option<LeanExpr>,
+) -> Option<LeanExpr> {
+    let contracted = contract(expression.expression_at(node)?)?;
+    expression.replacing(node, &contracted)
+}
+
+fn analogous_replacement(left: &LeanExpr, right: &LeanExpr) -> Option<(usize, LeanExpr)> {
+    fn same_header(left: &LeanExpr, right: &LeanExpr) -> bool {
+        match (left, right) {
+            (LeanExpr::Bvar { index: left }, LeanExpr::Bvar { index: right }) => left == right,
+            (LeanExpr::Sort { level: left }, LeanExpr::Sort { level: right }) => left == right,
+            (
+                LeanExpr::Const {
+                    name: left_name,
+                    levels: left_levels,
+                },
+                LeanExpr::Const {
+                    name: right_name,
+                    levels: right_levels,
+                },
+            ) => left_name == right_name && left_levels == right_levels,
+            (LeanExpr::App { .. }, LeanExpr::App { .. }) => true,
+            (
+                LeanExpr::Lam {
+                    name: left_name,
+                    binder_info: left_info,
+                    ..
+                },
+                LeanExpr::Lam {
+                    name: right_name,
+                    binder_info: right_info,
+                    ..
+                },
+            )
+            | (
+                LeanExpr::ForallE {
+                    name: left_name,
+                    binder_info: left_info,
+                    ..
+                },
+                LeanExpr::ForallE {
+                    name: right_name,
+                    binder_info: right_info,
+                    ..
+                },
+            ) => left_name == right_name && left_info == right_info,
+            (
+                LeanExpr::LetE {
+                    name: left_name,
+                    non_dep: left_non_dep,
+                    ..
+                },
+                LeanExpr::LetE {
+                    name: right_name,
+                    non_dep: right_non_dep,
+                    ..
+                },
+            ) => left_name == right_name && left_non_dep == right_non_dep,
+            (LeanExpr::Lit { literal: left }, LeanExpr::Lit { literal: right }) => left == right,
+            (
+                LeanExpr::Proj {
+                    type_name: left_name,
+                    index: left_index,
+                    ..
+                },
+                LeanExpr::Proj {
+                    type_name: right_name,
+                    index: right_index,
+                    ..
+                },
+            ) => left_name == right_name && left_index == right_index,
+            _ => false,
+        }
+    }
+
+    let mut left_nodes = Vec::new();
+    left.visit(&mut |expression| left_nodes.push(expression.clone()));
+    let mut right_nodes = Vec::new();
+    right.visit(&mut |expression| right_nodes.push(expression.clone()));
+    left_nodes
+        .into_iter()
+        .zip(right_nodes)
+        .enumerate()
+        .find_map(|(index, (left, right))| (!same_header(&left, &right)).then_some((index, right)))
+}
+
+fn generalized_application(
+    proposition: &LeanExpr,
+    proof_term: &LeanExpr,
+    target: &LeanExpr,
+) -> Option<LeanExpr> {
+    let mut body = proposition;
+    let mut binder_count = 0usize;
+    while let LeanExpr::ForallE { body: next, .. } = body {
+        binder_count = binder_count.checked_add(1)?;
+        body = next;
+    }
+    if binder_count == 0 {
+        return None;
+    }
+    let mut bindings = vec![None; binder_count];
+    if !match_generalized(body, target, binder_count, 0, &mut bindings) {
+        return None;
+    }
+    let mut result = proof_term.clone();
+    for argument in bindings.into_iter().rev() {
+        result = LeanExpr::App {
+            function: Box::new(result),
+            argument: Box::new(argument?),
+        };
+    }
+    Some(result)
+}
+
+fn match_generalized(
+    pattern: &LeanExpr,
+    target: &LeanExpr,
+    binder_count: usize,
+    depth: usize,
+    bindings: &mut [Option<LeanExpr>],
+) -> bool {
+    if let LeanExpr::Bvar { index } = pattern
+        && *index >= depth
+        && *index < depth.saturating_add(binder_count)
+        && target.is_closed()
+    {
+        let binding = &mut bindings[*index - depth];
+        return binding.as_ref().is_none_or(|bound| bound == target) && {
+            *binding = Some(target.clone());
+            true
+        };
+    }
+    match (pattern, target) {
+        (LeanExpr::Bvar { index: left }, LeanExpr::Bvar { index: right }) => left == right,
+        (LeanExpr::Sort { level: left }, LeanExpr::Sort { level: right }) => left == right,
+        (
+            LeanExpr::Const {
+                name: left_name,
+                levels: left_levels,
+            },
+            LeanExpr::Const {
+                name: right_name,
+                levels: right_levels,
+            },
+        ) => left_name == right_name && left_levels == right_levels,
+        (
+            LeanExpr::App {
+                function: left_function,
+                argument: left_argument,
+            },
+            LeanExpr::App {
+                function: right_function,
+                argument: right_argument,
+            },
+        ) => {
+            match_generalized(left_function, right_function, binder_count, depth, bindings)
+                && match_generalized(left_argument, right_argument, binder_count, depth, bindings)
+        }
+        (LeanExpr::Lam { .. }, LeanExpr::Lam { .. })
+        | (LeanExpr::ForallE { .. }, LeanExpr::ForallE { .. }) => {
+            match_generalized_binder(pattern, target, binder_count, depth, bindings)
+        }
+        (LeanExpr::LetE { .. }, LeanExpr::LetE { .. }) => {
+            match_generalized_let(pattern, target, binder_count, depth, bindings)
+        }
+        (LeanExpr::Lit { literal: left }, LeanExpr::Lit { literal: right }) => left == right,
+        (
+            LeanExpr::Proj {
+                type_name: left_name,
+                index: left_index,
+                subject: left_subject,
+            },
+            LeanExpr::Proj {
+                type_name: right_name,
+                index: right_index,
+                subject: right_subject,
+            },
+        ) => {
+            left_name == right_name
+                && left_index == right_index
+                && match_generalized(left_subject, right_subject, binder_count, depth, bindings)
+        }
+        _ => false,
+    }
+}
+
+fn match_generalized_binder(
+    pattern: &LeanExpr,
+    target: &LeanExpr,
+    binder_count: usize,
+    depth: usize,
+    bindings: &mut [Option<LeanExpr>],
+) -> bool {
+    let (
+        LeanExpr::Lam {
+            name: left_name,
+            binder_type: left_type,
+            body: left_body,
+            binder_info: left_info,
+        }
+        | LeanExpr::ForallE {
+            name: left_name,
+            binder_type: left_type,
+            body: left_body,
+            binder_info: left_info,
+        },
+    ) = (pattern,)
+    else {
+        return false;
+    };
+    let (
+        LeanExpr::Lam {
+            name: right_name,
+            binder_type: right_type,
+            body: right_body,
+            binder_info: right_info,
+        }
+        | LeanExpr::ForallE {
+            name: right_name,
+            binder_type: right_type,
+            body: right_body,
+            binder_info: right_info,
+        },
+    ) = (target,)
+    else {
+        return false;
+    };
+    left_name == right_name
+        && left_info == right_info
+        && match_generalized(left_type, right_type, binder_count, depth, bindings)
+        && match_generalized(
+            left_body,
+            right_body,
+            binder_count,
+            depth.saturating_add(1),
+            bindings,
+        )
+}
+
+fn match_generalized_let(
+    pattern: &LeanExpr,
+    target: &LeanExpr,
+    binder_count: usize,
+    depth: usize,
+    bindings: &mut [Option<LeanExpr>],
+) -> bool {
+    let LeanExpr::LetE {
+        name: left_name,
+        r#type: left_type,
+        value: left_value,
+        body: left_body,
+        non_dep: left_non_dep,
+    } = pattern
+    else {
+        return false;
+    };
+    let LeanExpr::LetE {
+        name: right_name,
+        r#type: right_type,
+        value: right_value,
+        body: right_body,
+        non_dep: right_non_dep,
+    } = target
+    else {
+        return false;
+    };
+    left_name == right_name
+        && left_non_dep == right_non_dep
+        && match_generalized(left_type, right_type, binder_count, depth, bindings)
+        && match_generalized(left_value, right_value, binder_count, depth, bindings)
+        && match_generalized(
+            left_body,
+            right_body,
+            binder_count,
+            depth.saturating_add(1),
+            bindings,
+        )
 }
 
 fn artifact_digest(artifact: &LeanArtifact) -> Result<[u8; 32], LeanError> {
     let encoded = serde_json::to_vec(artifact)?;
     Ok(Sha256::digest(encoded).into())
+}
+
+fn normalized_names(mut names: Vec<LeanName>) -> Vec<LeanName> {
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
 }
 
 fn decode_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, LeanError> {
@@ -1151,7 +1716,10 @@ impl LeanMeasurements {
                     LeanMetric::EncodedBytes,
                     SymbolId::new("encoded-proof-bytes"),
                 ),
-                MeasurementDescriptor::new(LeanMetric::AxiomCount, SymbolId::new("axiom-count")),
+                MeasurementDescriptor::new(
+                    LeanMetric::AllowedAxiomCount,
+                    SymbolId::new("allowed-axiom-count"),
+                ),
             ],
         }
     }
@@ -1176,10 +1744,22 @@ impl MeasurementSpace<LeanDomain> for LeanMeasurements {
         for (index, artifact) in artifacts.artifacts().iter().enumerate() {
             scratch.clear();
             serde_json::to_writer(&mut *scratch, &artifact.proof_term)?;
-            output.push(index, LeanMetric::ProofNodes, artifact.proof_term.node_count() as u64);
-            output.push(index, LeanMetric::ProofDepth, artifact.proof_term.depth() as u64);
+            output.push(
+                index,
+                LeanMetric::ProofNodes,
+                artifact.proof_term.node_count() as u64,
+            );
+            output.push(
+                index,
+                LeanMetric::ProofDepth,
+                artifact.proof_term.depth() as u64,
+            );
             output.push(index, LeanMetric::EncodedBytes, scratch.len() as u64);
-            output.push(index, LeanMetric::AxiomCount, artifact.allowed_axioms.len() as u64);
+            output.push(
+                index,
+                LeanMetric::AllowedAxiomCount,
+                artifact.allowed_axioms.len() as u64,
+            );
         }
         Ok(())
     }
@@ -1244,6 +1824,9 @@ pub fn pinned_environment_identity() -> LeanEnvironmentIdentity {
         mathlib_commit: MATHLIB_COMMIT.into(),
         lean_toolchain: LEAN_TOOLCHAIN.into(),
         lean_commit: LEAN_COMMIT.into(),
+        artifact_format: ARTIFACT_FORMAT_VERSION,
+        kernel_contract: KERNEL_CONTRACT_VERSION,
+        worker_source_sha256: sha256_hex(include_bytes!("../worker/ReflexLeanWorker.lean")),
     }
 }
 
@@ -1251,13 +1834,19 @@ pub fn pinned_environment_identity() -> LeanEnvironmentIdentity {
 mod tests {
     use reflex::{StructuralProtocol, StructuralView};
 
-    use super::{LeanArtifact, LeanConstructor, LeanExpr, LeanStructure, pinned_environment_identity};
-    use crate::ast::{LeanBinderInfo, LeanName};
+    use super::{
+        LeanArtifact, LeanConstructor, LeanExpr, LeanStructure, pinned_environment_identity,
+    };
+    use crate::ast::{LeanBinderInfo, LeanDeclarationIdentity, LeanName};
 
     fn artifact() -> LeanArtifact {
         let nat = LeanExpr::constant(LeanName::from_dotted("Nat"), vec![]);
         LeanArtifact {
             environment: pinned_environment_identity(),
+            declaration: LeanDeclarationIdentity {
+                name: LeanName::from_dotted("Reflex.test"),
+                level_params: vec![],
+            },
             proposition: LeanExpr::ForallE {
                 name: LeanName::from_dotted("n"),
                 binder_type: Box::new(nat.clone()),
@@ -1270,6 +1859,7 @@ mod tests {
                 body: Box::new(LeanExpr::Bvar { index: 0 }),
                 binder_info: LeanBinderInfo::Default,
             },
+            dependencies: vec![LeanName::from_dotted("Nat")],
             allowed_axioms: vec![],
         }
     }
@@ -1303,7 +1893,14 @@ mod tests {
 
         let structure = LeanStructure::new();
         let original = artifact();
-        assert_eq!(rebuild(&structure, &original, 0), original);
+        let root = original.proof_term.node_count() - 1;
+        assert_eq!(rebuild(&structure, &original, root), original);
+        let view = structure.view(&original);
+        for parent in 0..view.node_count() {
+            let mut children = Vec::new();
+            assert!(view.write_children(parent, &mut children));
+            assert!(children.into_iter().all(|child| child < parent));
+        }
         assert!(structure.schema().constructors.iter().all(|descriptor| {
             descriptor.immediate_arity() == reflex::ImmediateArity::Variable
         }));
@@ -1313,14 +1910,14 @@ mod tests {
     fn extract_and_replace_preserve_the_seed_relative_claim() {
         let structure = LeanStructure::new();
         let original = artifact();
-        let extracted = structure.extract(&original, 2, &mut vec![]).unwrap();
+        let extracted = structure.extract(&original, 1, &mut vec![]).unwrap();
         assert_eq!(extracted.proof_term, LeanExpr::Bvar { index: 0 });
         let replacement = LeanArtifact {
             proof_term: LeanExpr::constant(LeanName::from_dotted("Nat.zero"), vec![]),
             ..extracted
         };
         let replaced = structure
-            .replace(&original, 2, &replacement, &mut vec![])
+            .replace(&original, 1, &replacement, &mut vec![])
             .unwrap();
         assert!(matches!(replaced.proof_term, LeanExpr::Lam { .. }));
         assert_eq!(replaced.proposition, original.proposition);
@@ -1331,6 +1928,75 @@ mod tests {
         assert_eq!(
             super::constructor_of(&LeanExpr::Bvar { index: 0 }),
             LeanConstructor::BoundVariable
+        );
+    }
+
+    #[test]
+    fn normalization_and_abstraction_preserve_de_bruijn_structure() {
+        let nat = LeanExpr::constant(LeanName::from_dotted("Nat"), vec![]);
+        let zero = LeanExpr::constant(LeanName::from_dotted("Nat.zero"), vec![]);
+        let beta = LeanExpr::App {
+            function: Box::new(LeanExpr::Lam {
+                name: LeanName::from_dotted("x"),
+                binder_type: Box::new(nat.clone()),
+                body: Box::new(LeanExpr::Bvar { index: 0 }),
+                binder_info: LeanBinderInfo::Default,
+            }),
+            argument: Box::new(zero.clone()),
+        };
+        assert_eq!(beta.beta_or_zeta_contract(), Some(zero));
+
+        let function = LeanExpr::constant(LeanName::from_dotted("f"), vec![]);
+        let eta = LeanExpr::Lam {
+            name: LeanName::from_dotted("x"),
+            binder_type: Box::new(nat),
+            body: Box::new(LeanExpr::App {
+                function: Box::new(function.clone()),
+                argument: Box::new(LeanExpr::Bvar { index: 0 }),
+            }),
+            binder_info: LeanBinderInfo::Default,
+        };
+        assert_eq!(eta.eta_contract(), Some(function));
+    }
+
+    #[test]
+    fn factoring_round_trips_through_kernel_zeta_semantics() {
+        let shared = LeanExpr::App {
+            function: Box::new(LeanExpr::constant(LeanName::from_dotted("f"), vec![])),
+            argument: Box::new(LeanExpr::constant(LeanName::from_dotted("x"), vec![])),
+        };
+        let original = LeanExpr::App {
+            function: Box::new(shared.clone()),
+            argument: Box::new(shared.clone()),
+        };
+        let body = original.factor_closed(&shared).unwrap();
+        let factored = LeanExpr::LetE {
+            name: LeanName::from_dotted("shared"),
+            r#type: Box::new(LeanExpr::constant(LeanName::from_dotted("T"), vec![])),
+            value: Box::new(shared),
+            body: Box::new(body),
+            non_dep: false,
+        };
+        assert_eq!(factored.beta_or_zeta_contract(), Some(original));
+    }
+
+    #[test]
+    fn verified_generalization_instantiates_all_syntactic_parameters() {
+        let binder = LeanExpr::constant(LeanName::from_dotted("T"), vec![]);
+        let proposition = LeanExpr::ForallE {
+            name: LeanName::from_dotted("x"),
+            binder_type: Box::new(binder),
+            body: Box::new(LeanExpr::Bvar { index: 0 }),
+            binder_info: LeanBinderInfo::Default,
+        };
+        let proof = LeanExpr::constant(LeanName::from_dotted("general"), vec![]);
+        let target = LeanExpr::constant(LeanName::from_dotted("specific"), vec![]);
+        assert_eq!(
+            super::generalized_application(&proposition, &proof, &target),
+            Some(LeanExpr::App {
+                function: Box::new(proof),
+                argument: Box::new(target),
+            })
         );
     }
 }

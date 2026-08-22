@@ -45,7 +45,9 @@ inductive WireExpr where
   deriving FromJson, ToJson, Repr, Nonempty
 
 structure VerificationItem where
-  proposition : WireExpr
+  levelParams : Array WireName
+  claimProposition : WireExpr
+  candidateProposition : WireExpr
   proofTerm : WireExpr
   allowedAxioms : Array WireName
   deriving FromJson, ToJson
@@ -61,14 +63,14 @@ inductive Request where
 
 structure Handshake where
   protocolVersion : Nat
-  mathlibCommit : String
-  leanToolchain : String
+  leanVersion : String
   leanCommit : String
   trustLevel : Nat
   deriving FromJson, ToJson
 
 structure VerificationResult where
   accepted : Bool
+  dependencies : Array WireName := #[]
   axioms : Array WireName := #[]
   diagnostic : String := ""
   deriving FromJson, ToJson
@@ -86,6 +88,8 @@ structure TheoremFingerprint where
   name : WireName
   statementHash : UInt64
   dependencies : Array WireName
+  kind : String
+  locallyEligible : Bool
   deriving FromJson, ToJson
 
 inductive Response where
@@ -176,96 +180,153 @@ partial def WireExpr.ofLean : Expr → Except String WireExpr
   | .mdata _ expression => ofLean expression
   | .proj typeName index subject => .proj (WireName.ofLean typeName) index <$> ofLean subject
 
+partial def WireLevel.collectParams : WireLevel → StateM NameSet Unit
+  | .zero => pure ()
+  | .succ level => level.collectParams
+  | .max left right | .imax left right => left.collectParams *> right.collectParams
+  | .param name => modify (·.insert name.toLean)
+
+partial def WireExpr.collectLevelParams : WireExpr → StateM NameSet Unit
+  | .bvar _ | .lit _ => pure ()
+  | .sort level => level.collectParams
+  | .const _ levels => levels.forM WireLevel.collectParams
+  | .app function argument => function.collectLevelParams *> argument.collectLevelParams
+  | .lam _ binderType body _ | .forallE _ binderType body _ =>
+      binderType.collectLevelParams *> body.collectLevelParams
+  | .letE _ type value body _ =>
+      type.collectLevelParams *> value.collectLevelParams *> body.collectLevelParams
+  | .proj _ _ subject => subject.collectLevelParams
+
+def VerificationItem.hasUnknownLevelParam (item : VerificationItem) : Bool := Id.run do
+  let allowed := item.levelParams.map WireName.toLean
+  let ((), found) := (do
+    item.claimProposition.collectLevelParams
+    item.candidateProposition.collectLevelParams
+    item.proofTerm.collectLevelParams).run {}
+  return found.toArray.any fun name => !allowed.contains name
+
 def sortedNames (names : Array Name) : Array Name :=
   names.qsort (Name.quickLt · ·)
 
-partial def visitNameAxioms (env : Environment) (name : Name) : StateM (NameSet × NameSet) Unit := do
-  let (seen, found) ← get
-  unless seen.contains name do
-    set (seen.insert name, found)
-    match env.find? name with
-    | some (.axiomInfo _) => modify fun (seen, found) => (seen, found.insert name)
-    | some info =>
-        for dependency in info.type.getUsedConstants do visitNameAxioms env dependency
-        if let some value := info.value? then
-          for dependency in value.getUsedConstants do visitNameAxioms env dependency
-    | none => pure ()
+structure NameAnalysis where
+  forbidden : Bool := false
+  axioms : Array Name := #[]
 
-def collectExprAxioms (env : Environment) (expression : Expr) : Array Name := Id.run do
-  let ((), (_, found)) := (do
-    for name in expression.getUsedConstants do visitNameAxioms env name).run ({}, {})
-  return sortedNames found.toArray
+abbrev AnalysisCache := IO.Ref (Std.HashMap Name NameAnalysis)
 
-partial def visitNameUnsafe (env : Environment) (name : Name) : StateM NameSet Bool := do
-  let seen ← get
-  if seen.contains name then return false
-  set (seen.insert name)
+def mergeAnalysis (left right : NameAnalysis) : NameAnalysis := Id.run do
+  let mut axioms : NameSet := {}
+  for name in left.axioms do axioms := axioms.insert name
+  for name in right.axioms do axioms := axioms.insert name
+  return {
+    forbidden := left.forbidden || right.forbidden
+    axioms := sortedNames axioms.toArray
+  }
+
+partial def analyzeName (env : Environment) (cache : AnalysisCache) (visiting : NameSet)
+    (name : Name) : IO NameAnalysis := do
+  if let some analysis := (← cache.get)[name]? then return analysis
+  if visiting.contains name then return {}
+  let visiting := visiting.insert name
+  let mut analysis : NameAnalysis := {}
   match env.find? name with
-  | none => return true
+  | none => analysis := { forbidden := true }
   | some info =>
-      if info.isUnsafe || info.isPartial then return true
+      analysis := {
+        forbidden := name == ``sorryAx || info.type.hasSorry || info.isUnsafe || info.isPartial
+        axioms := match info with | .axiomInfo _ => #[name] | _ => #[]
+      }
       for dependency in info.type.getUsedConstants do
-        if ← visitNameUnsafe env dependency then return true
+        analysis := mergeAnalysis analysis (← analyzeName env cache visiting dependency)
       if let some value := info.value? then
+        if value.hasSorry then analysis := { analysis with forbidden := true }
         for dependency in value.getUsedConstants do
-          if ← visitNameUnsafe env dependency then return true
-      return false
+          analysis := mergeAnalysis analysis (← analyzeName env cache visiting dependency)
+  cache.modify (·.insert name analysis)
+  return analysis
 
-def hasUnsafeDependency (env : Environment) (expression : Expr) : Bool := Id.run do
-  let (unsafeFound, _) := (do
-    for name in expression.getUsedConstants do
-      if ← visitNameUnsafe env name then return true
-    return false).run {}
-  return unsafeFound
+def analyzeExpr (env : Environment) (cache : AnalysisCache) (expression : Expr) :
+    IO NameAnalysis := do
+  let mut analysis : NameAnalysis := { forbidden := expression.hasSorry }
+  for name in expression.getUsedConstants do
+    analysis := mergeAnalysis analysis (← analyzeName env cache {} name)
+  return analysis
 
-def verifyOne (env : Environment) (item : VerificationItem) : VerificationResult :=
-  match item.proposition.toLean, item.proofTerm.toLean with
-  | .ok proposition, .ok proofTerm =>
-      if proposition.hasSorry || proofTerm.hasSorry then
-        { accepted := false, diagnostic := "sorry is forbidden" }
-      else if hasUnsafeDependency env proofTerm then
-        { accepted := false, diagnostic := "unsafe, partial, or unknown dependency" }
+def verifyOne (env : Environment) (cache : AnalysisCache) (item : VerificationItem) :
+    IO VerificationResult := do
+  match item.claimProposition.toLean, item.candidateProposition.toLean, item.proofTerm.toLean with
+  | .ok claimProposition, .ok candidateProposition, .ok proofTerm =>
+      if claimProposition.hasSorry || candidateProposition.hasSorry || proofTerm.hasSorry then
+        return { accepted := false, diagnostic := "sorry is forbidden" }
+      else if item.hasUnknownLevelParam then
+        return { accepted := false, diagnostic := "proof introduced an unknown universe parameter" }
       else
-        match Kernel.check env {} proposition, Kernel.check env {} proofTerm with
-        | .ok propositionType, .ok proofType =>
-            match Kernel.check env {} propositionType with
-            | .error _ => { accepted := false, diagnostic := "claim is not a well-formed type" }
-            | .ok _ =>
-                if !Kernel.isDefEqGuarded env {} proofType proposition then
-                  { accepted := false, diagnostic := "proof type differs from the claim" }
+        let claimAnalysis ← analyzeExpr env cache claimProposition
+        let candidateAnalysis ← analyzeExpr env cache candidateProposition
+        let proofAnalysis ← analyzeExpr env cache proofTerm
+        let analysis := mergeAnalysis claimAnalysis (mergeAnalysis candidateAnalysis proofAnalysis)
+        if analysis.forbidden then
+          return { accepted := false, diagnostic := "unsafe, partial, sorry, or unknown dependency" }
+        match Kernel.check env {} claimProposition,
+            Kernel.check env {} candidateProposition,
+            Kernel.check env {} proofTerm with
+        | .ok claimType, .ok candidateType, .ok proofType =>
+            match Kernel.check env {} claimType, Kernel.check env {} candidateType with
+            | .error _, _ => return { accepted := false, diagnostic := "claim is not a well-formed type" }
+            | _, .error _ => return { accepted := false, diagnostic := "candidate claim is not a well-formed type" }
+            | .ok _, .ok _ =>
+                if !Kernel.isDefEqGuarded env {} candidateProposition claimProposition then
+                  return { accepted := false, diagnostic := "candidate claim differs from the seed claim" }
+                else if !Kernel.isDefEqGuarded env {} proofType candidateProposition then
+                  return { accepted := false, diagnostic := "proof type differs from the candidate claim" }
                 else
-                  let axioms := collectExprAxioms env proofTerm
+                  let axioms := analysis.axioms
                   let allowed := item.allowedAxioms.map WireName.toLean
                   if axioms.any (· == ``sorryAx) then
-                    { accepted := false, diagnostic := "sorryAx dependency is forbidden" }
+                    return { accepted := false, diagnostic := "sorryAx dependency is forbidden" }
                   else if axioms.any fun ax => !allowed.contains ax then
-                    { accepted := false, diagnostic := "proof introduced a new axiom" }
+                    return { accepted := false, diagnostic := "proof introduced a new axiom" }
                   else
-                    { accepted := true, axioms := axioms.map WireName.ofLean }
-        | .error _, _ => { accepted := false, diagnostic := "kernel rejected the claim" }
-        | _, .error _ => { accepted := false, diagnostic := "kernel rejected the proof" }
-  | .error diagnostic, _ => { accepted := false, diagnostic }
-  | _, .error diagnostic => { accepted := false, diagnostic }
+                    let dependencies := Id.run do
+                      let mut found : NameSet := {}
+                      for expression in #[candidateProposition, proofTerm] do
+                        for dependency in expression.getUsedConstants do
+                          found := found.insert dependency
+                      return sortedNames found.toArray
+                    let result : VerificationResult := {
+                      accepted := true
+                      dependencies := dependencies.map WireName.ofLean
+                      axioms := axioms.map WireName.ofLean
+                    }
+                    return result
+        | .error _, _, _ => return { accepted := false, diagnostic := "kernel rejected the claim" }
+        | _, .error _, _ => return { accepted := false, diagnostic := "kernel rejected the candidate claim" }
+        | _, _, .error _ => return { accepted := false, diagnostic := "kernel rejected the proof" }
+  | .error diagnostic, _, _ => return { accepted := false, diagnostic }
+  | _, .error diagnostic, _ => return { accepted := false, diagnostic }
+  | _, _, .error diagnostic => return { accepted := false, diagnostic }
 
-def indexedTheorem? (env : Environment) (name : Name) (includeBody : Bool) : Option IndexedTheorem := do
-  let .thmInfo theoremInfo ← env.find? name | none
-  if theoremInfo.type.hasSorry || theoremInfo.value.hasSorry then none else
-  if hasUnsafeDependency env theoremInfo.value then none else
-  let axioms := collectExprAxioms env theoremInfo.value
-  if axioms.any (· == ``sorryAx) then none else
-  let proposition ← WireExpr.ofLean theoremInfo.type |>.toOption
-  let proofTerm? := if includeBody then WireExpr.ofLean theoremInfo.value |>.toOption else
-    some (WireExpr.const (WireName.ofLean name)
-      (theoremInfo.levelParams.map (fun levelName => WireLevel.param (WireName.ofLean levelName))))
-  let proofTerm ← proofTerm?
-  let dependencies := sortedNames theoremInfo.value.getUsedConstants
-  some {
+def indexedTheorem? (env : Environment) (cache : AnalysisCache) (name : Name) :
+    IO (Option IndexedTheorem) := do
+  let some (.thmInfo theoremInfo) := env.find? name | return none
+  let analysis := mergeAnalysis
+    (← analyzeExpr env cache theoremInfo.type)
+    (← analyzeExpr env cache theoremInfo.value)
+  if analysis.forbidden || analysis.axioms.any (· == ``sorryAx) then return none
+  let .ok proposition := WireExpr.ofLean theoremInfo.type | return none
+  let .ok proofTerm := WireExpr.ofLean theoremInfo.value | return none
+  let dependencies := Id.run do
+    let mut found : NameSet := {}
+    for dependency in theoremInfo.type.getUsedConstants do found := found.insert dependency
+    for dependency in theoremInfo.value.getUsedConstants do found := found.insert dependency
+    return sortedNames found.toArray
+  return some {
     name := WireName.ofLean name
     levelParams := theoremInfo.levelParams.toArray.map WireName.ofLean
     proposition
     proofTerm
     dependencies := dependencies.map WireName.ofLean
-    axioms := axioms.map WireName.ofLean
+    axioms := analysis.axioms.map WireName.ofLean
   }
 
 def eligibleTheoremNames (env : Environment) : Array Name :=
@@ -275,11 +336,31 @@ def eligibleTheoremNames (env : Environment) : Array Name :=
         if theoremInfo.type.hasSorry || theoremInfo.value.hasSorry then names else names.push name
     | _ => names) #[] |>.qsort (Name.quickLt · ·)
 
+def declarationNames (env : Environment) : Array Name :=
+  env.constants.fold (fun names name _ => names.push name) #[] |>.qsort (Name.quickLt · ·)
+
+def declarationKind : ConstantInfo → String
+  | .axiomInfo _ => "axiom"
+  | .defnInfo _ => "definition"
+  | .thmInfo _ => "theorem"
+  | .opaqueInfo _ => "opaque"
+  | .quotInfo _ => "quotient"
+  | .inductInfo _ => "inductive"
+  | .ctorInfo _ => "constructor"
+  | .recInfo _ => "recursor"
+
+def locallyEligible (name : Name) (info : ConstantInfo) : Bool :=
+  name != ``sorryAx && !info.type.hasSorry && !info.isUnsafe && !info.isPartial &&
+    match info.value? with
+    | some value => !value.hasSorry
+    | none => true
+
 def writeResponse (output : IO.FS.Stream) (response : Response) : IO Unit := do
   output.putStrLn (toJson response).compress
   output.flush
 
-partial def serve (env : Environment) (names : Array Name) (input output : IO.FS.Stream) : IO Unit := do
+partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allNames : Array Name)
+    (input output : IO.FS.Stream) : IO Unit := do
   let line ← input.getLine
   if line.isEmpty then return
   let request : Request ← IO.ofExcept do
@@ -288,39 +369,42 @@ partial def serve (env : Environment) (names : Array Name) (input output : IO.FS
   match request with
   | .ping id =>
       writeResponse output (.pong id)
-      serve env names input output
+      serve env cache theoremNames allNames input output
   | .verify id items =>
-      writeResponse output (.verified id (items.map (verifyOne env)))
-      serve env names input output
+      writeResponse output (.verified id (← items.mapM (verifyOne env cache)))
+      serve env cache theoremNames allNames input output
   | .index id offset limit =>
-      let artifacts := (names.extract offset (min names.size (offset + limit))).filterMap
-        (indexedTheorem? env · false)
-      writeResponse output (.indexed id names.size offset artifacts)
-      serve env names input output
+      let artifacts ←
+        (theoremNames.extract offset (min theoremNames.size (offset + limit))).filterMapM
+          (indexedTheorem? env cache)
+      writeResponse output (.indexed id theoremNames.size offset artifacts)
+      serve env cache theoremNames allNames input output
   | .fingerprints id offset limit =>
-      let fingerprints := (names.extract offset (min names.size (offset + limit))).filterMap fun name =>
+      let fingerprints := (allNames.extract offset (min allNames.size (offset + limit))).filterMap fun name =>
         match env.find? name with
-        | some (.thmInfo theoremInfo) =>
+        | some info =>
           let dependencies := Id.run do
             let mut found : NameSet := {}
-            for dependency in theoremInfo.type.getUsedConstants do
+            for dependency in info.type.getUsedConstants do
               found := found.insert dependency
-            for dependency in theoremInfo.value.getUsedConstants do
-              found := found.insert dependency
+            if let some value := info.value? then
+              for dependency in value.getUsedConstants do found := found.insert dependency
             return sortedNames found.toArray
           some {
             name := WireName.ofLean name
-            statementHash := hash theoremInfo.type
+            statementHash := hash info.type
             dependencies := dependencies.map WireName.ofLean
+            kind := declarationKind info
+            locallyEligible := locallyEligible name info
           }
         | _ => none
-      writeResponse output (.fingerprinted id names.size offset fingerprints)
-      serve env names input output
+      writeResponse output (.fingerprinted id allNames.size offset fingerprints)
+      serve env cache theoremNames allNames input output
   | .fetch id requestedNames =>
-      let artifacts := requestedNames.filterMap fun requested =>
-        indexedTheorem? env requested.toLean true
+      let artifacts ← requestedNames.filterMapM fun requested =>
+        indexedTheorem? env cache requested.toLean
       writeResponse output (.fetched id artifacts)
-      serve env names input output
+      serve env cache theoremNames allNames input output
   | .shutdown id => writeResponse output (.stopped id)
 
 def run : IO Unit := do
@@ -329,14 +413,14 @@ def run : IO Unit := do
   let env ← importModules #[{ module := `Mathlib }] options 0
   let input ← IO.getStdin
   let output ← IO.getStdout
+  let cache ← IO.mkRef {}
   writeResponse output (.ready {
     protocolVersion := 1
-    mathlibCommit := "7178aee7a431bb7527da15c3507836d8dfefcda4"
-    leanToolchain := "leanprover/lean4:v4.15.0-rc1"
-    leanCommit := "ffac974dba799956a97d63ffcb13a774f700149c"
+    leanVersion := Lean.versionStringCore
+    leanCommit := Lean.githash
     trustLevel := 0
   })
-  serve env (eligibleTheoremNames env) input output
+  serve env cache (eligibleTheoremNames env) (declarationNames env) input output
 
 end ReflexLeanWorker
 

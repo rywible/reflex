@@ -59,6 +59,11 @@ impl SymbolId {
     }
 }
 
+/// A canonical post-order structural view.
+///
+/// Every child index must be smaller than its parent index, and a non-empty
+/// view's root is always `node_count() - 1`. The Runtime relies on this ordering
+/// for root-only primitive and Derived Operator applications.
 pub trait StructuralView {
     type Sort: Copy + Eq + Hash;
     type Constructor: Copy + Eq + Hash;

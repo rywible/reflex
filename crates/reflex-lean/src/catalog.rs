@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::ast::{LeanEnvironmentIdentity, LeanName};
 use crate::worker::{LeanWorker, WorkerError};
 
-const MAGIC: &[u8; 8] = b"RFLCAT01";
+const MAGIC: &[u8; 8] = b"RFLCAT02";
 const CHECKSUM_BYTES: usize = 32;
 
 #[derive(Debug)]
@@ -51,10 +51,25 @@ enum NameComponent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeclarationKind {
+    Axiom,
+    Definition,
+    Theorem,
+    Opaque,
+    Quotient,
+    Inductive,
+    Constructor,
+    Recursor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEntry {
     pub name: u32,
     pub statement_hash: u64,
     pub dependencies: Vec<u32>,
+    pub kind: DeclarationKind,
+    pub locally_eligible: bool,
+    pub eligible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +118,9 @@ impl LeanCatalog {
                     name,
                     statement_hash,
                     dependencies,
+                    kind: DeclarationKind::parse(&fingerprint.kind)?,
+                    locally_eligible: fingerprint.locally_eligible,
+                    eligible: fingerprint.locally_eligible,
                 });
             }
             offset = offset.saturating_add(page_size).min(total);
@@ -132,6 +150,9 @@ impl LeanCatalog {
             mathlib_commit: decoder.string()?,
             lean_toolchain: decoder.string()?,
             lean_commit: decoder.string()?,
+            artifact_format: decoder.u32()?,
+            kernel_contract: decoder.u32()?,
+            worker_source_sha256: decoder.string()?,
         };
         let name_count = decoder.usize()?;
         let mut names = Vec::with_capacity(name_count);
@@ -168,6 +189,9 @@ impl LeanCatalog {
                 name,
                 statement_hash,
                 dependencies,
+                kind: DeclarationKind::decode(decoder.byte()?)?,
+                locally_eligible: decoder.boolean()?,
+                eligible: false,
             });
         }
         if !decoder.is_finished() {
@@ -176,6 +200,7 @@ impl LeanCatalog {
             ));
         }
         let content_sha256 = hex(expected_digest);
+        resolve_eligibility(&mut entries)?;
         Ok(Self {
             environment,
             names,
@@ -218,22 +243,26 @@ impl LeanCatalog {
         &self.entries
     }
 
+    pub fn eligible_entries(&self) -> impl Iterator<Item = &CatalogEntry> {
+        self.entries.iter().filter(|entry| entry.eligible)
+    }
+
+    pub fn require_environment(
+        &self,
+        expected: &LeanEnvironmentIdentity,
+    ) -> Result<(), CatalogError> {
+        if &self.environment == expected {
+            Ok(())
+        } else {
+            Err(CatalogError::Invalid(
+                "catalog environment identity differs from the installed Lean domain".into(),
+            ))
+        }
+    }
+
     #[must_use]
     pub fn name(&self, id: u32) -> Option<LeanName> {
-        fn expand(names: &[NameComponent], id: u32) -> Option<LeanName> {
-            match names.get(id as usize)? {
-                NameComponent::Anonymous => Some(LeanName::Anonymous),
-                NameComponent::String { parent, value } => Some(LeanName::Str {
-                    parent: Box::new(expand(names, *parent)?),
-                    value: value.clone(),
-                }),
-                NameComponent::Number { parent, value } => Some(LeanName::Num {
-                    parent: Box::new(expand(names, *parent)?),
-                    value: *value,
-                }),
-            }
-        }
-        expand(&self.names, id)
+        expand_name(&self.names, id)
     }
 
     #[must_use]
@@ -244,8 +273,9 @@ impl LeanCatalog {
     fn from_parts(
         environment: LeanEnvironmentIdentity,
         names: Vec<NameComponent>,
-        entries: Vec<CatalogEntry>,
+        mut entries: Vec<CatalogEntry>,
     ) -> Result<Self, CatalogError> {
+        resolve_eligibility(&mut entries)?;
         let mut catalog = Self {
             environment,
             names,
@@ -275,6 +305,9 @@ impl LeanCatalog {
         write_string(&mut output, &self.environment.mathlib_commit);
         write_string(&mut output, &self.environment.lean_toolchain);
         write_string(&mut output, &self.environment.lean_commit);
+        write_varint(&mut output, u64::from(self.environment.artifact_format));
+        write_varint(&mut output, u64::from(self.environment.kernel_contract));
+        write_string(&mut output, &self.environment.worker_source_sha256);
         write_usize(&mut output, self.names.len())?;
         for component in &self.names {
             match component {
@@ -299,8 +332,109 @@ impl LeanCatalog {
             for dependency in &entry.dependencies {
                 write_varint(&mut output, u64::from(*dependency));
             }
+            output.push(entry.kind.encode());
+            output.push(u8::from(entry.locally_eligible));
         }
         Ok(output)
+    }
+}
+
+impl DeclarationKind {
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        match value {
+            "axiom" => Ok(Self::Axiom),
+            "definition" => Ok(Self::Definition),
+            "theorem" => Ok(Self::Theorem),
+            "opaque" => Ok(Self::Opaque),
+            "quotient" => Ok(Self::Quotient),
+            "inductive" => Ok(Self::Inductive),
+            "constructor" => Ok(Self::Constructor),
+            "recursor" => Ok(Self::Recursor),
+            _ => Err(CatalogError::Invalid(format!(
+                "unknown declaration kind {value}"
+            ))),
+        }
+    }
+
+    const fn encode(&self) -> u8 {
+        match self {
+            Self::Axiom => 0,
+            Self::Definition => 1,
+            Self::Theorem => 2,
+            Self::Opaque => 3,
+            Self::Quotient => 4,
+            Self::Inductive => 5,
+            Self::Constructor => 6,
+            Self::Recursor => 7,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, CatalogError> {
+        match value {
+            0 => Ok(Self::Axiom),
+            1 => Ok(Self::Definition),
+            2 => Ok(Self::Theorem),
+            3 => Ok(Self::Opaque),
+            4 => Ok(Self::Quotient),
+            5 => Ok(Self::Inductive),
+            6 => Ok(Self::Constructor),
+            7 => Ok(Self::Recursor),
+            _ => Err(CatalogError::Invalid("declaration kind tag differs".into())),
+        }
+    }
+}
+
+fn resolve_eligibility(entries: &mut [CatalogEntry]) -> Result<(), CatalogError> {
+    let indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.name, index))
+        .collect::<HashMap<_, _>>();
+    if indexes.len() != entries.len() {
+        return Err(CatalogError::Invalid(
+            "catalog contains duplicate declaration names".into(),
+        ));
+    }
+    for entry in entries.iter_mut() {
+        entry.eligible = entry.locally_eligible
+            && entry
+                .dependencies
+                .iter()
+                .all(|dependency| indexes.contains_key(dependency));
+    }
+    loop {
+        let previous = entries
+            .iter()
+            .map(|entry| entry.eligible)
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for entry in entries.iter_mut().filter(|entry| entry.eligible) {
+            if entry.dependencies.iter().any(|dependency| {
+                indexes
+                    .get(dependency)
+                    .is_none_or(|index| !previous[*index])
+            }) {
+                entry.eligible = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
+}
+
+fn expand_name(names: &[NameComponent], id: u32) -> Option<LeanName> {
+    match names.get(id as usize)? {
+        NameComponent::Anonymous => Some(LeanName::Anonymous),
+        NameComponent::String { parent, value } => Some(LeanName::Str {
+            parent: Box::new(expand_name(names, *parent)?),
+            value: value.clone(),
+        }),
+        NameComponent::Number { parent, value } => Some(LeanName::Num {
+            parent: Box::new(expand_name(names, *parent)?),
+            value: *value,
+        }),
     }
 }
 
@@ -403,6 +537,19 @@ impl<'a> Decoder<'a> {
             .map_err(|_| CatalogError::Invalid("encoded value exceeds usize".into()))
     }
 
+    fn u32(&mut self) -> Result<u32, CatalogError> {
+        u32::try_from(self.varint()?)
+            .map_err(|_| CatalogError::Invalid("integer exceeds u32".into()))
+    }
+
+    fn boolean(&mut self) -> Result<bool, CatalogError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(CatalogError::Invalid("boolean tag differs".into())),
+        }
+    }
+
     fn name_id(&mut self, upper_bound: usize) -> Result<u32, CatalogError> {
         let id = u32::try_from(self.varint()?)
             .map_err(|_| CatalogError::Invalid("name ID exceeds u32".into()))?;
@@ -437,10 +584,12 @@ impl<'a> Decoder<'a> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(64), |mut hex, byte| {
-        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
-        hex
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+            hex
+        })
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -451,7 +600,14 @@ fn temporary_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoder, write_varint};
+    use std::collections::HashMap;
+
+    use crate::ast::{LeanEnvironmentIdentity, LeanName};
+
+    use super::{
+        CatalogEntry, DeclarationKind, Decoder, LeanCatalog, NameComponent, intern_name,
+        write_varint,
+    };
 
     #[test]
     fn canonical_varints_round_trip_boundaries() {
@@ -468,5 +624,62 @@ mod tests {
     fn overlong_varints_are_rejected() {
         let mut decoder = Decoder::new(&[0x80, 0]);
         assert!(decoder.varint().is_err());
+    }
+
+    #[test]
+    fn eligibility_is_dependency_closed_and_binary_round_trip_is_checked() {
+        let mut names = Vec::<NameComponent>::new();
+        let mut ids = HashMap::new();
+        let _ = intern_name(&LeanName::Anonymous, &mut names, &mut ids).unwrap();
+        let a = intern_name(&LeanName::from_dotted("A"), &mut names, &mut ids).unwrap();
+        let b = intern_name(&LeanName::from_dotted("B"), &mut names, &mut ids).unwrap();
+        let c = intern_name(&LeanName::from_dotted("C"), &mut names, &mut ids).unwrap();
+        let environment = LeanEnvironmentIdentity {
+            mathlib_commit: "mathlib".into(),
+            lean_toolchain: "toolchain".into(),
+            lean_commit: "lean".into(),
+            artifact_format: 2,
+            kernel_contract: 2,
+            worker_source_sha256: "worker".into(),
+        };
+        let entry = |name, dependencies, locally_eligible| CatalogEntry {
+            name,
+            statement_hash: u64::from(name),
+            dependencies,
+            kind: DeclarationKind::Theorem,
+            locally_eligible,
+            eligible: locally_eligible,
+        };
+        let catalog = LeanCatalog::from_parts(
+            environment.clone(),
+            names,
+            vec![
+                entry(a, vec![b], true),
+                entry(b, vec![], false),
+                entry(c, vec![], true),
+            ],
+        )
+        .unwrap();
+        assert!(!catalog.entries()[0].eligible);
+        assert!(!catalog.entries()[1].eligible);
+        assert!(catalog.entries()[2].eligible);
+
+        let path = std::env::temp_dir().join(format!(
+            "reflex-lean-catalog-test-{}-{}.bin",
+            std::process::id(),
+            catalog.content_sha256()
+        ));
+        let corrupt = path.with_extension("corrupt.bin");
+        catalog.save_new(&path).unwrap();
+        let loaded = LeanCatalog::load(&path).unwrap();
+        assert_eq!(loaded.environment(), &environment);
+        assert_eq!(loaded.entries(), catalog.entries());
+        assert_eq!(loaded.content_sha256(), catalog.content_sha256());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&corrupt, bytes).unwrap();
+        assert!(LeanCatalog::load(&corrupt).is_err());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(corrupt).unwrap();
     }
 }

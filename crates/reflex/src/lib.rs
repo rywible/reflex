@@ -15,8 +15,8 @@ mod runtime;
 
 pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
-    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, ImmediateArity,
-    ExternalVerificationUsage, KernelRevision, OperatorAlgebra, OperatorDescriptor,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
+    ExternalVerificationUsage, ImmediateArity, KernelRevision, OperatorAlgebra, OperatorDescriptor,
     OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter, SemanticIdentity,
     StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
     VerificationAllowance, VerificationBatch, VerificationBatchOutcome, VerificationBatchReport,

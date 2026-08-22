@@ -7,12 +7,17 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::ast::{LeanEnvironmentIdentity, LeanExpr, LeanName};
-use crate::{LEAN_COMMIT, LEAN_TOOLCHAIN, MATHLIB_COMMIT};
+use crate::{
+    ARTIFACT_FORMAT_VERSION, KERNEL_CONTRACT_VERSION, LEAN_COMMIT, LEAN_RUNTIME_VERSION,
+    LEAN_TOOLCHAIN, LEAN_VERSION, MATHLIB_COMMIT,
+};
 
 pub const PROTOCOL_VERSION: usize = 1;
-pub const DEFAULT_WORKER_RESIDENT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_WORKER_RESIDENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const MINIMUM_WORKER_RESIDENT_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -54,10 +59,7 @@ pub struct LeanWorkerConfig {
 }
 
 impl LeanWorkerConfig {
-    pub fn pinned(
-        lake_executable: impl Into<PathBuf>,
-        mathlib_root: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn pinned(lake_executable: impl Into<PathBuf>, mathlib_root: impl Into<PathBuf>) -> Self {
         Self {
             lake_executable: lake_executable.into(),
             mathlib_root: mathlib_root.into(),
@@ -81,21 +83,93 @@ impl LeanWorkerConfig {
                 )));
             }
         }
-        let head = std::fs::read_to_string(self.mathlib_root.join(".git/HEAD"))?;
-        if !head.contains(MATHLIB_COMMIT) {
-            let output = Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&self.mathlib_root)
-                .output()?;
-            let actual = String::from_utf8_lossy(&output.stdout);
-            if actual.trim() != MATHLIB_COMMIT {
-                return Err(WorkerError::Protocol(format!(
-                    "mathlib checkout is {}, expected {MATHLIB_COMMIT}",
-                    actual.trim()
-                )));
-            }
+        if self.resident_bytes.get() < MINIMUM_WORKER_RESIDENT_BYTES {
+            return Err(WorkerError::Protocol(format!(
+                "Lean worker resident allowance is below the hard {MINIMUM_WORKER_RESIDENT_BYTES} byte minimum"
+            )));
         }
+        verify_git_checkout(&self.mathlib_root, MATHLIB_COMMIT, "mathlib")?;
+        verify_manifest_dependencies(&self.mathlib_root)?;
+        run_checked(
+            &self.lake_executable,
+            &["build", "Mathlib"],
+            &self.mathlib_root,
+            "pinned Mathlib build validation",
+        )?;
+        let lean_commit = run_checked(
+            &self.lake_executable,
+            &["env", "lean", "--githash"],
+            &self.mathlib_root,
+            "Lean compiler identity",
+        )?;
+        if lean_commit.trim() != LEAN_COMMIT {
+            return Err(WorkerError::Protocol(format!(
+                "Lean compiler is {}, expected {LEAN_COMMIT}",
+                lean_commit.trim()
+            )));
+        }
+        let lean_version = run_checked(
+            &self.lake_executable,
+            &["env", "lean", "--version"],
+            &self.mathlib_root,
+            "Lean compiler version",
+        )?;
+        if !lean_version.contains(&format!("version {LEAN_VERSION},")) {
+            return Err(WorkerError::Protocol(format!(
+                "Lean compiler version differs from {LEAN_VERSION}: {}",
+                lean_version.trim()
+            )));
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(WorkerError::Protocol(
+            "external Lean workers currently require Linux prlimit for a hard memory bound".into(),
+        ));
+        #[cfg(target_os = "linux")]
+        run_checked(
+            Path::new("prlimit"),
+            &["--version"],
+            &self.mathlib_root,
+            "Linux worker resource limiter",
+        )?;
         Ok(())
+    }
+
+    pub fn environment_identity(&self) -> Result<LeanEnvironmentIdentity, WorkerError> {
+        let worker_source = std::fs::read(&self.worker_source)?;
+        Ok(LeanEnvironmentIdentity {
+            mathlib_commit: MATHLIB_COMMIT.into(),
+            lean_toolchain: LEAN_TOOLCHAIN.into(),
+            lean_commit: LEAN_COMMIT.into(),
+            artifact_format: ARTIFACT_FORMAT_VERSION,
+            kernel_contract: KERNEL_CONTRACT_VERSION,
+            worker_source_sha256: hex(&Sha256::digest(worker_source)),
+        })
+    }
+
+    fn lean_invocation(&self) -> Result<LeanInvocation, WorkerError> {
+        let value = |name| {
+            run_checked(
+                &self.lake_executable,
+                &["env", "printenv", name],
+                &self.mathlib_root,
+                &format!("Lake environment variable {name}"),
+            )
+            .map(|value| value.trim_end().to_owned())
+        };
+        let executable = PathBuf::from(value("LEAN")?);
+        if !executable.is_file() {
+            return Err(WorkerError::Protocol(format!(
+                "Lake resolved a missing Lean executable: {}",
+                executable.display()
+            )));
+        }
+        Ok(LeanInvocation {
+            executable,
+            lean_path: value("LEAN_PATH")?,
+            lean_src_path: value("LEAN_SRC_PATH")?,
+            library_path: value("LD_LIBRARY_PATH")?,
+            sysroot: value("LEAN_SYSROOT")?,
+        })
     }
 }
 
@@ -113,7 +187,9 @@ pub struct IndexedTheorem {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationItem {
-    pub proposition: LeanExpr,
+    pub level_params: Vec<LeanName>,
+    pub claim_proposition: LeanExpr,
+    pub candidate_proposition: LeanExpr,
     pub proof_term: LeanExpr,
     pub allowed_axioms: Vec<LeanName>,
 }
@@ -122,6 +198,7 @@ pub struct VerificationItem {
 #[serde(rename_all = "camelCase")]
 pub struct VerificationResult {
     pub accepted: bool,
+    pub dependencies: Vec<LeanName>,
     pub axioms: Vec<LeanName>,
     pub diagnostic: String,
 }
@@ -132,6 +209,8 @@ pub struct TheoremFingerprint {
     pub name: LeanName,
     pub statement_hash: String,
     pub dependencies: Vec<LeanName>,
+    pub kind: String,
+    pub locally_eligible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -158,8 +237,13 @@ pub struct WorkerUsage {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 enum Request<'a> {
-    Ping { id: String },
-    Verify { id: String, items: &'a [VerificationItem] },
+    Ping {
+        id: String,
+    },
+    Verify {
+        id: String,
+        items: &'a [VerificationItem],
+    },
     Index {
         id: String,
         offset: usize,
@@ -170,15 +254,24 @@ enum Request<'a> {
         offset: usize,
         limit: usize,
     },
-    Fetch { id: String, names: &'a [LeanName] },
-    Shutdown { id: String },
+    Fetch {
+        id: String,
+        names: &'a [LeanName],
+    },
+    Shutdown {
+        id: String,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum Response {
-    Ready { handshake: Handshake },
-    Pong { id: String },
+    Ready {
+        handshake: Handshake,
+    },
+    Pong {
+        id: String,
+    },
     Verified {
         id: String,
         results: Vec<VerificationResult>,
@@ -199,16 +292,20 @@ enum Response {
         id: String,
         artifacts: Vec<IndexedTheorem>,
     },
-    Stopped { id: String },
-    Failed { id: String, diagnostic: String },
+    Stopped {
+        id: String,
+    },
+    Failed {
+        id: String,
+        diagnostic: String,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Handshake {
     protocol_version: usize,
-    mathlib_commit: String,
-    lean_toolchain: String,
+    lean_version: String,
     lean_commit: String,
     trust_level: usize,
 }
@@ -218,6 +315,29 @@ struct Process {
     input: BufWriter<ChildStdin>,
     output: BufReader<ChildStdout>,
     next_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LakeManifest {
+    packages_dir: PathBuf,
+    packages: Vec<LakePackage>,
+}
+
+#[derive(Deserialize)]
+struct LakePackage {
+    name: String,
+    #[serde(rename = "type")]
+    source_type: String,
+    rev: String,
+}
+
+struct LeanInvocation {
+    executable: PathBuf,
+    lean_path: String,
+    lean_src_path: String,
+    library_path: String,
+    sysroot: String,
 }
 
 impl Process {
@@ -285,31 +405,49 @@ impl LeanWorker {
         deadline: Option<Duration>,
     ) -> Result<Self, WorkerError> {
         config.validate()?;
-        let worker_root = config.worker_source.parent().ok_or_else(|| {
-            WorkerError::Protocol("worker source has no parent directory".into())
-        })?;
-        let mut child = Command::new(&config.lake_executable)
-            .args([
-                "env",
-                "lean",
-                "--trust=0",
-                "--threads=1",
-                "-DwarningAsError=true",
-            ])
+        let invocation = config.lean_invocation()?;
+        let worker_root = config
+            .worker_source
+            .parent()
+            .ok_or_else(|| WorkerError::Protocol("worker source has no parent directory".into()))?;
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let mut command = Command::new("prlimit");
+            command
+                .arg(format!("--as={}", config.resident_bytes.get()))
+                .arg("--")
+                .arg(&invocation.executable);
+            command
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut command = Command::new(&invocation.executable);
+        command
+            .args(["--trust=0", "--threads=1", "-DwarningAsError=true"])
             .arg(format!("--root={}", worker_root.display()))
             .arg("--run")
             .arg(&config.worker_source)
             .current_dir(&config.mathlib_root)
+            .env("LEAN_PATH", &invocation.lean_path)
+            .env("LEAN_SRC_PATH", &invocation.lean_src_path)
+            .env("LD_LIBRARY_PATH", &invocation.library_path)
+            .env("LEAN_SYSROOT", &invocation.sysroot)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let input = child.stdin.take().ok_or_else(|| {
-            WorkerError::Protocol("worker did not expose standard input".into())
-        })?;
-        let output = child.stdout.take().ok_or_else(|| {
-            WorkerError::Protocol("worker did not expose standard output".into())
-        })?;
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn()?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| WorkerError::Protocol("worker did not expose standard input".into()))?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| WorkerError::Protocol("worker did not expose standard output".into()))?;
         let mut process = Process {
             child,
             input: BufWriter::new(input),
@@ -347,20 +485,15 @@ impl LeanWorker {
             ));
         };
         if handshake.protocol_version != PROTOCOL_VERSION
-            || handshake.mathlib_commit != MATHLIB_COMMIT
-            || handshake.lean_toolchain != LEAN_TOOLCHAIN
+            || handshake.lean_version != LEAN_RUNTIME_VERSION
             || handshake.lean_commit != LEAN_COMMIT
             || handshake.trust_level != 0
         {
             return Err(WorkerError::Protocol(
-                "worker reported an incompatible semantic identity".into(),
+                "worker reported an incompatible environment or kernel pin".into(),
             ));
         }
-        let environment = LeanEnvironmentIdentity {
-            mathlib_commit: handshake.mathlib_commit,
-            lean_toolchain: handshake.lean_toolchain,
-            lean_commit: handshake.lean_commit,
-        };
+        let environment = config.environment_identity()?;
         Ok(Self {
             process: Mutex::new(process),
             resident_bytes: config.resident_bytes,
@@ -538,7 +671,9 @@ fn unexpected(expected: &str, response: Response) -> WorkerError {
         Response::Stopped { id } => WorkerError::Protocol(format!(
             "worker stopped after request {id} while awaiting {expected}"
         )),
-        _ => WorkerError::Protocol(format!("worker returned an unexpected response to {expected}")),
+        _ => WorkerError::Protocol(format!(
+            "worker returned an unexpected response to {expected}"
+        )),
     }
 }
 
@@ -548,10 +683,82 @@ fn decode_json<T: for<'de> Deserialize<'de>>(encoded: &str) -> Result<T, WorkerE
     Ok(T::deserialize(&mut deserializer)?)
 }
 
+fn run_checked(
+    executable: &Path,
+    arguments: &[&str],
+    directory: &Path,
+    description: &str,
+) -> Result<String, WorkerError> {
+    let output = Command::new(executable)
+        .args(arguments)
+        .current_dir(directory)
+        .output()?;
+    if !output.status.success() {
+        return Err(WorkerError::Protocol(format!(
+            "{description} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn verify_git_checkout(path: &Path, expected: &str, description: &str) -> Result<(), WorkerError> {
+    let actual = run_checked("git".as_ref(), &["rev-parse", "HEAD"], path, description)?;
+    if actual.trim() != expected {
+        return Err(WorkerError::Protocol(format!(
+            "{description} checkout is {}, expected {expected}",
+            actual.trim()
+        )));
+    }
+    let status = run_checked(
+        "git".as_ref(),
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        path,
+        description,
+    )?;
+    if !status.trim().is_empty() {
+        return Err(WorkerError::Protocol(format!(
+            "{description} checkout is dirty: {}",
+            status.lines().next().unwrap_or("unknown change")
+        )));
+    }
+    Ok(())
+}
+
+fn verify_manifest_dependencies(mathlib_root: &Path) -> Result<(), WorkerError> {
+    let manifest: LakeManifest =
+        serde_json::from_slice(&std::fs::read(mathlib_root.join("lake-manifest.json"))?)?;
+    for package in manifest
+        .packages
+        .iter()
+        .filter(|package| package.source_type == "git")
+    {
+        let path = mathlib_root
+            .join(&manifest.packages_dir)
+            .join(&package.name);
+        verify_git_checkout(
+            &path,
+            &package.rev,
+            &format!("Lake package {}", package.name),
+        )?;
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
 #[cfg(unix)]
 fn terminate_process(pid: u32) {
     let _ = Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
+        .args(["-KILL", "--", &format!("-{pid}")])
         .status();
 }
 

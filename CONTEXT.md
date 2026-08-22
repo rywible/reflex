@@ -120,6 +120,14 @@ _Avoid_: Replay Corpus, Scientific Corpus, benchmark leaderboard
 A sealed body of internal evaluation material that cannot influence search, training, tuning, or Operational Promotion and exists only for Scientific Confirmation.
 _Avoid_: Selection Corpus, public benchmark, training data
 
+**Temporal Audit Corpus**:
+A Scientific Corpus drawn from a later time boundary than the training environment and sealed before implementation or protocol freeze; it tests whether earlier learned Potential predicts later independently created value without allowing future information into development.
+_Avoid_: Replay Corpus, migration fixture, current library
+
+**Proof Collapse**:
+A kernel-Verified replacement proof for the same Seed-relative proposition that improves one or more proof Measurements, especially by reusing a shorter or more general existing declaration.
+_Avoid_: theorem alias, unchecked simplification, proof deletion
+
 **Artifact**:
 A verified domain object retained with its provenance and Verification Record as reusable knowledge for future search.
 _Avoid_: Candidate, result

@@ -1,6 +1,6 @@
 # Type variable-length Structural Protocol immediates
 
-A Structural Protocol constructor declares its immediate arity as either `Exact(n)` or `Variable`; it must not encode variable-length payloads behind a sentinel fixed count. Exact arity remains the default constructor-descriptor path.
+A Structural Protocol constructor declares its immediate arity as either `Exact(n)` or `Variable`; it must not encode variable-length payloads behind a sentinel fixed count. Exact arity remains the default constructor-descriptor path. Every Structural View uses canonical post-order node indexes with children before parents and the root last.
 
 ## Considered Options
 
