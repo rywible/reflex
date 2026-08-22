@@ -225,28 +225,23 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
         .iter()
         .map(|artifact| artifact.semantic_group)
         .collect::<HashSet<_>>();
-    let training = deterministic_prefix(
+    let training_pool = deterministic_prefix(
         december_artifacts
             .iter()
             .filter(|artifact| earlier_names.contains(&artifact.declaration)),
-        arguments.training_artifacts,
+        arguments.training_artifacts.saturating_mul(8),
     );
-    let heldout = deterministic_prefix(
+    let heldout_pool = deterministic_prefix(
         december_artifacts
             .iter()
             .filter(|artifact| !earlier_families.contains(&artifact.semantic_group)),
-        arguments.heldout_artifacts,
+        arguments.heldout_artifacts.saturating_mul(8),
     );
-    if training.len() != arguments.training_artifacts
-        || heldout.len() != arguments.heldout_artifacts
-    {
-        return Err("Lean development corpus cannot satisfy the requested disjoint scopes".into());
-    }
     let config = LeanWorkerConfig::pinned(&arguments.lake, &arguments.december_root);
     let worker = LeanWorker::start(&config)?;
-    let names = training
+    let names = training_pool
         .iter()
-        .chain(&heldout)
+        .chain(&heldout_pool)
         .map(|artifact| artifact.declaration.clone())
         .collect::<Vec<_>>();
     let mut by_name = worker
@@ -254,20 +249,31 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
         .into_iter()
         .map(|theorem| (theorem.name.clone(), theorem))
         .collect::<HashMap<_, _>>();
-    let ordered = names
+    let mut training = training_pool
         .iter()
-        .map(|name| {
-            by_name
-                .remove(name)
-                .ok_or_else(|| format!("Lean development theorem {name} is unavailable"))
-        })
-        .collect::<Result<Vec<IndexedTheorem>, _>>()?;
+        .filter_map(|artifact| by_name.remove(&artifact.declaration))
+        .take(arguments.training_artifacts)
+        .collect::<Vec<_>>();
+    let heldout = heldout_pool
+        .iter()
+        .filter_map(|artifact| by_name.remove(&artifact.declaration))
+        .take(arguments.heldout_artifacts)
+        .collect::<Vec<_>>();
+    if training.len() != arguments.training_artifacts
+        || heldout.len() != arguments.heldout_artifacts
+    {
+        return Err("Lean development corpus cannot satisfy the requested fetchable scopes".into());
+    }
+    let training_count = training.len();
+    let heldout_count = heldout.len();
+    training.extend(heldout);
+    let ordered: Vec<IndexedTheorem> = training;
     let corpus = LeanCorpus::verified_theorems(&worker, ordered)?;
     drop(worker);
     let heldout_seed_nodes = corpus
         .entries()
         .iter()
-        .skip(training.len())
+        .skip(training_count)
         .map(|entry| {
             (
                 entry.name.to_string(),
@@ -278,8 +284,8 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
     Ok(DevelopmentCorpus {
         config,
         corpus,
-        training: training.len(),
-        heldout: heldout.len(),
+        training: training_count,
+        heldout: heldout_count,
         heldout_seed_nodes,
     })
 }
