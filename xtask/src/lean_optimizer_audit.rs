@@ -8,7 +8,7 @@ use std::time::Duration;
 use reflex::internal_experiments::{
     CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
     CandidateNoveltyFilterReasonInspection, ExperienceVerdictInspection,
-    compare_candidate_features, inspect_experience_segment,
+    compare_candidate_features, inspect_experience_segment, inspect_session_segment,
 };
 use reflex::{
     BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
@@ -26,11 +26,11 @@ use sha2::{Digest, Sha256};
 
 use crate::harness::{
     AnyError, HostEnvironment, HostIsolation, HostIsolationPolicy, capture_child_host_isolated,
-    environment, hash_file, hash_json, hex, inherited_host_isolation, parse_flag_values,
-    require_absent, require_clean, require_release,
+    completion_name, environment, hash_file, hash_json, hex, inherited_host_isolation,
+    parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v15";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v16";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -133,6 +133,10 @@ struct LearningSummary {
 struct BundleSummary {
     schema: &'static str,
     identity: String,
+    completed: bool,
+    completion: Option<&'static str>,
+    requested: Usage,
+    usage: Usage,
     artifact_records: u64,
     experience_entries: u64,
     experience_claims: usize,
@@ -396,6 +400,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
         .ok_or("lean-bundle-summary requires --bundle PATH")?;
     let bytes = std::fs::read(path)?;
     let decoded = CanonicalBundle::decode(&bytes, 1024 * 1024 * 1024)?;
+    let session = inspect_session_segment(decoded.segment(SegmentKind::Session))?;
     let artifacts = decoded.segment(SegmentKind::Artifacts);
     if artifacts.len() < 8 {
         return Err("Lean Bundle has a truncated Artifact count".into());
@@ -426,8 +431,12 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
     })
     .collect();
     let summary = BundleSummary {
-        schema: "reflex-lean-bundle-summary-v1",
+        schema: "reflex-lean-bundle-summary-v2",
         identity: String::from_utf8(decoded.identity().to_vec())?,
+        completed: session.completed,
+        completion: session.completion.map(completion_name),
+        requested: usage(session.requested),
+        usage: usage(session.usage),
         artifact_records,
         experience_entries: experience.entries,
         experience_claims: experience.claims,
@@ -452,7 +461,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v12";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v13";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;

@@ -7,7 +7,39 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::{DomainDefinition, ImprovementRequest, SessionError};
+use crate::{Completion, DomainDefinition, ImprovementRequest, ResourceUsage, SessionError};
+
+/// Repository-facing projection of the durable Session envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionInspection {
+    pub completed: bool,
+    pub requested: ResourceUsage,
+    pub kernel_revision: u64,
+    pub environment: Vec<u8>,
+    pub completion: Option<Completion>,
+    pub usage: ResourceUsage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionInspectionError;
+
+impl std::fmt::Display for SessionInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("malformed Session segment")
+    }
+}
+
+impl std::error::Error for SessionInspectionError {}
+
+/// Decodes the resource request, terminal disposition, and measured usage from
+/// a Session segment without duplicating its durable framing in an experiment.
+///
+/// # Errors
+///
+/// Returns an error when the segment framing or fingerprints are malformed.
+pub fn inspect_session_segment(bytes: &[u8]) -> Result<SessionInspection, SessionInspectionError> {
+    crate::runtime::inspect_session_segment(bytes).map_err(|()| SessionInspectionError)
+}
 
 /// Test-facing projection decoded through the production Experience codec.
 #[derive(Clone, Debug)]

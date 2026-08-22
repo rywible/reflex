@@ -224,9 +224,10 @@ enum SessionSeal {
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
+const GENERATION_COHORT_LOOKAHEAD: u64 = 2;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 11;
+const RUNTIME_REVISION: u64 = 12;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -285,6 +286,110 @@ where
             &scheduler,
             requirements,
         )
+    })
+}
+
+struct DecodedSession<'a> {
+    completed: bool,
+    encoded_scope: &'a [u8],
+    encoded_cursor: &'a [u8],
+    #[cfg(feature = "internal-experiments")]
+    requested: ResourceUsage,
+    kernel_revision: u64,
+    compatibility_prefix_len: usize,
+    #[cfg(feature = "internal-experiments")]
+    environment: &'a [u8],
+    #[cfg(feature = "internal-experiments")]
+    completion: Option<Completion>,
+    usage: ResourceUsage,
+}
+
+fn decode_session_segment<E>(bytes: &[u8]) -> Result<DecodedSession<'_>, SessionError<E>> {
+    let mut input = bytes;
+    let disposition = take_bundle(&mut input, 1)?[0];
+    if !matches!(disposition, 0 | 1) {
+        return Err(SessionError::CorruptBundle);
+    }
+    if read_bundle_u64(&mut input)? != RUNTIME_REVISION {
+        return Err(SessionError::IncompatibleBundle);
+    }
+    take_bundle(&mut input, 32)?;
+    let scope_fingerprint = take_bundle(&mut input, 32)?;
+    let encoded_scope = take_sized(&mut input)?;
+    if Sha256::digest(encoded_scope)[..] != *scope_fingerprint {
+        return Err(SessionError::CorruptBundle);
+    }
+    let cursor_fingerprint = take_bundle(&mut input, 32)?;
+    let encoded_cursor = take_sized(&mut input)?;
+    if Sha256::digest(encoded_cursor)[..] != *cursor_fingerprint {
+        return Err(SessionError::CorruptBundle);
+    }
+    let requested = ResourceUsage {
+        worker_threads: usize::try_from(read_bundle_u64(&mut input)?)
+            .map_err(|_| SessionError::CorruptBundle)?,
+        resident_bytes: read_bundle_u64(&mut input)?,
+        durable_bytes: read_bundle_u64(&mut input)?,
+        elapsed_time: read_bundle_duration(&mut input)?,
+        cpu_time: read_bundle_duration(&mut input)?,
+        verification_requests: read_bundle_u64(&mut input)?,
+    };
+    let kernel_revision = read_bundle_u64(&mut input)?;
+    let compatibility_prefix_len = bytes.len() - input.len();
+    let environment = take_sized(&mut input)?;
+    let completion_byte = take_bundle(&mut input, 1)?[0];
+    let completion = match completion_byte {
+        0 => None,
+        1 => Some(Completion::ResourceEnvelopeExhausted),
+        2 => Some(Completion::SuccessConditionsSatisfied),
+        3 => Some(Completion::StoppedByObserver),
+        4 => Some(Completion::NoEligibleWork),
+        _ => return Err(SessionError::CorruptBundle),
+    };
+    if environment.is_empty() || !matches!((disposition, completion), (0, None) | (1, Some(_))) {
+        return Err(SessionError::CorruptBundle);
+    }
+    let usage = ResourceUsage {
+        worker_threads: usize::try_from(read_bundle_u64(&mut input)?)
+            .map_err(|_| SessionError::CorruptBundle)?,
+        resident_bytes: read_bundle_u64(&mut input)?,
+        verification_requests: read_bundle_u64(&mut input)?,
+        durable_bytes: read_bundle_u64(&mut input)?,
+        elapsed_time: read_bundle_duration(&mut input)?,
+        cpu_time: read_bundle_duration(&mut input)?,
+    };
+    if !input.is_empty() {
+        return Err(SessionError::CorruptBundle);
+    }
+    #[cfg(not(feature = "internal-experiments"))]
+    let _ = requested;
+    Ok(DecodedSession {
+        completed: disposition == 1,
+        encoded_scope,
+        encoded_cursor,
+        #[cfg(feature = "internal-experiments")]
+        requested,
+        kernel_revision,
+        compatibility_prefix_len,
+        #[cfg(feature = "internal-experiments")]
+        environment,
+        #[cfg(feature = "internal-experiments")]
+        completion,
+        usage,
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+pub(crate) fn inspect_session_segment(
+    bytes: &[u8],
+) -> Result<crate::internal_experiments::SessionInspection, ()> {
+    let decoded = decode_session_segment::<()>(bytes).map_err(|_| ())?;
+    Ok(crate::internal_experiments::SessionInspection {
+        completed: decoded.completed,
+        requested: decoded.requested,
+        kernel_revision: decoded.kernel_revision,
+        environment: decoded.environment.to_vec(),
+        completion: decoded.completion,
+        usage: decoded.usage,
     })
 }
 
@@ -1126,14 +1231,23 @@ where
         let mut candidates = Vec::new();
         let mut application_bytes = vector_bytes(&pending_parent_indexes);
         let mut choice_window_exhausted = false;
+        let mut covered_claims = ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.claim_digest)
+            .collect::<Vec<_>>();
+        covered_claims.sort_unstable();
+        covered_claims.dedup();
+        let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
+        let cohort_limit = cohort::limit(
+            remaining,
+            verification_workers.worker_lanes(),
+            &parent_claims,
+            &covered_claims,
+        );
         let available_resident = resource_meter.available_resident(resident_before_epoch);
-        let generation_limit = usize::try_from(
-            remaining_verifications
-                .saturating_mul(CHOICES_PER_VERIFICATION)
-                .min(available_resident / MIN_CHOICE_RESIDENT_BYTES)
-                .min(MAX_CANDIDATE_CHOICES),
-        )
-        .unwrap_or(usize::MAX);
+        let generation_limit =
+            candidate_generation_limit(cohort_limit, remaining_verifications, available_resident);
         if generation_limit == 0 {
             resident_budget_exhausted = true;
             break;
@@ -1312,20 +1426,6 @@ where
         candidates = novel.candidates;
         let mut candidate_fates = novel.fates;
         let fate_is_new_generation = novel.fate_is_new_generation;
-        let mut covered_claims = ledger
-            .entries()
-            .iter()
-            .map(|entry| entry.claim_digest)
-            .collect::<Vec<_>>();
-        covered_claims.sort_unstable();
-        covered_claims.dedup();
-        let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
-        let cohort_limit = cohort::limit(
-            remaining,
-            verification_workers.worker_lanes(),
-            &parent_claims,
-            &covered_claims,
-        );
         deferred_candidates = order_by_learned_potential(
             &goal_evaluator,
             &frontier,
@@ -2032,6 +2132,24 @@ fn candidate_pipeline_reserve<D: DomainDefinition>(
             .saturating_mul(2);
         bytes.saturating_add(ledger.max(4 * 1024))
     })
+}
+
+fn candidate_generation_limit(
+    cohort_limit: usize,
+    remaining_verifications: u64,
+    available_resident: u64,
+) -> usize {
+    let verification_lookahead = u64::try_from(cohort_limit)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(GENERATION_COHORT_LOOKAHEAD)
+        .min(remaining_verifications);
+    let cohort_choices = verification_lookahead.saturating_mul(CHOICES_PER_VERIFICATION);
+    usize::try_from(
+        cohort_choices
+            .min(available_resident / MIN_CHOICE_RESIDENT_BYTES)
+            .min(MAX_CANDIDATE_CHOICES),
+    )
+    .unwrap_or(usize::MAX)
 }
 
 fn opportunity_features<D: DomainDefinition>(
@@ -3459,98 +3577,50 @@ fn decode_bundle<D: DomainDefinition>(
 fn validate_session<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
-    mut input: &[u8],
+    input: &[u8],
 ) -> Result<Option<ResourceUsage>, SessionError<D::Error>> {
-    let encoded_session = input;
-    let disposition = take_bundle(&mut input, 1)?[0];
-    if !matches!(disposition, 0 | 1) {
-        return Err(SessionError::CorruptBundle);
-    }
-    if read_bundle_u64(&mut input)? != RUNTIME_REVISION {
-        return Err(SessionError::IncompatibleBundle);
-    }
-    let _goal_fingerprint = take_bundle(&mut input, 32)?;
-    let scope_fingerprint = take_bundle(&mut input, 32)?;
-    let encoded_scope = take_sized(&mut input)?;
-    if Sha256::digest(encoded_scope)[..] != *scope_fingerprint {
-        return Err(SessionError::CorruptBundle);
-    }
+    let decoded = decode_session_segment(input)?;
     let scope = domain
         .seeds()
-        .decode_scope(encoded_scope)
+        .decode_scope(decoded.encoded_scope)
         .map_err(|_| SessionError::CorruptBundle)?;
     let mut canonical_scope = Vec::new();
     domain
         .seeds()
         .encode_scope(&scope, &mut canonical_scope)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if canonical_scope != encoded_scope {
-        return Err(SessionError::CorruptBundle);
-    }
-    let cursor_fingerprint = take_bundle(&mut input, 32)?;
-    let encoded_cursor = take_sized(&mut input)?;
-    if Sha256::digest(encoded_cursor)[..] != *cursor_fingerprint {
+    if canonical_scope != decoded.encoded_scope {
         return Err(SessionError::CorruptBundle);
     }
     let cursor = domain
         .seeds()
-        .decode_cursor(encoded_cursor)
+        .decode_cursor(decoded.encoded_cursor)
         .map_err(|_| SessionError::CorruptBundle)?;
     let mut canonical_cursor = Vec::new();
     domain
         .seeds()
         .encode_cursor(&cursor, &mut canonical_cursor)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if canonical_cursor != encoded_cursor {
+    if canonical_cursor != decoded.encoded_cursor {
         return Err(SessionError::CorruptBundle);
     }
-    let _worker_threads = read_bundle_u64(&mut input)?;
-    let _resident_bytes = read_bundle_u64(&mut input)?;
-    let _durable_bytes = read_bundle_u64(&mut input)?;
-    take_bundle(&mut input, 12)?;
-    take_bundle(&mut input, 12)?;
-    let _verification_requests = read_bundle_u64(&mut input)?;
-    if read_bundle_u64(&mut input)? != domain.kernel().revision().0 {
+    if decoded.kernel_revision != domain.kernel().revision().0 {
         return Err(SessionError::IncompatibleBundle);
     }
-    let compatibility_prefix_len = encoded_session.len() - input.len();
-    let environment = take_sized(&mut input)?;
-    let completion = take_bundle(&mut input, 1)?[0];
-    if environment.is_empty() || !matches!((disposition, completion), (0, 0) | (1, 1..=4)) {
-        return Err(SessionError::CorruptBundle);
-    }
-    let worker_threads =
-        usize::try_from(read_bundle_u64(&mut input)?).map_err(|_| SessionError::CorruptBundle)?;
-    let resident_bytes = read_bundle_u64(&mut input)?;
-    let verification_requests = read_bundle_u64(&mut input)?;
-    let durable_bytes = read_bundle_u64(&mut input)?;
-    let elapsed_time = read_bundle_duration(&mut input)?;
-    let cpu_time = read_bundle_duration(&mut input)?;
-    if !input.is_empty() {
-        return Err(SessionError::CorruptBundle);
-    }
-    let usage = ResourceUsage {
-        worker_threads,
-        resident_bytes,
-        verification_requests,
-        durable_bytes,
-        elapsed_time,
-        cpu_time,
-    };
-    if disposition == 0 {
+    if !decoded.completed {
         let expected = encode_session(
             domain,
             request,
-            encoded_cursor,
-            SessionSeal::Interrupted(usage),
+            decoded.encoded_cursor,
+            SessionSeal::Interrupted(decoded.usage),
         )?;
-        if expected.get(..compatibility_prefix_len)
-            != encoded_session.get(..compatibility_prefix_len)
+        if expected.get(..decoded.compatibility_prefix_len)
+            != input.get(..decoded.compatibility_prefix_len)
         {
             return Err(SessionError::IncompatibleBundle);
         }
     }
-    Ok((disposition == 0).then_some(usage))
+    Ok((!decoded.completed).then_some(decoded.usage))
 }
 
 fn finish_scheduled<D: DomainDefinition, T>(
@@ -4515,12 +4585,67 @@ fn test_fault_point(_: &str) {}
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
+    use std::time::Duration;
+
+    use sha2::Digest;
 
     use super::{
-        append_proposal_features, operator_feature_values, protected_origin_keys, sort_prefix_by,
+        RUNTIME_REVISION, append_proposal_features, candidate_generation_limit,
+        inspect_session_segment, operator_feature_values, protected_origin_keys, push_bytes,
+        push_duration, push_u64, sort_prefix_by,
     };
     use crate::ProposalFeatures;
     use crate::learning::{FEATURE_COUNT, Features};
+
+    #[test]
+    fn session_inspection_reports_completion_and_resource_usage() {
+        let mut encoded = vec![1];
+        push_u64(&mut encoded, RUNTIME_REVISION);
+        encoded.extend_from_slice(&[1; 32]);
+        encoded.extend_from_slice(&sha2::Sha256::digest(b"scope"));
+        push_bytes(&mut encoded, b"scope");
+        encoded.extend_from_slice(&sha2::Sha256::digest(b"cursor"));
+        push_bytes(&mut encoded, b"cursor");
+        push_u64(&mut encoded, 6);
+        push_u64(&mut encoded, 32 << 30);
+        push_u64(&mut encoded, 1 << 30);
+        push_duration(&mut encoded, Duration::from_mins(10));
+        push_duration(&mut encoded, Duration::from_secs(601));
+        push_u64(&mut encoded, 1024);
+        push_u64(&mut encoded, 7);
+        push_bytes(&mut encoded, b"environment");
+        encoded.push(1);
+        push_u64(&mut encoded, 6);
+        push_u64(&mut encoded, 123_456);
+        push_u64(&mut encoded, 16);
+        push_u64(&mut encoded, 654_321);
+        push_duration(&mut encoded, Duration::from_millis(250));
+        push_duration(&mut encoded, Duration::from_secs(602));
+
+        let inspection = inspect_session_segment(&encoded).expect("valid Session segment");
+
+        assert!(inspection.completed);
+        assert_eq!(
+            inspection.completion,
+            Some(crate::Completion::ResourceEnvelopeExhausted)
+        );
+        assert_eq!(inspection.requested.worker_threads, 6);
+        assert_eq!(inspection.requested.verification_requests, 1024);
+        assert_eq!(inspection.usage.worker_threads, 6);
+        assert_eq!(inspection.usage.resident_bytes, 123_456);
+        assert_eq!(inspection.usage.verification_requests, 16);
+        assert_eq!(inspection.usage.durable_bytes, 654_321);
+        assert_eq!(inspection.usage.elapsed_time, Duration::from_millis(250));
+        assert_eq!(inspection.usage.cpu_time, Duration::from_secs(602));
+    }
+
+    #[test]
+    fn candidate_generation_is_bounded_by_two_verification_cohorts() {
+        assert_eq!(candidate_generation_limit(24, 1_008, u64::MAX), 384);
+        assert_eq!(candidate_generation_limit(8, 10, u64::MAX), 80);
+        assert_eq!(candidate_generation_limit(24, 1_008, 64 * 1024), 8);
+        assert_eq!(candidate_generation_limit(0, 1_008, u64::MAX), 0);
+    }
 
     #[test]
     fn proposal_features_occupy_a_disjoint_model_feature_channel() {
