@@ -79,6 +79,12 @@ pub(super) fn require_absent(path: &Path, artifact: &str) -> Result<(), AnyError
     }
 }
 
+pub(super) fn peak_process_resident_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .map_or(0, |status| parse_peak_resident_bytes(&status))
+}
+
 pub(super) fn capture_child(
     executable: &Path,
     arguments: &[OsString],
@@ -171,6 +177,17 @@ fn parse_resident_bytes(status: &str) -> u64 {
         .lines()
         .find_map(|line| {
             let value = line.strip_prefix("VmRSS:")?.trim();
+            let kibibytes = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+            Some(kibibytes.saturating_mul(1024))
+        })
+        .unwrap_or(0)
+}
+
+fn parse_peak_resident_bytes(status: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("VmHWM:")?.trim();
             let kibibytes = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
             Some(kibibytes.saturating_mul(1024))
         })
@@ -287,12 +304,16 @@ fn cpu_description() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_completed_child_cpu_ticks, parse_resident_bytes, ticks_to_nanoseconds};
+    use super::{
+        parse_completed_child_cpu_ticks, parse_peak_resident_bytes, parse_resident_bytes,
+        ticks_to_nanoseconds,
+    };
 
     #[test]
     fn linux_resident_parser_uses_current_rss_in_bytes() {
         let status = "Name:\tworker\nVmPeak:\t900 kB\nVmRSS:\t123 kB\nVmHWM:\t456 kB\n";
         assert_eq!(parse_resident_bytes(status), 123 * 1024);
+        assert_eq!(parse_peak_resident_bytes(status), 456 * 1024);
         assert_eq!(parse_resident_bytes("Name:\tworker\n"), 0);
     }
 

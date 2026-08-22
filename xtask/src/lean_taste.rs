@@ -13,11 +13,11 @@ use reflex_lean::worker::{LeanWorker, LeanWorkerConfig};
 use serde::Serialize;
 
 use crate::harness::{
-    AnyError, HostEnvironment, environment, hash_json, require_absent, require_clean,
-    require_release,
+    AnyError, HostEnvironment, environment, hash_json, peak_process_resident_bytes, require_absent,
+    require_clean, require_release,
 };
 
-const SCHEMA: &str = "reflex-lean-taste-development-v1";
+const SCHEMA: &str = "reflex-lean-taste-development-v2";
 const CUTOFF: &str = "2025-01-01T00:00:00Z";
 
 struct Arguments {
@@ -45,6 +45,8 @@ struct Protocol {
     certificate_limit: usize,
     migration_limit: usize,
     audit_access: &'static str,
+    reuse_target: &'static str,
+    descendant_target: &'static str,
 }
 
 #[derive(Serialize)]
@@ -98,6 +100,22 @@ struct MigrationSummary {
 }
 
 #[derive(Serialize)]
+struct Economics {
+    analysis_wall_ns: u64,
+    controller_cpu_ns: u64,
+    controller_peak_resident_bytes: u64,
+    worker_lifetime_wall_ns: u64,
+    worker_cpu_upper_bound_ns: u64,
+    combined_resident_upper_bound_bytes: u64,
+    catalog_durable_bytes: [u64; 3],
+    encoded_model_durable_bytes: usize,
+    report_durable_bytes: usize,
+    kernel_verification_calls: usize,
+    kernel_verification_wall_ns: u64,
+    kernel_verification_cpu_upper_bound_ns: u64,
+}
+
+#[derive(Serialize)]
 struct Report {
     schema: &'static str,
     status: &'static str,
@@ -111,8 +129,7 @@ struct Report {
     virtual_best_mean_targets: [f32; POTENTIAL_HEADS],
     relationships: RelationshipSummary,
     migration: MigrationSummary,
-    verifier_requests: usize,
-    verifier_resident_upper_bound_bytes: u64,
+    economics: Economics,
     host: HostEnvironment,
     protocol_deviations: Vec<String>,
     content_sha256: String,
@@ -124,6 +141,8 @@ struct Report {
 )]
 pub fn run(arguments: &[String]) -> Result<(), AnyError> {
     require_release("lean-taste-development")?;
+    let run_cpu = ProcessTime::now();
+    let run_started = Instant::now();
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
     let arguments = parse(arguments)?;
@@ -164,6 +183,8 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
         certificate_limit: arguments.certificate_limit,
         migration_limit: arguments.migration_limit,
         audit_access: "post-cutoff declarations forbidden",
+        reuse_target: "new later theorem with a direct dependency on the earlier theorem",
+        descendant_target: "increase in direct inbound declaration dependencies on the earlier theorem",
     };
     let protocol_sha256 = hash_json(&protocol)?;
 
@@ -194,6 +215,7 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
         }
     });
 
+    let worker_started = Instant::now();
     let june_worker = LeanWorker::start(&june_config)?;
     let september_worker = LeanWorker::start(&september_config)?;
     let candidate_order = stratified_relationships(
@@ -201,9 +223,20 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
         arguments.certificate_limit,
     );
     let mut certificates = Vec::new();
+    let mut kernel_verification_calls = 0_usize;
+    let mut kernel_verification_wall_ns = 0_u64;
+    let mut kernel_verification_cpu_upper_bound_ns = 0_u64;
     for candidate in candidate_order {
-        if let Some(certificate) = certify_relationship(&june_worker, &september_worker, candidate)?
-        {
+        let (certificate, usage) =
+            certify_relationship(&june_worker, &september_worker, candidate)?;
+        if let Some(usage) = usage {
+            kernel_verification_calls = kernel_verification_calls.saturating_add(1);
+            kernel_verification_wall_ns =
+                kernel_verification_wall_ns.saturating_add(duration_ns(usage.elapsed));
+            kernel_verification_cpu_upper_bound_ns = kernel_verification_cpu_upper_bound_ns
+                .saturating_add(duration_ns(usage.cpu_upper_bound));
+        }
+        if let Some(certificate) = certificate {
             certificates.push(certificate);
         }
     }
@@ -222,7 +255,12 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
         .map(|example| example.declaration.clone())
         .collect::<Vec<_>>();
     let migration_sources = june_worker.fetch(&migration_names)?;
-    let migration = migrate_theorems(&migration_sources, &september_worker)?;
+    let (migration, migration_usage) = migrate_theorems(&migration_sources, &september_worker)?;
+    kernel_verification_calls = kernel_verification_calls.saturating_add(1);
+    kernel_verification_wall_ns =
+        kernel_verification_wall_ns.saturating_add(duration_ns(migration_usage.elapsed));
+    kernel_verification_cpu_upper_bound_ns = kernel_verification_cpu_upper_bound_ns
+        .saturating_add(duration_ns(migration_usage.cpu_upper_bound));
     let migration_summary = MigrationSummary {
         attempted: migration_sources.len(),
         migrated: migration.migrated.len(),
@@ -233,11 +271,20 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
             .map(|failure| format!("{}: {}", failure.declaration, failure.diagnostic))
             .collect(),
     };
-    let verifier_requests = relationship_summary.attempted + migration_summary.attempted;
     let verifier_resident_upper_bound_bytes = june_worker
         .resident_bytes()
         .get()
         .saturating_add(september_worker.resident_bytes().get());
+    drop(june_worker);
+    drop(september_worker);
+    let worker_lifetime_wall_ns = duration_ns(worker_started.elapsed());
+    let controller_peak_resident_bytes = peak_process_resident_bytes();
+    let catalog_durable_bytes = [
+        std::fs::metadata(&arguments.june_catalog)?.len(),
+        std::fs::metadata(&arguments.september_catalog)?.len(),
+        std::fs::metadata(&arguments.december_catalog)?.len(),
+    ];
+    let encoded_model_durable_bytes = treatments.iter().map(|result| result.model_bytes).sum();
 
     let mut report = Report {
         schema: SCHEMA,
@@ -256,17 +303,30 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
         virtual_best_mean_targets,
         relationships: relationship_summary,
         migration: migration_summary,
-        verifier_requests,
-        verifier_resident_upper_bound_bytes,
+        economics: Economics {
+            analysis_wall_ns: duration_ns(run_started.elapsed()),
+            controller_cpu_ns: duration_ns(run_cpu.elapsed()),
+            controller_peak_resident_bytes,
+            worker_lifetime_wall_ns,
+            worker_cpu_upper_bound_ns: worker_lifetime_wall_ns.saturating_mul(2),
+            combined_resident_upper_bound_bytes: controller_peak_resident_bytes
+                .saturating_add(verifier_resident_upper_bound_bytes),
+            catalog_durable_bytes,
+            encoded_model_durable_bytes,
+            report_durable_bytes: 0,
+            kernel_verification_calls,
+            kernel_verification_wall_ns,
+            kernel_verification_cpu_upper_bound_ns,
+        },
         host,
         protocol_deviations: Vec::new(),
         content_sha256: String::new(),
     };
-    report.content_sha256 = hash_json(&report)?;
+    let encoded = finalize_report(&mut report)?;
     if let Some(parent) = arguments.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&arguments.output, serde_json::to_vec_pretty(&report)?)?;
+    std::fs::write(&arguments.output, encoded)?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
@@ -298,7 +358,7 @@ fn evaluate_treatment(
     let ranking_wall_ns = duration_ns(rank_started.elapsed());
     let encoded = model.encode()?;
     Ok(RankedResult {
-        treatment: format!("{treatment:?}").to_ascii_lowercase(),
+        treatment: treatment_name(treatment).into(),
         selected: selected_union.len(),
         training_wall_ns,
         training_cpu_ns,
@@ -307,6 +367,29 @@ fn evaluate_treatment(
         model_sha256: model.content_sha256(),
         mean_targets,
     })
+}
+
+fn finalize_report(report: &mut Report) -> Result<Vec<u8>, AnyError> {
+    for _ in 0..8 {
+        report.content_sha256.clear();
+        report.content_sha256 = hash_json(report)?;
+        let encoded = serde_json::to_vec_pretty(report)?;
+        if report.economics.report_durable_bytes == encoded.len() {
+            return Ok(encoded);
+        }
+        report.economics.report_durable_bytes = encoded.len();
+    }
+    Err("Lean taste report durable-byte accounting did not converge".into())
+}
+
+const fn treatment_name(treatment: Treatment) -> &'static str {
+    match treatment {
+        Treatment::Full => "full",
+        Treatment::Bootstrap => "bootstrap",
+        Treatment::NoModel => "no-model",
+        Treatment::NoConsolidation => "no-consolidation",
+        Treatment::ImmediateOnly => "immediate-only",
+    }
 }
 
 fn evaluate_baselines(examples: &[TemporalExample], limit: usize) -> Vec<BaselineResult> {

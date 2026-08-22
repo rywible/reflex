@@ -248,18 +248,23 @@ impl TemporalPair {
                     && !earlier_by_name.contains_key(&entry.name)
             })
             .collect::<Vec<_>>();
-        let mut descendants = HashMap::<LeanName, usize>::new();
-        let mut reuse = HashMap::<LeanName, usize>::new();
+        let mut reuse = vec![0_usize; earlier.entries.len()];
         let mut compression = HashMap::<LeanName, usize>::new();
+        let earlier_indexes = earlier
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.name.clone(), index))
+            .collect::<HashMap<_, _>>();
         let mut candidates = Vec::new();
         for entry in &new_later {
+            let mut direct_sources = Vec::new();
             for dependency in &entry.dependencies {
-                if let Some(source) = earlier_by_name
-                    .get(dependency)
-                    .filter(|source| matches!(source.kind, DeclarationKind::Theorem))
-                {
-                    *descendants.entry(source.name.clone()).or_default() += 1;
-                    *reuse.entry(source.name.clone()).or_default() += 1;
+                if let Some(index) = earlier_indexes.get(dependency).copied().filter(|index| {
+                    matches!(earlier.entries[*index].kind, DeclarationKind::Theorem)
+                }) {
+                    let source = &earlier.entries[index];
+                    direct_sources.push(index);
                     candidates.push(RelationshipCandidate {
                         earlier: source.name.clone(),
                         later: entry.name.clone(),
@@ -272,6 +277,11 @@ impl TemporalPair {
                         },
                     });
                 }
+            }
+            direct_sources.sort_unstable();
+            direct_sources.dedup();
+            for source in direct_sources {
+                reuse[source] = reuse[source].saturating_add(1);
             }
             if let Some(sources) = earlier_by_statement.get(&entry.statement_hash) {
                 for source in sources
@@ -300,11 +310,18 @@ impl TemporalPair {
             .iter()
             .filter(|entry| matches!(entry.kind, DeclarationKind::Theorem))
             .map(|entry| {
-                let descendant_count = descendants.get(&entry.name).copied().unwrap_or(0);
-                let reuse_count = reuse.get(&entry.name).copied().unwrap_or(0);
+                let index = earlier_indexes[&entry.name];
+                let descendant_count = later_by_name
+                    .get(&entry.name)
+                    .map_or(0, |later| later.inbound.saturating_sub(entry.inbound));
+                let reuse_count = reuse[index];
                 let compression_count = compression.get(&entry.name).copied().unwrap_or(0);
-                let survived = later_by_name.contains_key(&entry.name);
+                let future = later_by_name.get(&entry.name);
+                let survived = future.is_some();
                 let anticipated = descendant_count != 0 || compression_count != 0;
+                let future_verification_cost = future.map_or(1.0, |later| {
+                    (bounded_f32(later.dependencies.len()).ln_1p() / 8.0).min(1.0)
+                });
                 TemporalExample {
                     declaration: entry.name.clone(),
                     semantic_group: semantic_group(entry),
@@ -315,7 +332,7 @@ impl TemporalPair {
                         saturating_count(reuse_count),
                         saturating_count(compression_count),
                         f32::from(survived),
-                        ((bounded_f32(entry.dependencies.len()) + 1.0).ln_1p() / 8.0).min(1.0),
+                        future_verification_cost,
                         f32::from(!anticipated && !survived),
                     ],
                 }
@@ -346,7 +363,7 @@ pub struct MigrationReport {
 pub fn migrate_theorems(
     source: &[IndexedTheorem],
     target: &LeanWorker,
-) -> Result<MigrationReport, WorkerError> {
+) -> Result<(MigrationReport, crate::worker::WorkerUsage), WorkerError> {
     let items = source
         .iter()
         .map(|theorem| VerificationItem {
@@ -357,7 +374,7 @@ pub fn migrate_theorems(
             allowed_axioms: theorem.axioms.clone(),
         })
         .collect::<Vec<_>>();
-    let (results, _) = target.verify(&items)?;
+    let (results, usage) = target.verify(&items)?;
     let mut report = MigrationReport {
         migrated: Vec::new(),
         failures: Vec::new(),
@@ -375,19 +392,25 @@ pub fn migrate_theorems(
             });
         }
     }
-    Ok(report)
+    Ok((report, usage))
 }
 
 pub fn certify_relationship(
     earlier: &LeanWorker,
     later: &LeanWorker,
     candidate: &RelationshipCandidate,
-) -> Result<Option<CertifiedRelationship>, WorkerError> {
+) -> Result<
+    (
+        Option<CertifiedRelationship>,
+        Option<crate::worker::WorkerUsage>,
+    ),
+    WorkerError,
+> {
     let source = earlier.fetch(std::slice::from_ref(&candidate.earlier))?;
     let target = later.fetch(std::slice::from_ref(&candidate.later))?;
     let (Some(source), Some(target)) = (source.into_iter().next(), target.into_iter().next())
     else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let direct_derivation = target.dependencies.contains(&source.name);
     let replacement = matches!(
@@ -404,7 +427,7 @@ pub fn certify_relationship(
         }
     } else {
         if !direct_derivation {
-            return Ok(None);
+            return Ok((None, None));
         }
         VerificationItem {
             level_params: target.level_params.clone(),
@@ -414,10 +437,10 @@ pub fn certify_relationship(
             allowed_axioms: target.axioms.clone(),
         }
     };
-    let (mut results, _) = later.verify(&[item])?;
+    let (mut results, usage) = later.verify(&[item])?;
     let verification = results.pop().expect("one verification item has one result");
     if !verification.accepted {
-        return Ok(None);
+        return Ok((None, Some(usage)));
     }
     let kind = if replacement {
         if source.proposition == target.proposition {
@@ -440,13 +463,16 @@ pub fn certify_relationship(
     } else {
         0
     };
-    Ok(Some(CertifiedRelationship {
-        kind,
-        earlier: source,
-        later: target,
-        verification,
-        proof_nodes_removed,
-    }))
+    Ok((
+        Some(CertifiedRelationship {
+            kind,
+            earlier: source,
+            later: target,
+            verification,
+            proof_nodes_removed,
+        }),
+        Some(usage),
+    ))
 }
 
 #[must_use]
@@ -747,6 +773,11 @@ impl TasteModel {
                 .chain(&model.ranker.n)
                 .flatten()
                 .any(|value| !value.is_finite())
+            || model.retrieval.iter().any(|cell| {
+                cell.targets
+                    .iter()
+                    .any(|target| !target.is_finite() || !(0.0..=1.0).contains(target))
+            })
         {
             return Err("taste model dimensions or numeric state differ".into());
         }
@@ -1018,6 +1049,19 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn graph(name: &str, dependencies: &[&str], kind: DeclarationKind) -> GraphEntry {
+        GraphEntry {
+            name: LeanName::from_dotted(name),
+            statement_hash: name.bytes().map(u64::from).sum(),
+            dependencies: dependencies
+                .iter()
+                .map(|name| LeanName::from_dotted(name))
+                .collect(),
+            kind,
+            inbound: 0,
+        }
+    }
+
     fn example(index: u8, useful: bool) -> TemporalExample {
         let mut features = vec![0.0; TASTE_FEATURES];
         features[0] = 1.0;
@@ -1063,5 +1107,49 @@ mod tests {
         let ranked = model.rank(&examples, 8);
         assert_eq!(ranked.len(), 8);
         assert_eq!(ranked.iter().collect::<HashSet<_>>().len(), 8);
+    }
+
+    #[test]
+    fn temporal_pair_distinguishes_theorem_reuse_from_all_new_descendants() {
+        let earlier = TemporalSnapshot {
+            environment_sha256: "earlier".into(),
+            entries: vec![graph("Seed", &[], DeclarationKind::Theorem)],
+        };
+        let mut later_seed = graph("Seed", &[], DeclarationKind::Theorem);
+        later_seed.inbound = 2;
+        let later = TemporalSnapshot {
+            environment_sha256: "later".into(),
+            entries: vec![
+                later_seed,
+                graph("Direct", &["Seed"], DeclarationKind::Theorem),
+                graph("Helper", &["Seed"], DeclarationKind::Definition),
+            ],
+        };
+
+        let pair = TemporalPair::derive(&earlier, &later).unwrap();
+        let seed = pair
+            .examples
+            .iter()
+            .find(|example| example.declaration == LeanName::from_dotted("Seed"))
+            .unwrap();
+        assert!(
+            (seed.targets[PotentialHead::Reuse.index()] - saturating_count(1)).abs() < f32::EPSILON
+        );
+        assert!(
+            (seed.targets[PotentialHead::Descendants.index()] - saturating_count(2)).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_out_of_range_retrieval_state() {
+        let examples = (0..8)
+            .map(|index| example(index, index >= 4))
+            .collect::<Vec<_>>();
+        let model = TasteModel::train(&examples, Treatment::Full);
+        let mut value = serde_json::to_value(model).unwrap();
+        value["retrieval"][0]["targets"][0] = serde_json::json!(2.0);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(TasteModel::decode(&bytes).is_err());
     }
 }
