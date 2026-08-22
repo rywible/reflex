@@ -1,6 +1,8 @@
 # Lean 2026 Temporal Audit v1
 
-Status: **implementation complete; audit declarations still sealed**
+Status: **superseded before audit exposure by the public-optimizer v2 protocol**
+
+No declaration from the 2026 audit snapshot was accessed under this protocol. Final pre-freeze review established that v1 trained and ranked a standalone Lean Potential model directly in the Experimental Harness rather than exercising the public Improvement Session. Its implementation is retained as negative design evidence, but it is ineligible for execution or Scientific Confirmation.
 
 This is the human-readable registration for the executable protocol in xtask/src/lean_audit.rs and xtask/src/lean_audit_confirm.rs. The content-addressed freeze manifest and exact audit lock are committed before any checkout or declaration from the audit snapshot is accessed.
 
