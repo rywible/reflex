@@ -73,6 +73,7 @@ pub struct LeanCorpusEntry {
 #[derive(Clone, Debug, Default)]
 pub struct LeanCorpus {
     entries: Vec<LeanCorpusEntry>,
+    operator_library: Vec<LeanArtifact>,
 }
 
 impl LeanCorpus {
@@ -81,11 +82,45 @@ impl LeanCorpus {
         &self.entries
     }
 
+    #[must_use]
+    pub fn operator_library(&self) -> &[LeanArtifact] {
+        &self.operator_library
+    }
+
     pub fn verified_page(worker: &LeanWorker, page: IndexPage) -> Result<Self, LeanError> {
         Self::verified_theorems(worker, page.artifacts)
     }
 
     pub fn verified_theorems(
+        worker: &LeanWorker,
+        theorems: Vec<IndexedTheorem>,
+    ) -> Result<Self, LeanError> {
+        let mut corpus = Self::verified_entries(worker, theorems)?;
+        corpus.operator_library = corpus
+            .entries
+            .iter()
+            .map(|entry| entry.artifact.clone())
+            .collect();
+        Ok(corpus)
+    }
+
+    pub fn verified_seeds_with_library(
+        worker: &LeanWorker,
+        mut seeds: Vec<IndexedTheorem>,
+        library: Vec<IndexedTheorem>,
+    ) -> Result<Self, LeanError> {
+        let seed_count = seeds.len();
+        seeds.extend(library);
+        let mut verified = Self::verified_entries(worker, seeds)?;
+        let library_entries = verified.entries.split_off(seed_count);
+        verified.operator_library = library_entries
+            .into_iter()
+            .map(|entry| entry.artifact)
+            .collect();
+        Ok(verified)
+    }
+
+    fn verified_entries(
         worker: &LeanWorker,
         theorems: Vec<IndexedTheorem>,
     ) -> Result<Self, LeanError> {
@@ -129,11 +164,15 @@ impl LeanCorpus {
                 evidence,
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            operator_library: Vec::new(),
+        })
     }
 
     pub fn append(&mut self, mut other: Self) {
         self.entries.append(&mut other.entries);
+        self.operator_library.append(&mut other.operator_library);
     }
 }
 
@@ -208,11 +247,7 @@ impl LeanDomain {
         {
             return Err(LeanError::IncompatibleEnvironment);
         }
-        let substitutions = corpus
-            .entries()
-            .iter()
-            .map(|entry| entry.artifact.clone())
-            .collect::<Vec<_>>();
+        let substitutions = corpus.operator_library;
         Ok(Self {
             environment: environment.clone(),
             structure: LeanStructure::new(),

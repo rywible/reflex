@@ -21,7 +21,7 @@ use crate::harness::{
     require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v2";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v3";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -30,6 +30,9 @@ const WORKER_THREADS: usize = 6;
 const DURABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const SUPERVISOR_WALL_LIMIT: Duration = Duration::from_mins(35);
 const SUPERVISOR_CAPABILITY: &str = "reflex-lean-public-optimizer-supervisor-v1";
+const PRIMARY_PROOF_NODE_LIMIT: usize = 100_000;
+const SELECTION_POOL_MULTIPLIER: usize = 8;
+const LIBRARY_CANDIDATES_PER_SEED: usize = 8;
 
 struct Arguments {
     lake: PathBuf,
@@ -45,9 +48,12 @@ struct Arguments {
 
 struct DevelopmentCorpus {
     config: LeanWorkerConfig,
-    corpus: LeanCorpus,
+    training_corpus: LeanCorpus,
+    heldout_corpus: LeanCorpus,
     training: usize,
     heldout: usize,
+    september_catalog_sha256: String,
+    december_catalog_sha256: String,
     heldout_seed_nodes: HashMap<String, usize>,
     selected_artifacts: Vec<SelectedArtifact>,
 }
@@ -56,7 +62,13 @@ struct DevelopmentCorpus {
 struct SelectedArtifact {
     role: &'static str,
     declaration: String,
+    statement_hash: u64,
     proof_nodes: usize,
+}
+
+struct SelectedTheorem {
+    example: TemporalExample,
+    theorem: IndexedTheorem,
 }
 
 #[derive(Serialize)]
@@ -86,6 +98,9 @@ struct Report {
     status: &'static str,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    primary_proof_node_limit: usize,
+    september_catalog_sha256: String,
+    december_catalog_sha256: String,
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
@@ -102,6 +117,8 @@ struct ReportInputs {
     host_isolation: HostIsolation,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    september_catalog_sha256: String,
+    december_catalog_sha256: String,
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
@@ -207,7 +224,7 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     let full_bundle = arguments.work.join("full.bundle");
     let bootstrap_bundle = arguments.work.join("bootstrap.bundle");
     let training_usage = finish_training(improve(
-        LeanDomain::new(prepared.config.clone(), prepared.corpus.clone())?,
+        LeanDomain::new(prepared.config.clone(), prepared.training_corpus)?,
         request(
             LeanSeedScope {
                 start: 0,
@@ -223,10 +240,10 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     let full = finish_treatment(
         "full",
         improve(
-            LeanDomain::new(prepared.config.clone(), prepared.corpus.clone())?,
+            LeanDomain::new(prepared.config.clone(), prepared.heldout_corpus.clone())?,
             request(
                 LeanSeedScope {
-                    start: prepared.training,
+                    start: 0,
                     count: prepared.heldout,
                 },
                 arguments.verification_requests,
@@ -243,10 +260,10 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     let bootstrap = finish_treatment(
         "bootstrap",
         improve(
-            LeanDomain::new(prepared.config, prepared.corpus)?,
+            LeanDomain::new(prepared.config, prepared.heldout_corpus)?,
             request(
                 LeanSeedScope {
-                    start: prepared.training,
+                    start: 0,
                     count: prepared.heldout,
                 },
                 arguments.verification_requests,
@@ -266,6 +283,8 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
             host_isolation: isolation,
             training_artifacts: prepared.training,
             heldout_artifacts: prepared.heldout,
+            september_catalog_sha256: prepared.september_catalog_sha256,
+            december_catalog_sha256: prepared.december_catalog_sha256,
             selected_artifacts: prepared.selected_artifacts,
             training_usage,
             full,
@@ -280,6 +299,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         host_isolation,
         training_artifacts,
         heldout_artifacts,
+        september_catalog_sha256,
+        december_catalog_sha256,
         selected_artifacts,
         training_usage,
         full,
@@ -301,6 +322,9 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         status: "development-only; no 2026 exposure",
         training_artifacts,
         heldout_artifacts,
+        primary_proof_node_limit: PRIMARY_PROOF_NODE_LIMIT,
+        september_catalog_sha256,
+        december_catalog_sha256,
         selected_artifacts,
         training_usage,
         full,
@@ -323,95 +347,168 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
 fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> {
     let september_catalog = LeanCatalog::load(&arguments.september_catalog)?;
     let december_catalog = LeanCatalog::load(&arguments.december_catalog)?;
+    let september_catalog_sha256 = september_catalog.content_sha256().to_owned();
+    let december_catalog_sha256 = december_catalog.content_sha256().to_owned();
     let september_artifacts =
         TemporalSnapshot::from_catalog(&september_catalog).forecast_artifacts();
     let december_artifacts = TemporalSnapshot::from_catalog(&december_catalog).forecast_artifacts();
-    let earlier_names = september_artifacts
-        .iter()
-        .map(|artifact| artifact.declaration.clone())
-        .collect::<HashSet<_>>();
-    let earlier_families = september_artifacts
-        .iter()
-        .map(|artifact| artifact.semantic_group)
-        .collect::<HashSet<_>>();
-    let training_pool = deterministic_prefix(
-        december_artifacts
-            .iter()
-            .filter(|artifact| earlier_names.contains(&artifact.declaration)),
-        arguments.training_artifacts.saturating_mul(8),
-    );
-    let heldout_pool = deterministic_prefix(
-        december_artifacts
-            .iter()
-            .filter(|artifact| !earlier_families.contains(&artifact.semantic_group)),
-        arguments.heldout_artifacts.saturating_mul(8),
-    );
+    let (earlier_names, training_pool, heldout_pool) =
+        selection_pools(&september_artifacts, &december_artifacts, arguments);
     let config = LeanWorkerConfig::pinned(&arguments.lake, &arguments.december_root);
     let worker = LeanWorker::start(&config)?;
-    let names = training_pool
-        .iter()
-        .chain(&heldout_pool)
-        .map(|artifact| artifact.declaration.clone())
-        .collect::<Vec<_>>();
-    let mut by_name = worker
-        .fetch(&names)?
-        .into_iter()
-        .map(|theorem| (theorem.name.clone(), theorem))
-        .collect::<HashMap<_, _>>();
-    let mut training = training_pool
-        .iter()
-        .filter_map(|artifact| by_name.remove(&artifact.declaration))
-        .take(arguments.training_artifacts)
-        .collect::<Vec<_>>();
-    let heldout = heldout_pool
-        .iter()
-        .filter_map(|artifact| by_name.remove(&artifact.declaration))
-        .take(arguments.heldout_artifacts)
-        .collect::<Vec<_>>();
+    let training = fetch_primary(&worker, &training_pool, arguments.training_artifacts)?;
+    let heldout = fetch_primary(&worker, &heldout_pool, arguments.heldout_artifacts)?;
     if training.len() != arguments.training_artifacts
         || heldout.len() != arguments.heldout_artifacts
     {
-        return Err("Lean development corpus cannot satisfy the requested fetchable scopes".into());
+        return Err(
+            "Lean development corpus cannot satisfy the requested human-facing primary scopes"
+                .into(),
+        );
     }
     let training_count = training.len();
     let heldout_count = heldout.len();
-    training.extend(heldout);
-    let ordered: Vec<IndexedTheorem> = training;
-    let corpus = LeanCorpus::verified_theorems(&worker, ordered)?;
-    drop(worker);
-    let heldout_seed_nodes = corpus
-        .entries()
+
+    let selected_names = training
         .iter()
-        .skip(training_count)
-        .map(|entry| {
+        .chain(&heldout)
+        .map(|selected| selected.theorem.name.clone())
+        .collect::<HashSet<_>>();
+    let training_library = fetch_library(
+        &worker,
+        &december_artifacts,
+        &training,
+        &selected_names,
+        |artifact| earlier_names.contains(&artifact.declaration),
+    )?;
+    let heldout_library = fetch_library(
+        &worker,
+        &december_artifacts,
+        &heldout,
+        &selected_names,
+        |_| true,
+    )?;
+
+    let (training_corpus, heldout_corpus) = build_corpora(
+        &worker,
+        &training,
+        &heldout,
+        &training_library,
+        &heldout_library,
+    )?;
+    drop(worker);
+    let heldout_seed_nodes = heldout
+        .iter()
+        .map(|selected| {
             (
-                entry.name.to_string(),
-                entry.artifact.proof_term.node_count(),
+                selected.theorem.name.to_string(),
+                selected.theorem.proof_term.node_count(),
             )
         })
         .collect();
-    let selected_artifacts = corpus
-        .entries()
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| SelectedArtifact {
-            role: if index < training_count {
-                "training"
-            } else {
-                "heldout"
-            },
-            declaration: entry.name.to_string(),
-            proof_nodes: entry.artifact.proof_term.node_count(),
-        })
-        .collect();
+    let selected_artifacts =
+        selected_artifacts(&training, &heldout, &training_library, &heldout_library);
     Ok(DevelopmentCorpus {
         config,
-        corpus,
+        training_corpus,
+        heldout_corpus,
         training: training_count,
         heldout: heldout_count,
+        september_catalog_sha256,
+        december_catalog_sha256,
         heldout_seed_nodes,
         selected_artifacts,
     })
+}
+
+fn selection_pools<'a>(
+    september: &[TemporalExample],
+    december: &'a [TemporalExample],
+    arguments: &Arguments,
+) -> (
+    HashSet<reflex_lean::ast::LeanName>,
+    Vec<&'a TemporalExample>,
+    Vec<&'a TemporalExample>,
+) {
+    let earlier_names = september
+        .iter()
+        .map(|artifact| artifact.declaration.clone())
+        .collect::<HashSet<_>>();
+    let earlier_families = september
+        .iter()
+        .map(|artifact| artifact.semantic_group)
+        .collect::<HashSet<_>>();
+    let earlier_statement_counts = statement_counts(
+        december
+            .iter()
+            .filter(|artifact| earlier_names.contains(&artifact.declaration)),
+    );
+    let december_statement_counts = statement_counts(december.iter());
+    let training = deterministic_prefix(
+        december.iter().filter(|artifact| {
+            earlier_names.contains(&artifact.declaration)
+                && is_human_facing(&artifact.declaration)
+                && earlier_statement_counts
+                    .get(&artifact.statement_hash)
+                    .is_some_and(|count| *count >= 2)
+        }),
+        arguments
+            .training_artifacts
+            .saturating_mul(SELECTION_POOL_MULTIPLIER),
+    );
+    let heldout = deterministic_prefix(
+        december.iter().filter(|artifact| {
+            !earlier_families.contains(&artifact.semantic_group)
+                && is_human_facing(&artifact.declaration)
+                && december_statement_counts
+                    .get(&artifact.statement_hash)
+                    .is_some_and(|count| *count >= 2)
+        }),
+        arguments
+            .heldout_artifacts
+            .saturating_mul(SELECTION_POOL_MULTIPLIER),
+    );
+    (earlier_names, training, heldout)
+}
+
+fn build_corpora(
+    worker: &LeanWorker,
+    training: &[SelectedTheorem],
+    heldout: &[SelectedTheorem],
+    training_library: &[SelectedTheorem],
+    heldout_library: &[SelectedTheorem],
+) -> Result<(LeanCorpus, LeanCorpus), AnyError> {
+    let seeds = |selected: &[SelectedTheorem]| {
+        selected
+            .iter()
+            .map(|selected| selected.theorem.clone())
+            .collect::<Vec<_>>()
+    };
+    let shared_library = seeds(training)
+        .into_iter()
+        .chain(seeds(training_library))
+        .collect::<Vec<_>>();
+    let training_corpus =
+        LeanCorpus::verified_seeds_with_library(worker, seeds(training), shared_library.clone())?;
+    let heldout_corpus = LeanCorpus::verified_seeds_with_library(
+        worker,
+        seeds(heldout),
+        shared_library
+            .into_iter()
+            .chain(seeds(heldout_library))
+            .collect(),
+    )?;
+    Ok((training_corpus, heldout_corpus))
+}
+
+fn statement_counts<'a>(
+    artifacts: impl Iterator<Item = &'a TemporalExample>,
+) -> HashMap<u64, usize> {
+    let mut counts = HashMap::new();
+    for artifact in artifacts {
+        *counts.entry(artifact.statement_hash).or_default() += 1;
+    }
+    counts
 }
 
 fn deterministic_prefix<'a>(
@@ -419,9 +516,117 @@ fn deterministic_prefix<'a>(
     count: usize,
 ) -> Vec<&'a TemporalExample> {
     let mut artifacts = artifacts.collect::<Vec<_>>();
-    artifacts.sort_unstable_by_key(|artifact| artifact.semantic_group);
-    artifacts.truncate(count);
+    artifacts.sort_unstable_by(|left, right| {
+        (&left.semantic_group, &left.declaration).cmp(&(&right.semantic_group, &right.declaration))
+    });
+    let mut statements = HashSet::new();
     artifacts
+        .into_iter()
+        .filter(|artifact| statements.insert(artifact.statement_hash))
+        .take(count)
+        .collect()
+}
+
+fn fetch_primary(
+    worker: &LeanWorker,
+    pool: &[&TemporalExample],
+    count: usize,
+) -> Result<Vec<SelectedTheorem>, AnyError> {
+    let names = pool
+        .iter()
+        .map(|artifact| artifact.declaration.clone())
+        .collect::<Vec<_>>();
+    let mut by_name = worker
+        .fetch(&names)?
+        .into_iter()
+        .map(|theorem| (theorem.name.clone(), theorem))
+        .collect::<HashMap<_, _>>();
+    Ok(pool
+        .iter()
+        .filter_map(|example| {
+            let theorem = by_name.remove(&example.declaration)?;
+            (theorem.proof_term.node_count() <= PRIMARY_PROOF_NODE_LIMIT).then(|| SelectedTheorem {
+                example: (*example).clone(),
+                theorem,
+            })
+        })
+        .take(count)
+        .collect())
+}
+
+fn fetch_library(
+    worker: &LeanWorker,
+    available: &[TemporalExample],
+    seeds: &[SelectedTheorem],
+    excluded_names: &HashSet<reflex_lean::ast::LeanName>,
+    eligible: impl Fn(&TemporalExample) -> bool,
+) -> Result<Vec<SelectedTheorem>, AnyError> {
+    let mut candidates = Vec::new();
+    for seed in seeds {
+        let mut alternatives = available
+            .iter()
+            .filter(|artifact| {
+                artifact.statement_hash == seed.example.statement_hash
+                    && !excluded_names.contains(&artifact.declaration)
+                    && eligible(artifact)
+            })
+            .collect::<Vec<_>>();
+        alternatives.sort_unstable_by(|left, right| left.declaration.cmp(&right.declaration));
+        candidates.extend(alternatives.into_iter().take(LIBRARY_CANDIDATES_PER_SEED));
+    }
+    candidates.sort_unstable_by(|left, right| left.declaration.cmp(&right.declaration));
+    candidates.dedup_by(|left, right| left.declaration == right.declaration);
+    let fetched = fetch_primary(worker, &candidates, candidates.len())?
+        .into_iter()
+        .filter(|candidate| {
+            seeds.iter().any(|seed| {
+                candidate.example.statement_hash == seed.example.statement_hash
+                    && candidate.theorem.level_params == seed.theorem.level_params
+                    && candidate.theorem.proposition == seed.theorem.proposition
+            })
+        })
+        .collect::<Vec<_>>();
+    if seeds.iter().any(|seed| {
+        !fetched
+            .iter()
+            .any(|candidate| candidate.example.statement_hash == seed.example.statement_hash)
+    }) {
+        return Err(
+            "every selected Lean Seed requires a fetchable same-statement library Artifact".into(),
+        );
+    }
+    Ok(fetched)
+}
+
+fn is_human_facing(name: &reflex_lean::ast::LeanName) -> bool {
+    let display = name.to_string();
+    let component = display.rsplit('.').next().unwrap_or(&display);
+    !component.strip_prefix("proof_").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn selected_artifacts(
+    training: &[SelectedTheorem],
+    heldout: &[SelectedTheorem],
+    training_library: &[SelectedTheorem],
+    heldout_library: &[SelectedTheorem],
+) -> Vec<SelectedArtifact> {
+    let mut selected = Vec::new();
+    for (role, artifacts) in [
+        ("training", training),
+        ("heldout", heldout),
+        ("training-library", training_library),
+        ("heldout-library", heldout_library),
+    ] {
+        selected.extend(artifacts.iter().map(|artifact| SelectedArtifact {
+            role,
+            declaration: artifact.theorem.name.to_string(),
+            statement_hash: artifact.example.statement_hash,
+            proof_nodes: artifact.theorem.proof_term.node_count(),
+        }));
+    }
+    selected
 }
 
 fn request(
@@ -577,4 +782,50 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
         heldout_artifacts: value("--heldout-artifacts")?.parse()?,
         verification_requests: value("--verification-requests")?.parse()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reflex_lean::ast::LeanName;
+    use reflex_lean::temporal::POTENTIAL_HEADS;
+
+    fn example(name: &str, statement_hash: u64, semantic_group: u8) -> TemporalExample {
+        TemporalExample {
+            declaration: LeanName::from_dotted(name),
+            module: LeanName::from_dotted("Test.Module"),
+            statement_hash,
+            semantic_group: [semantic_group; 32],
+            features: Vec::new(),
+            targets: [0.0; POTENTIAL_HEADS],
+        }
+    }
+
+    #[test]
+    fn primary_selection_excludes_generated_components_and_duplicate_statements() {
+        let generated = example("Test.theorem.proof_7", 1, 0);
+        let first = example("Test.first", 2, 1);
+        let duplicate = example("Test.duplicate", 2, 2);
+        let second = example("Test.second", 3, 3);
+        let artifacts = [&generated, &duplicate, &second, &first];
+
+        let selected = deterministic_prefix(
+            artifacts
+                .into_iter()
+                .filter(|artifact| is_human_facing(&artifact.declaration)),
+            8,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|artifact| artifact.statement_hash)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(!is_human_facing(&generated.declaration));
+        assert!(is_human_facing(&LeanName::from_dotted(
+            "Test.proof_by_cases"
+        )));
+    }
 }

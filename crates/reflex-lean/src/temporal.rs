@@ -79,6 +79,7 @@ impl PotentialHead {
 pub struct TemporalExample {
     pub declaration: LeanName,
     pub module: LeanName,
+    pub statement_hash: u64,
     pub semantic_group: [u8; 32],
     pub features: Vec<f32>,
     pub targets: [f32; POTENTIAL_HEADS],
@@ -253,6 +254,7 @@ impl TemporalSnapshot {
             .map(|entry| TemporalExample {
                 declaration: entry.name.clone(),
                 module: entry.module.clone(),
+                statement_hash: entry.statement_hash,
                 semantic_group: semantic_group(entry),
                 features: features(entry),
                 targets: [0.0; POTENTIAL_HEADS],
@@ -381,6 +383,7 @@ impl TemporalPair {
                 TemporalExample {
                     declaration: entry.name.clone(),
                     module: entry.module.clone(),
+                    statement_hash: entry.statement_hash,
                     semantic_group: semantic_group(entry),
                     features: features(entry),
                     targets: [
@@ -1154,6 +1157,7 @@ mod tests {
         TemporalExample {
             declaration: LeanName::from_dotted(&format!("T{index}")),
             module: LeanName::from_dotted("Test.Module"),
+            statement_hash: u64::from(index),
             semantic_group: [index; 32],
             features,
             targets: [
