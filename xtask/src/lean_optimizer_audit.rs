@@ -21,7 +21,7 @@ use crate::harness::{
     require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v3";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v4";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -104,6 +104,8 @@ struct Report {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
+    no_model: TreatmentResult,
+    no_derived: TreatmentResult,
     bootstrap: TreatmentResult,
     full_has_more_improvements: bool,
     full_uses_less_cpu_per_improvement: bool,
@@ -122,6 +124,8 @@ struct ReportInputs {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     full: TreatmentResult,
+    no_model: TreatmentResult,
+    no_derived: TreatmentResult,
     bootstrap: TreatmentResult,
 }
 
@@ -219,10 +223,30 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     std::fs::create_dir_all(&arguments.work)?;
 
     let prepared = prepare_corpus(&arguments)?;
+    let inputs = run_treatments(&arguments, prepared, host, isolation)?;
+    write_report(&arguments, inputs)
+}
 
+fn run_treatments(
+    arguments: &Arguments,
+    prepared: DevelopmentCorpus,
+    host: HostEnvironment,
+    isolation: HostIsolation,
+) -> Result<ReportInputs, AnyError> {
     let training_bundle = arguments.work.join("training.bundle");
+    let bootstrap_template_bundle = arguments.work.join("bootstrap-template.bundle");
     let full_bundle = arguments.work.join("full.bundle");
+    let no_model_seed = arguments.work.join("no-model-seed.bundle");
+    let no_model_bundle = arguments.work.join("no-model.bundle");
+    let no_derived_seed = arguments.work.join("no-derived-seed.bundle");
+    let no_derived_bundle = arguments.work.join("no-derived.bundle");
     let bootstrap_bundle = arguments.work.join("bootstrap.bundle");
+    build_bootstrap_template(
+        &prepared.config,
+        prepared.training_corpus.clone(),
+        prepared.training,
+        &bootstrap_template_bundle,
+    )?;
     let training_usage = finish_training(improve(
         LeanDomain::new(prepared.config.clone(), prepared.training_corpus)?,
         request(
@@ -237,30 +261,10 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
         )?,
         |_| ControlFlow::Continue(()),
     )?);
-    let full = finish_treatment(
-        "full",
-        improve(
-            LeanDomain::new(prepared.config.clone(), prepared.heldout_corpus.clone())?,
-            request(
-                LeanSeedScope {
-                    start: 0,
-                    count: prepared.heldout,
-                },
-                arguments.verification_requests,
-                BundlePlan::Resume {
-                    source: training_bundle,
-                    target: full_bundle.clone(),
-                },
-            )?,
-            |_| ControlFlow::Continue(()),
-        )?,
-        &prepared.heldout_seed_nodes,
-        &full_bundle,
-    )?;
     let bootstrap = finish_treatment(
         "bootstrap",
         improve(
-            LeanDomain::new(prepared.config, prepared.heldout_corpus)?,
+            LeanDomain::new(prepared.config.clone(), prepared.heldout_corpus.clone())?,
             request(
                 LeanSeedScope {
                     start: 0,
@@ -276,21 +280,80 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
         &prepared.heldout_seed_nodes,
         &bootstrap_bundle,
     )?;
-    write_report(
-        &arguments,
-        ReportInputs {
-            host,
-            host_isolation: isolation,
-            training_artifacts: prepared.training,
-            heldout_artifacts: prepared.heldout,
-            september_catalog_sha256: prepared.september_catalog_sha256,
-            december_catalog_sha256: prepared.december_catalog_sha256,
-            selected_artifacts: prepared.selected_artifacts,
-            training_usage,
-            full,
-            bootstrap,
-        },
-    )
+    crate::causal::ablate_bundle(
+        &training_bundle,
+        &no_model_seed,
+        Some(&bootstrap_template_bundle),
+        false,
+    )?;
+    crate::causal::ablate_bundle(&training_bundle, &no_derived_seed, None, true)?;
+    let full = run_resumed_treatment(
+        "full",
+        &prepared.config,
+        &prepared.heldout_corpus,
+        prepared.heldout,
+        arguments.verification_requests,
+        &training_bundle,
+        &full_bundle,
+        &prepared.heldout_seed_nodes,
+    )?;
+    let no_model = run_resumed_treatment(
+        "no-model",
+        &prepared.config,
+        &prepared.heldout_corpus,
+        prepared.heldout,
+        arguments.verification_requests,
+        &no_model_seed,
+        &no_model_bundle,
+        &prepared.heldout_seed_nodes,
+    )?;
+    let no_derived = run_resumed_treatment(
+        "no-derived",
+        &prepared.config,
+        &prepared.heldout_corpus,
+        prepared.heldout,
+        arguments.verification_requests,
+        &no_derived_seed,
+        &no_derived_bundle,
+        &prepared.heldout_seed_nodes,
+    )?;
+    Ok(ReportInputs {
+        host,
+        host_isolation: isolation,
+        training_artifacts: prepared.training,
+        heldout_artifacts: prepared.heldout,
+        september_catalog_sha256: prepared.september_catalog_sha256,
+        december_catalog_sha256: prepared.december_catalog_sha256,
+        selected_artifacts: prepared.selected_artifacts,
+        training_usage,
+        full,
+        no_model,
+        no_derived,
+        bootstrap,
+    })
+}
+
+fn build_bootstrap_template(
+    config: &LeanWorkerConfig,
+    corpus: LeanCorpus,
+    training: usize,
+    target: &Path,
+) -> Result<(), AnyError> {
+    finish_training(improve(
+        LeanDomain::new(config.clone(), corpus)?,
+        request(
+            LeanSeedScope {
+                start: 0,
+                count: training,
+            },
+            u64::try_from(training).unwrap_or(u64::MAX),
+            BundlePlan::Fresh {
+                target: target.to_path_buf(),
+            },
+        )?,
+        |_| ControlFlow::Continue(()),
+    )?);
+    Ok(())
 }
 
 fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyError> {
@@ -304,6 +367,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         full,
+        no_model,
+        no_derived,
         bootstrap,
     } = inputs;
     let full_has_more_improvements =
@@ -328,6 +393,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         full,
+        no_model,
+        no_derived,
         bootstrap,
         full_has_more_improvements,
         full_uses_less_cpu_per_improvement,
@@ -685,6 +752,42 @@ fn require_supervising_parent() -> Result<(), AnyError> {
         );
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a causal treatment binds its immutable source, output, corpus, budget, and result accounting"
+)]
+fn run_resumed_treatment(
+    name: &'static str,
+    config: &LeanWorkerConfig,
+    corpus: &LeanCorpus,
+    heldout: usize,
+    verification_requests: u64,
+    source: &Path,
+    target: &Path,
+    seed_nodes: &HashMap<String, usize>,
+) -> Result<TreatmentResult, AnyError> {
+    finish_treatment(
+        name,
+        improve(
+            LeanDomain::new(config.clone(), corpus.clone())?,
+            request(
+                LeanSeedScope {
+                    start: 0,
+                    count: heldout,
+                },
+                verification_requests,
+                BundlePlan::Resume {
+                    source: source.to_path_buf(),
+                    target: target.to_path_buf(),
+                },
+            )?,
+            |_| ControlFlow::Continue(()),
+        )?,
+        seed_nodes,
+        target,
+    )
 }
 
 fn finish_training(outcome: reflex::SessionOutcome<LeanDomain>) -> Usage {

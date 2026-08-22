@@ -1586,7 +1586,7 @@ fn validate_treatment_bundle(path: &Path) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn ablate_bundle(
+pub(super) fn ablate_bundle(
     source: &Path,
     target: &Path,
     model_template: Option<&Path>,
