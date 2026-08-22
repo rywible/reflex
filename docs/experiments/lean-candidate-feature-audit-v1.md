@@ -43,3 +43,7 @@ This keeps inference to a small fixed dot product. Structural summaries should b
 ## Decision
 
 Do not increase parameter count yet. First protect one deterministic exploration opportunity per correctness claim and run the existing 16-feature model against Bootstrap at 128 total evaluation requests. If it promotes but has no causal ranking advantage, replay the exact retained Experience through the same-capacity v2 representation. Only a same-capacity feature win unlocks the model-size sweep.
+
+## Development follow-up
+
+The active baseline lost to Bootstrap, and [the paired v2 replay](./lean-model-feature-development-v1.md) then failed its protected-head gate. V2's structural signal improved descendant-potential Selection loss by 92%, but reducing operator identity from eight buckets to four coincided with 7.3% regressions across the dominant correctness/value heads. The next same-capacity family retains eight operator buckets and compresses structural shape into seven non-bias dimensions. This post-result refinement is Development, not a rewrite of the predeclared v2 result.

@@ -40,3 +40,7 @@ Also report:
 ## Decision rule
 
 Prefer the smallest treatment on the Pareto frontier of verified discoveries per CPU-second, Selection loss, and model bytes. A larger model advances only if its paired per-claim discovery efficiency exceeds the smaller nested treatment and it causes no protected-head regression under the existing promotion tolerances. Parameter count alone, training loss, and saturated 4/4 completion cannot justify advancement.
+
+## Development amendment after structural-16 v2
+
+[The fixed-Experience v2 result](./lean-model-feature-development-v1.md) failed the gate: it improved descendant-potential loss but regressed protected correctness/value heads after replacing eight operator buckets with four signed buckets. Before any 32-feature treatment, a second 16-dimensional Development family will retain eight stable operator buckets and use indexes 1–7 for log parent nodes, log Candidate nodes, signed log node reduction, log Candidate depth, signed log depth reduction, constructor-histogram L1 distance, and root-constructor equality. Repeated use of the same Selection corpus is explicitly exploratory; a winning representation still requires the public-path causal gate and later independent confirmation.
