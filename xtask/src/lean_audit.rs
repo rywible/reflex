@@ -19,7 +19,7 @@ use crate::harness::{
 
 const SCHEMA: &str = "reflex-lean-temporal-audit-freeze-v1";
 const CUTOFF: &str = "2025-01-01T00:00:00Z";
-const CANDIDATES_PER_HEAD: usize = 256;
+const ARTIFACTS_PER_HEAD: usize = 256;
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
 const AUDIT_BOUNDARY: &str = "2026-07-01T00:00:00Z";
 const BOUNDARY_EVIDENCE_URL: &str = "https://api.github.com/repos/leanprover-community/mathlib4/commits?sha=master&until=2026-06-30T23%3A59%3A59Z&per_page=1";
@@ -62,6 +62,7 @@ struct AuditLock {
     mathlib_commit_timestamp: String,
     boundary_evidence_url: &'static str,
     boundary_evidence_sha256: String,
+    boundary_evidence_response: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -116,6 +117,7 @@ struct PairSummary {
 struct BoundaryEvidence {
     commit_timestamp: String,
     response_sha256: String,
+    response: String,
 }
 
 #[derive(Deserialize)]
@@ -187,9 +189,9 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
     let december = TemporalSnapshot::from_catalog(&december_catalog);
     let first = TemporalPair::derive(&june, &september)?;
     let second = TemporalPair::derive(&september, &december)?;
-    let mut experience = first.examples.clone();
-    experience.extend(second.examples.iter().cloned());
-    let seen = experience
+    let mut training_targets = first.examples.clone();
+    training_targets.extend(second.examples.iter().cloned());
+    let seen = training_targets
         .iter()
         .map(|example| example.semantic_group)
         .collect::<HashSet<_>>();
@@ -198,7 +200,7 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         .into_iter()
         .filter(|artifact| !seen.contains(&artifact.semantic_group))
         .collect::<Vec<_>>();
-    if audit_artifacts.len() < CANDIDATES_PER_HEAD {
+    if audit_artifacts.len() < ARTIFACTS_PER_HEAD {
         return Err("pre-cutoff semantic-family exclusion leaves too few audit artifacts".into());
     }
 
@@ -216,7 +218,7 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         rankings.push(freeze_treatment(
             name,
             treatment,
-            &experience,
+            &training_targets,
             &audit_artifacts,
         )?);
     }
@@ -240,7 +242,7 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
             std::fs::metadata(&arguments.december_catalog)?.len(),
         ],
         pairs: [pair_summary(&first), pair_summary(&second)],
-        training_examples: experience.len(),
+        training_examples: training_targets.len(),
         audit_artifacts: audit_artifacts.len(),
         audit_artifact_set_sha256,
         rankings,
@@ -296,6 +298,7 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         mathlib_commit_timestamp: boundary.commit_timestamp,
         boundary_evidence_url: BOUNDARY_EVIDENCE_URL,
         boundary_evidence_sha256: boundary.response_sha256,
+        boundary_evidence_response: boundary.response,
         lean_toolchain: arguments.lean_toolchain,
         lean_toolchain_alias: arguments.lean_toolchain_alias,
         lean_version: arguments.lean_version,
@@ -323,7 +326,7 @@ fn frozen_protocol() -> Protocol {
         training_pairs: [["2024-06-30", "2024-09-30"], ["2024-09-30", "2024-12-31"]],
         audit_artifact_snapshot: "2024-12-31",
         audit_artifact_exclusion: "exclude every semantic family observed in either training pair",
-        audit_artifacts_per_head: CANDIDATES_PER_HEAD,
+        audit_artifacts_per_head: ARTIFACTS_PER_HEAD,
         heads: PotentialHead::ALL.map(PotentialHead::name),
         treatments: [
             "full",
@@ -379,7 +382,7 @@ fn freeze_treatment(
         let indexes = if treatment == Treatment::NoModel {
             baseline_indexes(artifacts, "uniform")
         } else {
-            model.rank_for_head(artifacts, CANDIDATES_PER_HEAD, head)
+            model.rank_for_head(artifacts, ARTIFACTS_PER_HEAD, head)
         };
         let frozen = freeze_artifacts(artifacts, &indexes);
         ranking_wall_ns[index] = duration_ns(ranking_started.elapsed());
@@ -438,7 +441,7 @@ fn baseline_indexes(examples: &[TemporalExample], name: &str) -> Vec<usize> {
         }),
         _ => unreachable!("frozen baseline list is exhaustive"),
     }
-    ranked.truncate(CANDIDATES_PER_HEAD);
+    ranked.truncate(ARTIFACTS_PER_HEAD);
     ranked
 }
 
@@ -588,6 +591,7 @@ fn parse_audit_boundary(
     Ok(BoundaryEvidence {
         commit_timestamp: commit.commit.committer.date.clone(),
         response_sha256: hex(&Sha256::digest(response)),
+        response: String::from_utf8(response.to_vec())?,
     })
 }
 

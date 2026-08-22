@@ -95,6 +95,20 @@ pub enum RelationshipKind {
     CorpusCompression,
 }
 
+impl RelationshipKind {
+    #[must_use]
+    pub const fn evidence_code(self) -> u8 {
+        match self {
+            Self::Exact => 0,
+            Self::Definitional => 1,
+            Self::Specialization => 2,
+            Self::Derivation => 3,
+            Self::FamilyCollapse => 4,
+            Self::CorpusCompression => 5,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelationshipCandidate {
     pub earlier: LeanName,

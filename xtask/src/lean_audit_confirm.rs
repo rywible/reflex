@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,6 +33,7 @@ const WALL_LIMIT: Duration = Duration::from_hours(24);
 const RESIDENT_LIMIT: u64 = 48 * 1024 * 1024 * 1024;
 const SUPERVISOR_CAPABILITY: &str = "reflex-lean-temporal-audit-supervisor-v1";
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
+const IN_PROCESS_LANES: usize = 6;
 
 struct Arguments {
     manifest: PathBuf,
@@ -90,6 +93,7 @@ struct Lock {
     mathlib_commit_timestamp: String,
     boundary_evidence_url: String,
     boundary_evidence_sha256: String,
+    boundary_evidence_response: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -193,6 +197,7 @@ struct ReplayRecord {
     accepted: bool,
     diagnostic: String,
     kernel_evidence_sha256: String,
+    preparation_cpu_upper_bound_ns: u64,
     cumulative_cpu_upper_bound_ns: u64,
     proof_nodes: usize,
     proof_depth: usize,
@@ -369,6 +374,12 @@ struct FailureReport<'a> {
 }
 
 #[derive(Deserialize)]
+struct FailureIdentity {
+    schema: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
 struct MechanicalIdentity {
     schema: String,
     mechanical_gate_passed: bool,
@@ -440,10 +451,28 @@ struct FinalReport {
     content_sha256: String,
 }
 
+#[derive(Serialize)]
+struct FailedExecutionFinalReport {
+    schema: &'static str,
+    status: &'static str,
+    critique_complete: bool,
+    mechanical_gate_passed: bool,
+    scientifically_confirmed: bool,
+    execution_receipt_file_sha256: String,
+    failure_report_file_sha256: String,
+    failure_status: String,
+    next_domain: &'static str,
+    next_domain_role: &'static str,
+    content_sha256: String,
+}
+
 pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
     require_release("lean-temporal-audit-confirm")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
+    if host.available_parallelism < IN_PROCESS_LANES + 2 {
+        return Err("Lean Temporal Audit host cannot supply its registered eight lanes".into());
+    }
     parse(arguments)?;
     require_absent(
         &execution_receipt_path()?,
@@ -513,10 +542,9 @@ pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
     if !receipt_path.exists() {
         return Err("Lean Temporal Audit cannot finalize before its one-shot execution".into());
     }
-    if failure_report_path()?.exists() {
-        return Err(
-            "a sealed Lean Temporal Audit failure cannot be finalized as confirmation".into(),
-        );
+    let failure_path = failure_report_path()?;
+    if failure_path.exists() {
+        return finalize_failed_execution(&receipt_path, &failure_path, &arguments.output);
     }
     let receipt: ReceiptIdentity = serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
     let mechanical: MechanicalIdentity =
@@ -546,7 +574,7 @@ pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
         return Err("Lean Temporal Audit critique chain is not content-addressed".into());
     }
     validate_assessment(&packet, &assessment)?;
-    let confirmed = mechanical.mechanical_gate_passed;
+    let confirmed = mechanical.mechanical_gate_passed && assessment.protocol_deviations.is_empty();
     let mut report = FinalReport {
         schema: "reflex-lean-temporal-audit-final-v1",
         status: if confirmed {
@@ -579,6 +607,43 @@ pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
     println!(
         "status={} content_sha256={} next_domain=Wrela",
         report.status, report.content_sha256
+    );
+    Ok(())
+}
+
+fn finalize_failed_execution(
+    receipt: &Path,
+    failure: &Path,
+    output: &Path,
+) -> Result<(), AnyError> {
+    let failure_identity: FailureIdentity = serde_json::from_slice(&std::fs::read(failure)?)?;
+    if failure_identity.schema != "reflex-lean-temporal-audit-failure-v1"
+        || failure_identity.status != "sealed-failure; rerun-forbidden"
+    {
+        return Err("Lean Temporal Audit failure report identity differs".into());
+    }
+    let mut report = FailedExecutionFinalReport {
+        schema: "reflex-lean-temporal-audit-final-v1",
+        status: "null-result",
+        critique_complete: false,
+        mechanical_gate_passed: false,
+        scientifically_confirmed: false,
+        execution_receipt_file_sha256: hash_file(receipt)?,
+        failure_report_file_sha256: hash_file(failure)?,
+        failure_status: failure_identity.status,
+        next_domain: "Wrela",
+        next_domain_role: "registered-third-domain; not-rescue-analysis",
+        content_sha256: String::new(),
+    };
+    report.content_sha256 = hash_json(&report)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    println!(
+        "status=null-result content_sha256={} next_domain=Wrela",
+        report.content_sha256
     );
     Ok(())
 }
@@ -657,13 +722,13 @@ fn confirm_once(arguments: &[String]) -> Result<(), AnyError> {
         .map(|example| (example.declaration.to_string(), example.targets))
         .collect::<HashMap<_, _>>();
     let outcomes = evaluate(&manifest.rankings, &targets);
-    let pareto = pareto_outcomes(&outcomes, &manifest.rankings, &targets)?;
+    let pareto = pareto_outcomes(&manifest.rankings, &targets)?;
     let pareto_dominates = pareto.iter().all(|outcome| outcome.difference >= 0.0)
         && pareto.iter().any(|outcome| outcome.difference > 0.0)
         && pareto
             .iter()
             .all(|outcome| outcome.simultaneous_lower_bound_99 >= 0.0);
-    let causal_ablations = ablation_outcomes(&outcomes)?;
+    let causal_ablations = ablation_outcomes(&manifest.rankings, &targets)?;
     let causal_ablations_passed = causal_ablations.iter().all(|outcome| outcome.passed);
     let maximum_exhaustion_cpu_ns = outcomes
         .iter()
@@ -877,6 +942,11 @@ fn validate_inputs(
     if lock.content_sha256.is_empty() {
         return Err("Lean Temporal Audit lock has no content identity".into());
     }
+    if hex(&Sha256::digest(lock.boundary_evidence_response.as_bytes()))
+        != lock.boundary_evidence_sha256
+    {
+        return Err("Lean Temporal Audit boundary response identity differs".into());
+    }
     let mut unhashed_lock = lock.clone();
     let expected_lock_hash = std::mem::take(&mut unhashed_lock.content_sha256);
     if hash_json(&unhashed_lock)? != expected_lock_hash {
@@ -894,9 +964,9 @@ fn evaluate(
     rankings: &[Ranking],
     targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
 ) -> Vec<TreatmentOutcome> {
-    rankings
-        .iter()
-        .map(|ranking| TreatmentOutcome {
+    parallel_map_indexed(rankings.len(), |index| {
+        let ranking = &rankings[index];
+        TreatmentOutcome {
             treatment: ranking.treatment.clone(),
             heads: ranking
                 .heads
@@ -904,8 +974,8 @@ fn evaluate(
                 .enumerate()
                 .map(|(head, artifacts)| evaluate_head(ranking, head, artifacts, targets))
                 .collect(),
-        })
-        .collect()
+        }
+    })
 }
 
 fn evaluate_head(
@@ -984,16 +1054,19 @@ fn family_mean(units: &BTreeMap<String, Vec<f64>>) -> f64 {
     )
 }
 
-fn ablation_outcomes(outcomes: &[TreatmentOutcome]) -> Result<Vec<AblationOutcome>, AnyError> {
-    let full = outcomes
+fn ablation_outcomes(
+    rankings: &[Ranking],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> Result<Vec<AblationOutcome>, AnyError> {
+    let full = rankings
         .iter()
-        .find(|outcome| outcome.treatment == "full")
+        .find(|ranking| ranking.treatment == "full")
         .ok_or("frozen rankings omit Full")?;
-    Ok(outcomes
+    Ok(rankings
         .iter()
-        .filter(|outcome| {
+        .filter(|ranking| {
             matches!(
-                outcome.treatment.as_str(),
+                ranking.treatment.as_str(),
                 "bootstrap" | "no-model" | "no-consolidation" | "immediate-only"
             )
         })
@@ -1001,11 +1074,10 @@ fn ablation_outcomes(outcomes: &[TreatmentOutcome]) -> Result<Vec<AblationOutcom
             let mut full_wins = 0;
             let mut ties = 0;
             let mut full_losses = 0;
-            for (full, ablated) in full.heads.iter().zip(&ablation.heads) {
-                match full
-                    .directional_utility
-                    .total_cmp(&ablated.directional_utility)
-                {
+            for head in 0..POTENTIAL_HEADS {
+                let (_, _, difference) =
+                    paired_family_point(&full.heads[head], &ablation.heads[head], head, targets);
+                match difference.total_cmp(&0.0) {
                     std::cmp::Ordering::Greater => full_wins += 1,
                     std::cmp::Ordering::Equal => ties += 1,
                     std::cmp::Ordering::Less => full_losses += 1,
@@ -1023,23 +1095,9 @@ fn ablation_outcomes(outcomes: &[TreatmentOutcome]) -> Result<Vec<AblationOutcom
 }
 
 fn pareto_outcomes(
-    outcomes: &[TreatmentOutcome],
     rankings: &[Ranking],
     targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
 ) -> Result<Vec<ParetoOutcome>, AnyError> {
-    let full = outcomes
-        .iter()
-        .find(|outcome| outcome.treatment == "full")
-        .ok_or("frozen rankings omit Full")?;
-    let baselines = outcomes
-        .iter()
-        .filter(|outcome| {
-            matches!(
-                outcome.treatment.as_str(),
-                "uniform" | "dependency-light" | "historical-reuse"
-            )
-        })
-        .collect::<Vec<_>>();
     let full_ranking = rankings
         .iter()
         .find(|ranking| ranking.treatment == "full")
@@ -1050,40 +1108,83 @@ fn pareto_outcomes(
             .find(|ranking| ranking.treatment == name)
             .expect("three frozen baseline rankings exist")
     });
+    let bound_values = parallel_map_indexed(POTENTIAL_HEADS * 3, |job| {
+        let head = job / 3;
+        let baseline = job % 3;
+        clustered_difference_lower_bound(
+            &full_ranking.heads[head],
+            &baseline_rankings[baseline].heads[head],
+            head,
+            targets,
+        )
+    });
     let mut lower_bounds = std::array::from_fn::<_, POTENTIAL_HEADS, _>(|_| [0.0; 3]);
-    for (head, head_bounds) in lower_bounds.iter_mut().enumerate() {
-        for (baseline, ranking) in baseline_rankings.iter().enumerate() {
-            head_bounds[baseline] = clustered_difference_lower_bound(
-                &full_ranking.heads[head],
-                &ranking.heads[head],
-                head,
-                targets,
-            );
-        }
+    for (job, value) in bound_values.into_iter().enumerate() {
+        lower_bounds[job / 3][job % 3] = value;
     }
     Ok((0..POTENTIAL_HEADS)
         .map(|head| {
-            let best = baselines
+            let paired = baseline_rankings.map(|ranking| {
+                let (full, baseline, difference) = paired_family_point(
+                    &full_ranking.heads[head],
+                    &ranking.heads[head],
+                    head,
+                    targets,
+                );
+                (ranking.treatment.as_str(), full, baseline, difference)
+            });
+            let best = paired
                 .iter()
-                .max_by(|left, right| {
-                    left.heads[head]
-                        .directional_utility
-                        .total_cmp(&right.heads[head].directional_utility)
-                })
+                .max_by(|left, right| left.2.total_cmp(&right.2).then_with(|| right.0.cmp(left.0)))
                 .expect("three frozen baselines exist");
             ParetoOutcome {
                 head: head_name(head),
-                full: full.heads[head].directional_utility,
-                virtual_best_baseline: best.heads[head].directional_utility,
-                difference: full.heads[head].directional_utility
-                    - best.heads[head].directional_utility,
+                full: best.1,
+                virtual_best_baseline: best.2,
+                difference: best.3,
                 simultaneous_lower_bound_99: lower_bounds[head]
                     .into_iter()
                     .fold(f64::INFINITY, f64::min),
-                baseline: best.treatment.clone(),
+                baseline: best.0.to_owned(),
             }
         })
         .collect())
+}
+
+fn paired_family_point(
+    full: &[FrozenArtifact],
+    comparator: &[FrozenArtifact],
+    head: usize,
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> (f64, f64, f64) {
+    let mut families = BTreeMap::<(String, String), (Vec<f64>, Vec<f64>)>::new();
+    for (artifacts, side) in [(full, 0_usize), (comparator, 1_usize)] {
+        for artifact in artifacts {
+            let utility = targets
+                .get(&artifact.declaration)
+                .map_or(0.0, |targets| directional(head, f64::from(targets[head])));
+            let values = families
+                .entry((artifact.module.clone(), artifact.semantic_family.clone()))
+                .or_default();
+            if side == 0 {
+                values.0.push(utility);
+            } else {
+                values.1.push(utility);
+            }
+        }
+    }
+    let (mut full_total, mut comparator_total) = (0.0, 0.0);
+    for (full, comparator) in families.values() {
+        full_total += mean_or_zero(full);
+        comparator_total += mean_or_zero(comparator);
+    }
+    let denominator = f64::from(u32::try_from(families.len()).unwrap_or(u32::MAX));
+    if denominator == 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let full = full_total / denominator;
+    let comparator = comparator_total / denominator;
+    (full, comparator, full - comparator)
 }
 
 fn clustered_difference_lower_bound(
@@ -1168,12 +1269,12 @@ fn time_gate(
         interval_gate_evaluated = true;
         let modules =
             std::array::from_fn::<_, POTENTIAL_HEADS, _>(|head| bootstrap_modules(records, head));
-        let mut speedups = Vec::with_capacity(10_000);
-        for replicate in 0..10_000_u64 {
+        let mut speedups = parallel_map_indexed(10_000, |replicate| {
             let weights = std::array::from_fn(|head| {
                 bootstrap_weights(
                     &modules[head],
-                    replicate ^ u64::try_from(head).unwrap_or(u64::MAX),
+                    u64::try_from(replicate).unwrap_or(u64::MAX)
+                        ^ u64::try_from(head).unwrap_or(u64::MAX),
                 )
             });
             let sample = time_heads(records, targets, Some(&weights));
@@ -1181,8 +1282,8 @@ fn time_gate(
                 .iter()
                 .filter_map(|outcome| outcome.speedup)
                 .collect::<Vec<_>>();
-            speedups.push(geometric_mean(&values, POTENTIAL_HEADS).unwrap_or(0.0));
-        }
+            geometric_mean(&values, POTENTIAL_HEADS).unwrap_or(0.0)
+        });
         speedups.sort_unstable_by(f64::total_cmp);
         simultaneous_lower_bound_99 = speedups.get(99).copied();
     }
@@ -1269,6 +1370,11 @@ fn time_to_target(
     weights: Option<&HashMap<String, u32>>,
     target: f64,
 ) -> Option<u64> {
+    if target <= 0.0 {
+        return sequence
+            .first()
+            .map(|record| record.preparation_cpu_upper_bound_ns);
+    }
     for end in 1..=sequence.len() {
         let prefix = &sequence[..end];
         if weighted_utility(prefix, head, targets, weights).is_some_and(|value| value >= target) {
@@ -1363,6 +1469,37 @@ fn mean_or_zero(values: &[f64]) -> f64 {
     if values.is_empty() { 0.0 } else { mean(values) }
 }
 
+fn parallel_map_indexed<T, F>(len: usize, function: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    let next = AtomicUsize::new(0);
+    let slots = (0..len).map(|_| Mutex::new(None)).collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        for _ in 0..IN_PROCESS_LANES.min(len) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= len {
+                        break;
+                    }
+                    *slots[index].lock().expect("parallel result slot poisoned") =
+                        Some(function(index));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("parallel result slot poisoned")
+                .expect("parallel result slot omitted")
+        })
+        .collect()
+}
+
 fn bootstrap_weights(modules: &[Vec<String>], replicate: u64) -> HashMap<String, u32> {
     let mut state = splitmix64(replicate ^ 0x6c65_616e_6175_6469);
     let mut weights = HashMap::new();
@@ -1398,9 +1535,10 @@ fn replay_rankings(
     let mut cpu = 0_u64;
     for ranking in rankings {
         for (head, artifacts) in ranking.heads.iter().enumerate() {
-            let mut cumulative = ranking
+            let preparation = ranking
                 .training_cpu_ns
                 .saturating_add(ranking.selection_cpu_ns[head]);
+            let mut cumulative = preparation;
             for (rank, artifact) in artifacts.iter().take(REPLAY_PER_HEAD).enumerate() {
                 let fetch_started = Instant::now();
                 let name = LeanName::from_dotted(&artifact.declaration);
@@ -1417,6 +1555,7 @@ fn replay_rankings(
                         accepted: false,
                         diagnostic: "source theorem unavailable".into(),
                         kernel_evidence_sha256: String::new(),
+                        preparation_cpu_upper_bound_ns: preparation,
                         cumulative_cpu_upper_bound_ns: cumulative,
                         proof_nodes: 0,
                         proof_depth: 0,
@@ -1471,6 +1610,7 @@ fn replay_rankings(
                     accepted,
                     diagnostic,
                     kernel_evidence_sha256,
+                    preparation_cpu_upper_bound_ns: preparation,
                     cumulative_cpu_upper_bound_ns: cumulative,
                     proof_nodes,
                     proof_depth,
@@ -1698,7 +1838,7 @@ fn relationship_evidence_hash(
     digest.update(candidate.earlier.to_string().as_bytes());
     digest.update([0]);
     digest.update(candidate.later.to_string().as_bytes());
-    digest.update([candidate.expected as u8]);
+    digest.update([candidate.expected.evidence_code()]);
     digest.update(serde_json::to_vec(verification)?);
     Ok(hex(&digest.finalize()))
 }
@@ -1946,6 +2086,10 @@ fn validate_assessment(
         || assessment.items.len() != 32
         || assessment.reviewer.trim().is_empty()
         || assessment.overall_assessment.trim().is_empty()
+        || assessment
+            .protocol_deviations
+            .iter()
+            .any(|deviation| deviation.trim().is_empty())
     {
         return Err("Lean Temporal Audit critique must completely assess 32 items".into());
     }
@@ -2159,6 +2303,30 @@ mod tests {
     }
 
     #[test]
+    fn paired_point_gate_keeps_absent_families_in_both_denominators() {
+        let full = vec![artifact("A", "M", "full-only")];
+        let comparator = vec![artifact("B", "M", "comparator-only")];
+        let targets = [
+            ("A".into(), [1.0; POTENTIAL_HEADS]),
+            ("B".into(), [1.0; POTENTIAL_HEADS]),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let (full, comparator, difference) = paired_family_point(&full, &comparator, 0, &targets);
+        assert!((full - 0.5).abs() < f64::EPSILON);
+        assert!((comparator - 0.5).abs() < f64::EPSILON);
+        assert!(difference.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parallel_analysis_retains_input_order() {
+        assert_eq!(
+            parallel_map_indexed(32, |index| index * index),
+            (0..32).map(|index| index * index).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn finalizer_recomputes_terminal_json_content_identity() {
         #[derive(Serialize)]
         struct SelfHashed<'a> {
@@ -2218,6 +2386,7 @@ mod tests {
                     accepted: true,
                     diagnostic: String::new(),
                     kernel_evidence_sha256: format!("evidence-{treatment}-{head}"),
+                    preparation_cpu_upper_bound_ns: cpu / 2,
                     cumulative_cpu_upper_bound_ns: cpu,
                     proof_nodes: 1,
                     proof_depth: 1,
@@ -2237,6 +2406,10 @@ mod tests {
         assert!(
             gate.geometric_mean_speedup
                 .is_some_and(|speedup| speedup >= 10.0)
+        );
+        assert_eq!(
+            time_to_target(&[&records[0]], 0, &targets, None, 0.0),
+            Some(records[0].preparation_cpu_upper_bound_ns)
         );
     }
 }
