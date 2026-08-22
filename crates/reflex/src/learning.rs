@@ -113,16 +113,20 @@ pub(crate) struct PairedModelComparison {
     pub(crate) selection_claims: usize,
     pub(crate) baseline_loss: [f32; HEAD_COUNT],
     pub(crate) structural_loss: [f32; HEAD_COUNT],
+    pub(crate) balanced_structural_loss: [f32; HEAD_COUNT],
     pub(crate) baseline_training_cpu: std::time::Duration,
     pub(crate) structural_training_cpu: std::time::Duration,
+    pub(crate) balanced_structural_training_cpu: std::time::Duration,
     pub(crate) baseline_revision: [u8; 32],
     pub(crate) structural_revision: [u8; 32],
+    pub(crate) balanced_structural_revision: [u8; 32],
     pub(crate) model_bytes: usize,
     pub(crate) baseline_reproduces_champion: bool,
     pub(crate) structural_promotes: bool,
     pub(crate) ranking_budgets: [usize; 7],
     pub(crate) baseline_accepted_at_k: [usize; 7],
     pub(crate) structural_accepted_at_k: [usize; 7],
+    pub(crate) balanced_structural_accepted_at_k: [usize; 7],
     pub(crate) evaluated_at_k: [usize; 7],
     pub(crate) selection_accepted: usize,
 }
@@ -240,25 +244,41 @@ impl LearningState {
         let structural_replay = bounded_corpus(&structural, false);
         let baseline_selection = bounded_corpus(&baseline, true);
         let structural_selection = bounded_corpus(&structural, true);
-        let train = |replay: &[&TrainingExample]| {
+        let train = |replay: &[&TrainingExample], balancing: Option<[[f32; 2]; HEAD_COUNT]>| {
             let started = cpu_time::ProcessTime::now();
             let mut model = FtrlModel::zero();
             for _ in 0..TRAINING_EPOCHS {
                 for example in replay {
-                    model.update(example);
+                    if let Some(balancing) = balancing {
+                        let weights = std::array::from_fn(|head| {
+                            balancing[head][usize::from(example.targets.0[head] > 0.0)]
+                        });
+                        model.update_weighted(example, weights);
+                    } else {
+                        model.update(example);
+                    }
                 }
             }
             (model, started.elapsed())
         };
-        let (baseline_model, baseline_training_cpu) = train(&baseline_replay);
-        let (structural_model, structural_training_cpu) = train(&structural_replay);
+        let (baseline_model, baseline_training_cpu) = train(&baseline_replay, None);
+        let (structural_model, structural_training_cpu) = train(&structural_replay, None);
+        let (balanced_structural_model, balanced_structural_training_cpu) = train(
+            &structural_replay,
+            Some(outcome_balancing(&structural_replay)),
+        );
         let baseline_loss = losses(&baseline_model, &baseline_selection);
         let structural_loss = losses(&structural_model, &structural_selection);
+        let balanced_structural_loss = losses(&balanced_structural_model, &structural_selection);
         let baseline_ranking = accepted_ranking(&baseline_model, baseline_attempts, &self.roles);
         let structural_ranking =
             accepted_ranking(&structural_model, structural_attempts, &self.roles);
+        let balanced_structural_ranking =
+            accepted_ranking(&balanced_structural_model, structural_attempts, &self.roles);
         if baseline_ranking.evaluated_at_k != structural_ranking.evaluated_at_k
             || baseline_ranking.total_accepted != structural_ranking.total_accepted
+            || baseline_ranking.evaluated_at_k != balanced_structural_ranking.evaluated_at_k
+            || baseline_ranking.total_accepted != balanced_structural_ranking.total_accepted
         {
             return Err(());
         }
@@ -277,10 +297,13 @@ impl LearningState {
             selection_claims,
             baseline_loss,
             structural_loss,
+            balanced_structural_loss,
             baseline_training_cpu,
             structural_training_cpu,
+            balanced_structural_training_cpu,
             baseline_revision: revision_digest(&baseline_model),
             structural_revision: revision_digest(&structural_model),
+            balanced_structural_revision: revision_digest(&balanced_structural_model),
             model_bytes: baseline_model.encode().len(),
             baseline_reproduces_champion: self
                 .champion
@@ -291,6 +314,7 @@ impl LearningState {
             ranking_budgets: RANKING_BUDGETS,
             baseline_accepted_at_k: baseline_ranking.accepted_at_k,
             structural_accepted_at_k: structural_ranking.accepted_at_k,
+            balanced_structural_accepted_at_k: balanced_structural_ranking.accepted_at_k,
             evaluated_at_k: baseline_ranking.evaluated_at_k,
             selection_accepted: baseline_ranking.total_accepted,
         })
@@ -684,6 +708,10 @@ impl FtrlModel {
     }
 
     pub(crate) fn update(&mut self, example: &TrainingExample) {
+        self.update_weighted(example, [1.0; HEAD_COUNT]);
+    }
+
+    fn update_weighted(&mut self, example: &TrainingExample, head_weights: [f32; HEAD_COUNT]) {
         const ALPHA: f32 = 0.1;
         let predictions = self.predict_active(example.features, example.active_features);
         let errors: [f32; HEAD_COUNT] =
@@ -697,7 +725,8 @@ impl FtrlModel {
             let previous_sqrt_n = self.sqrt_n[index];
             let previous_z = self.z[index];
             let previous_weights = self.weights[index];
-            let gradients = errors.map(|error| error * feature);
+            let gradients: [f32; HEAD_COUNT] =
+                std::array::from_fn(|head| errors[head] * feature * head_weights[head]);
             let next_n =
                 std::array::from_fn(|head| previous_n[head] + gradients[head] * gradients[head]);
             let next_sqrt_n = next_n.map(f32::sqrt);
@@ -946,6 +975,33 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&Trainin
     }
     corpus.sort_unstable_by_key(|example| example.key);
     corpus
+}
+
+#[cfg(feature = "internal-experiments")]
+fn outcome_balancing(examples: &[&TrainingExample]) -> [[f32; 2]; HEAD_COUNT] {
+    let mut counts = [[0_u32; 2]; HEAD_COUNT];
+    for example in examples {
+        for (head, target) in example.targets.0.iter().enumerate() {
+            let class = usize::from(*target > 0.0);
+            counts[head][class] = counts[head][class].saturating_add(1);
+        }
+    }
+    std::array::from_fn(|head| {
+        let total = counts[head][0].saturating_add(counts[head][1]);
+        if counts[head].contains(&0) || total == 0 {
+            [1.0; 2]
+        } else {
+            std::array::from_fn(|class| {
+                let denominator = counts[head][class].saturating_mul(2);
+                (bounded_u32(total) / bounded_u32(denominator)).min(32.0)
+            })
+        }
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+fn bounded_u32(value: u32) -> f32 {
+    f32::from(u16::try_from(value).unwrap_or(u16::MAX))
 }
 
 pub(crate) fn compare_models(

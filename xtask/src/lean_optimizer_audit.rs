@@ -141,17 +141,21 @@ struct FeatureDevelopmentReport {
     head_count: usize,
     baseline_selection_loss: [f32; 7],
     structural_selection_loss: [f32; 7],
+    balanced_structural_selection_loss: [f32; 7],
     baseline_training_cpu_ns: u64,
     structural_training_cpu_ns: u64,
+    balanced_structural_training_cpu_ns: u64,
     feature_extraction_cpu_ns: u64,
     baseline_model_revision: String,
     structural_model_revision: String,
+    balanced_structural_model_revision: String,
     model_bytes: usize,
     baseline_reproduces_champion: bool,
     structural_promotes_over_baseline: bool,
     ranking_budgets: [usize; 7],
     baseline_accepted_at_k: [usize; 7],
     structural_accepted_at_k: [usize; 7],
+    balanced_structural_accepted_at_k: [usize; 7],
     evaluated_at_k: [usize; 7],
     selection_accepted: usize,
     host: HostEnvironment,
@@ -331,7 +335,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v4";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v5";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -385,17 +389,23 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         head_count: 7,
         baseline_selection_loss: comparison.baseline_selection_loss,
         structural_selection_loss: comparison.structural_selection_loss,
+        balanced_structural_selection_loss: comparison.balanced_structural_selection_loss,
         baseline_training_cpu_ns: duration_ns(comparison.baseline_training_cpu),
         structural_training_cpu_ns: duration_ns(comparison.structural_training_cpu),
+        balanced_structural_training_cpu_ns: duration_ns(
+            comparison.balanced_structural_training_cpu,
+        ),
         feature_extraction_cpu_ns: duration_ns(comparison.feature_extraction_cpu),
         baseline_model_revision: hex(&comparison.baseline_model_revision),
         structural_model_revision: hex(&comparison.structural_model_revision),
+        balanced_structural_model_revision: hex(&comparison.balanced_structural_model_revision),
         model_bytes: comparison.model_bytes,
         baseline_reproduces_champion: comparison.baseline_reproduces_champion,
         structural_promotes_over_baseline: comparison.structural_promotes_over_baseline,
         ranking_budgets: comparison.ranking_budgets,
         baseline_accepted_at_k: comparison.baseline_accepted_at_k,
         structural_accepted_at_k: comparison.structural_accepted_at_k,
+        balanced_structural_accepted_at_k: comparison.balanced_structural_accepted_at_k,
         evaluated_at_k: comparison.evaluated_at_k,
         selection_accepted: comparison.selection_accepted,
         host,
