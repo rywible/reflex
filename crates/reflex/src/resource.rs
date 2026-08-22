@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
 
-use crate::{ResourceEnvelope, ResourceUsage};
+use crate::{
+    ExternalVerificationUsage, ResourceEnvelope, ResourceUsage, VerificationAllowance,
+    VerificationWorkerRequirements,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResidentReservation {
@@ -51,6 +54,7 @@ pub(crate) struct ResourceEnvelopeGuard {
     peak_durable: Cell<u64>,
     elapsed_before: Cell<Duration>,
     cpu_before: Cell<Duration>,
+    external_cpu: Cell<Duration>,
 }
 
 impl ResourceEnvelopeGuard {
@@ -68,6 +72,7 @@ impl ResourceEnvelopeGuard {
             peak_durable: Cell::new(0),
             elapsed_before: Cell::new(Duration::ZERO),
             cpu_before: Cell::new(Duration::ZERO),
+            external_cpu: Cell::new(Duration::ZERO),
         })
     }
 
@@ -109,6 +114,59 @@ impl ResourceEnvelopeGuard {
         bytes <= self.durable_limit
     }
 
+    pub(crate) fn verification_allowance(
+        &self,
+        worker_lanes: usize,
+        resident_overlap: u64,
+    ) -> Result<VerificationAllowance, ()> {
+        let elapsed_spent = self
+            .elapsed_before
+            .get()
+            .saturating_add(self.wall_started.elapsed());
+        let cpu_spent = self.current_cpu()?;
+        Ok(VerificationAllowance::new(
+            worker_lanes,
+            self.resident_limit.saturating_sub(resident_overlap),
+            self.elapsed_limit.saturating_sub(elapsed_spent),
+            self.cpu_limit.saturating_sub(cpu_spent),
+        ))
+    }
+
+    pub(crate) fn charge_external_verification(
+        &self,
+        requirements: VerificationWorkerRequirements,
+        allowance: VerificationAllowance,
+        usage: ExternalVerificationUsage,
+        resident_overlap: u64,
+    ) -> Result<(), ()> {
+        self.external_cpu
+            .set(self.external_cpu.get().saturating_add(usage.cpu_time()));
+        let observed_resident = resident_overlap
+            .saturating_sub(requirements.resident_bytes())
+            .saturating_add(usage.peak_resident_bytes());
+        self.peak_resident
+            .set(self.peak_resident.get().max(observed_resident));
+        let elapsed_spent = self
+            .elapsed_before
+            .get()
+            .saturating_add(self.wall_started.elapsed());
+        let cpu_spent = self.current_cpu()?;
+        if usage.worker_lanes() > requirements.worker_lanes()
+            || usage.worker_lanes() > allowance.worker_lanes()
+            || usage.peak_resident_bytes() > requirements.resident_bytes()
+            || usage.peak_resident_bytes() > allowance.resident_bytes()
+            || usage.elapsed_time() > allowance.elapsed_time()
+            || usage.cpu_time() > allowance.cpu_time()
+            || requirements.worker_lanes() == 0 && usage != ExternalVerificationUsage::default()
+            || observed_resident > self.resident_limit
+            || requirements.worker_lanes() != 0
+                && (elapsed_spent > self.elapsed_limit || cpu_spent > self.cpu_limit)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
     pub(crate) fn time_exhausted(&self) -> Result<bool, ()> {
         self.time_exhausted_against(self.elapsed_limit, self.cpu_limit)
     }
@@ -130,11 +188,7 @@ impl ResourceEnvelopeGuard {
             .get()
             .saturating_add(self.wall_started.elapsed())
             >= elapsed_limit
-            || self
-                .cpu_before
-                .get()
-                .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?)
-                >= cpu_limit)
+            || self.current_cpu()? >= cpu_limit)
     }
 
     pub(crate) fn usage(
@@ -151,11 +205,16 @@ impl ResourceEnvelopeGuard {
                 .elapsed_before
                 .get()
                 .saturating_add(self.wall_started.elapsed()),
-            cpu_time: self
-                .cpu_before
-                .get()
-                .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?),
+            cpu_time: self.current_cpu()?,
         })
+    }
+
+    fn current_cpu(&self) -> Result<Duration, ()> {
+        Ok(self
+            .cpu_before
+            .get()
+            .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?)
+            .saturating_add(self.external_cpu.get()))
     }
 }
 
@@ -164,7 +223,10 @@ mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
     use std::time::Duration;
 
-    use crate::{NonZeroDuration, ResourceEnvelope, ResourceUsage};
+    use crate::{
+        ExternalVerificationUsage, NonZeroDuration, ResourceEnvelope, ResourceUsage,
+        VerificationWorkerRequirements,
+    };
 
     use super::{ResidentReservation, ResourceEnvelopeGuard};
 
@@ -209,5 +271,43 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rejected_external_overrun_is_still_charged() {
+        let one_second = NonZeroDuration::new(Duration::from_secs(1)).unwrap();
+        let resources = ResourceEnvelope::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(1_000).unwrap(),
+            NonZeroU64::new(1).unwrap(),
+            one_second,
+            one_second,
+            NonZeroU64::new(1).unwrap(),
+        );
+        let guard = ResourceEnvelopeGuard::start(&resources).unwrap();
+        let requirements = VerificationWorkerRequirements::external(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(100).unwrap(),
+        );
+        let allowance = guard.verification_allowance(1, 100).unwrap();
+
+        assert!(
+            guard
+                .charge_external_verification(
+                    requirements,
+                    allowance,
+                    ExternalVerificationUsage::new(
+                        1,
+                        200,
+                        Duration::from_millis(1),
+                        Duration::from_secs(2),
+                    ),
+                    200,
+                )
+                .is_err()
+        );
+        let usage = guard.usage(1, 0).unwrap();
+        assert!(usage.cpu_time >= Duration::from_secs(2));
+        assert!(usage.resident_bytes >= 300);
     }
 }

@@ -14,8 +14,9 @@ use reflex::{
     KernelRevision, MeasurementDescriptor, MeasurementEnvironment, MeasurementSpace,
     MeasurementWriter, MetricOrdering, NonEmpty, OperatorAlgebra, OperatorDescriptor,
     OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter, SemanticIdentity,
-    StructuralProtocol, Verdict, VerdictWriter, VerificationBatch, VerificationKernel,
-    VerificationRecord, VerificationReplayBatch, VerifiedBatch,
+    StructuralProtocol, Verdict, VerdictWriter, VerificationBatch, VerificationBatchOutcome,
+    VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    VerifiedBatch,
 };
 
 const U8_ROTATIONS: u8 = 8;
@@ -1732,10 +1733,10 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         requests: VerificationBatch<'_, BitVecDomain, Self::Claim>,
         output: &mut VerdictWriter<'_, Self::Evidence>,
         (): &mut Self::Scratch,
-    ) -> Result<(), BitVecError> {
+    ) -> VerificationBatchOutcome<BitVecError> {
         let verdicts = requests
             .requests()
-            .par_iter()
+            .iter()
             .map(|request| {
                 let expected = truth_table(request.seed);
                 let evidence = truth_table(request.candidate);
@@ -1749,7 +1750,7 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         for verdict in verdicts {
             output.push(verdict);
         }
-        Ok(())
+        VerificationBatchOutcome::completed(VerificationBatchReport::in_process())
     }
 
     fn replay_batch(
@@ -1757,10 +1758,10 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         records: VerificationReplayBatch<'_, BitVecDomain, Self::Claim, Self::Evidence>,
         output: &mut ReplayVerdictWriter<'_>,
         (): &mut Self::Scratch,
-    ) -> Result<(), BitVecError> {
+    ) -> VerificationBatchOutcome<BitVecError> {
         let replayed = records
             .requests()
-            .par_iter()
+            .iter()
             .map(
                 |VerificationReplayRequest {
                      artifact,
@@ -1776,7 +1777,7 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         for accepted in replayed {
             output.push(accepted);
         }
-        Ok(())
+        VerificationBatchOutcome::completed(VerificationBatchReport::in_process())
     }
 
     fn encode_claim(&self, claim: &Self::Claim, output: &mut Vec<u8>) -> Result<(), BitVecError> {

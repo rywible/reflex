@@ -14,6 +14,7 @@ pub(crate) enum Phase {
     Generation,
     Selection,
     Verification,
+    VerificationKernel,
     MeasurementAdmission,
     Consolidation,
     Training,
@@ -21,7 +22,7 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     const fn index(self) -> usize {
         self as usize
@@ -128,6 +129,7 @@ impl Recorder {
             ("generation_ns", Phase::Generation),
             ("selection_ns", Phase::Selection),
             ("verification_ns", Phase::Verification),
+            ("verification_kernel_ns", Phase::VerificationKernel),
             ("measurement_admission_ns", Phase::MeasurementAdmission),
             ("consolidation_ns", Phase::Consolidation),
             ("training_ns", Phase::Training),

@@ -455,6 +455,7 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
     type Scratch: Default + Send + 'static;
 
     fn revision(&self) -> KernelRevision;
+    fn worker_requirements(&self) -> VerificationWorkerRequirements;
 
     fn claim_for_candidate(
         &self,
@@ -467,14 +468,14 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
         requests: VerificationBatch<'_, D, Self::Claim>,
         output: &mut VerdictWriter<'_, Self::Evidence>,
         scratch: &mut Self::Scratch,
-    ) -> Result<(), D::Error>;
+    ) -> VerificationBatchOutcome<D::Error>;
 
     fn replay_batch(
         &self,
         records: VerificationReplayBatch<'_, D, Self::Claim, Self::Evidence>,
         output: &mut ReplayVerdictWriter<'_>,
         scratch: &mut Self::Scratch,
-    ) -> Result<(), D::Error>;
+    ) -> VerificationBatchOutcome<D::Error>;
 
     fn encode_claim(
         &self,
@@ -493,6 +494,23 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
     fn decode_evidence(&self, bytes: &[u8]) -> Result<Self::Evidence, D::Error>;
 }
 
+pub struct VerificationAllowance {
+    worker_lanes: usize,
+    resident_bytes: u64,
+    elapsed_time: Duration,
+    cpu_time: Duration,
+}
+
+pub struct VerificationBatchOutcome<E> {
+    report: VerificationBatchReport,
+    error: Option<E>,
+}
+
+pub struct VerificationBatchReport {
+    external_usage: ExternalVerificationUsage,
+    worker_failed: bool,
+}
+
 pub enum Verdict<E> {
     Accepted { evidence: E },
     Refuted,
@@ -503,6 +521,10 @@ pub enum Verdict<E> {
 Only the Runtime Controller can convert `Accepted` into `VerifiedCandidate<D>` or `VerifiedArtifact<D>`; their constructors are private to the `reflex` crate. No Operator, Measurement, model, or caller can manufacture verified state.
 
 `Refuted` and `Unknown` are ordinary results. They are recorded in the Experience Ledger and do not abort a Session.
+
+The default worker requirements are in-process and consume no external lanes. An external Kernel declares pinned worker lanes and resident bytes before the Runtime pool is built. Every batch receives its remaining allowance and returns an outcome even on a domain error, so observed child CPU, wall time, peak resident memory, and worker failure cannot disappear down an error path. A failed or over-budget external batch terminates the Session only after the charged interrupted checkpoint is durable.
+
+`claim_for_candidate` is deterministic in-process claim derivation and cannot invoke the external authority because it has no allowance. Only `verify_batch` and `replay_batch` may dispatch the pinned workers.
 
 ### Measurement Space
 
@@ -707,7 +729,9 @@ Each admission epoch is represented by an internal `EpochTransition`. Artifact, 
 
 Search, Verification, training, and Knowledge Consolidation share the same compute-lane budget and obey Protected Allocations. No learned or domain Module owns another pool. Pinned Verification workers authorized by ADR 0048 consume lanes from that same budget rather than creating nested parallelism.
 
-Production scheduling may be nondeterministic. The internal Experimental Harness uses fixed partitions, predetermined random streams, and deterministic reductions through the private Scheduler and ResourceMeter seams while exercising the same Improvement Session implementation.
+The private Scheduler is the only owner of Candidate-scale Verification parallelism. In-process kernels receive ordered contiguous sub-batches on the Runtime pool; they do not create nested pools. `REFLEX_INTERNAL_SCHEDULER=throughput` uses surplus ordered chunks and Rayon's local-deque work stealing, while `deterministic` fixes one contiguous partition per Runtime lane. Both reductions preserve request order. External pinned workers receive one whole batch because their adapter owns process dispatch, but their lanes are first subtracted from the same caller-declared worker budget and at least one Runtime controller lane must remain.
+
+Production scheduling may be nondeterministic. The internal Experimental Harness uses fixed partitions, predetermined random streams, and deterministic reductions through the private Scheduler and ResourceMeter seams while exercising the same Improvement Session implementation. Scheduling semantics are pinned by `RUNTIME_REVISION`; a change makes an interrupted Domain Bundle explicitly incompatible instead of silently changing its resumed execution.
 
 ## Revisions and learning
 
@@ -859,6 +883,8 @@ Production binaries use optimization level 3, fat link-time optimization, one co
 `perf-smoke` is the bounded development diagnostic. It records the embedded build profile and flags, session wall and process CPU time, externally sampled process-tree CPU time and peak resident memory, semantic outcome, and recovery validity. It permits a dirty tree and labels its report development-only. It must never be presented as confirmation evidence or replace a frozen equal-budget protocol.
 
 `causal-development-performance` replays one consumed v5 corpus through Full and Bootstrap for bounded regression work. It rejects changes unless deterministic Measurements, Pareto artifact identity, Knowledge Revision, Model Revision, and recovery remain exact, Full is at least twice as fast as historical v5 Full, and Full beats historical v5 Bootstrap wall time. Consumed data remains Development Corpus: passing this gate is never confirmation evidence.
+
+`verification-scaling` is the bounded multicore development gate. It runs the production Improvement Session and Runtime scheduler over a fixed candidate-heavy BitVec corpus in isolated one-lane and eight-lane processes, records the private Verification-Kernel phase plus whole-process CPU, and requires identical semantic outcomes, at least `6x` median phase-wall speedup, and no more than `20%` excess median aggregate CPU. Its report records dirty-tree and host state and is performance evidence, never Scientific Confirmation.
 
 Mechanical hot-path changes cache only derivable private state. Cached correctness-claim bytes remain the exact equality authority while their digest is only a grouping index; cached FTRL weights and square roots remain excluded from canonical Model Revision encoding. Bounded selection must reproduce the exact prefix of the complete total order. This keeps speedups from silently weakening correctness or changing durable identity.
 

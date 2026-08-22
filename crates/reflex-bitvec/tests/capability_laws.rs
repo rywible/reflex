@@ -94,14 +94,16 @@ fn expanded_unary_expressions_have_exact_wrapping_semantics_and_canonical_round_
         claim: &claim,
     }];
     let mut verdicts = Vec::new();
-    domain
+    let (report, error) = domain
         .kernel()
         .verify_batch(
             VerificationBatch::new(&requests),
             &mut VerdictWriter::new(&mut verdicts),
             &mut (),
         )
-        .unwrap();
+        .into_parts();
+    assert_eq!(report, reflex::VerificationBatchReport::in_process());
+    assert!(error.is_none());
     assert!(matches!(verdicts.as_slice(), [Verdict::Accepted { .. }]));
 }
 
@@ -370,14 +372,16 @@ fn kernel_refuses_a_claim_that_is_not_bound_to_the_seed() {
         claim: &unrelated_claim,
     }];
     let mut verdicts = Vec::new();
-    domain
+    let (report, error) = domain
         .kernel()
         .verify_batch(
             VerificationBatch::new(&requests),
             &mut VerdictWriter::new(&mut verdicts),
             &mut (),
         )
-        .unwrap();
+        .into_parts();
+    assert_eq!(report, reflex::VerificationBatchReport::in_process());
+    assert!(error.is_none());
 
     assert!(matches!(verdicts.as_slice(), [Verdict::Refuted]));
 }

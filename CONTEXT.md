@@ -28,6 +28,10 @@ _Avoid_: Testing, validation, evaluation
 The minimal, versioned, domain-supplied authority whose judgment establishes a Correctness Claim under identified semantics and assumptions.
 _Avoid_: Test suite, learned verifier, optimizer
 
+**Verification Allowance**:
+The per-batch portion of the Resource Envelope granted to a Verification Kernel, including worker lanes, resident memory, elapsed time, and CPU time; external usage and failure are charged before the batch outcome is interpreted.
+_Avoid_: Separate verifier budget, advisory timeout
+
 **Verification Record**:
 The replayable evidence binding a Correctness Claim and its assumptions to the exact semantics and Verification Kernel revision that accepted it.
 _Avoid_: Test result, confidence score, benchmark report

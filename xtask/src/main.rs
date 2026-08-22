@@ -20,6 +20,7 @@ mod build;
 mod causal;
 mod harness;
 mod performance;
+mod scaling;
 
 use harness::{
     AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_json,
@@ -172,8 +173,16 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             performance::run_instrumentation_overhead(&arguments)
         }
+        Some("verification-scaling") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            scaling::run(&arguments)
+        }
+        Some("verification-scaling-child") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            scaling::run_child(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling> [arguments]"
                 .into(),
         ),
     }

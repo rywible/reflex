@@ -199,7 +199,11 @@ fn resume_rejects_a_bad_segment_checksum_even_with_a_valid_file_checksum() {
 }
 
 #[test]
-fn resume_rejects_unknown_segment_versions_and_model_digest_mismatches() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one canonical bundle fixture is mutated across independent compatibility axes"
+)]
+fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-v3-schema-integrity-{}-{}.bundle",
         std::process::id(),
@@ -236,6 +240,25 @@ fn resume_rejects_unknown_segment_versions_and_model_digest_mismatches() {
     )
     .unwrap();
     let valid = std::fs::read(&bundle_path).unwrap();
+
+    let mut bad_runtime_revision = valid.clone();
+    let (_, payload, length, checksum) = segment_location(&bad_runtime_revision, 1);
+    bad_runtime_revision[payload + 1..payload + 9].copy_from_slice(&99_u64.to_le_bytes());
+    let segment_digest = Sha256::digest(&bad_runtime_revision[payload..payload + length]);
+    bad_runtime_revision[checksum..checksum + 32].copy_from_slice(&segment_digest);
+    refresh_file_checksum(&mut bad_runtime_revision);
+    std::fs::write(&bundle_path, bad_runtime_revision).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::IncompatibleBundle)
+    ));
 
     let mut bad_version = valid.clone();
     let (version, _, _, _) = segment_location(&bad_version, 4);

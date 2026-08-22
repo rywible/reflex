@@ -307,6 +307,7 @@ pub enum SessionError<E> {
     IncompatibleBundle,
     CorruptBundle,
     Domain(E),
+    VerificationWorker,
     Durability(std::io::Error),
     Resource,
 }
@@ -320,6 +321,7 @@ impl<E: fmt::Display> fmt::Display for SessionError<E> {
             Self::IncompatibleBundle => formatter.write_str("incompatible Domain Bundle"),
             Self::CorruptBundle => formatter.write_str("corrupt Domain Bundle"),
             Self::Domain(error) => write!(formatter, "domain error: {error}"),
+            Self::VerificationWorker => formatter.write_str("Verification worker failed"),
             Self::Durability(error) => write!(formatter, "durability error: {error}"),
             Self::Resource => formatter.write_str("Resource Envelope cannot be honored"),
         }

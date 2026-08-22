@@ -1,5 +1,7 @@
 use std::error::Error;
 use std::hash::Hash;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use crate::measurement::MeasurementSpace;
 
@@ -461,17 +463,235 @@ pub struct VerificationRequest<'a, D: DomainDefinition, C> {
 
 pub struct VerificationBatch<'a, D: DomainDefinition, C> {
     requests: &'a [VerificationRequest<'a, D, C>],
+    allowance: VerificationAllowance,
 }
 
 impl<'a, D: DomainDefinition, C> VerificationBatch<'a, D, C> {
     #[must_use]
     pub fn new(requests: &'a [VerificationRequest<'a, D, C>]) -> Self {
-        Self { requests }
+        Self {
+            requests,
+            allowance: VerificationAllowance::none(),
+        }
     }
 
     #[must_use]
     pub fn requests(&self) -> &'a [VerificationRequest<'a, D, C>] {
         self.requests
+    }
+
+    #[must_use]
+    pub fn allowance(&self) -> VerificationAllowance {
+        self.allowance
+    }
+
+    pub(crate) const fn with_allowance(
+        requests: &'a [VerificationRequest<'a, D, C>],
+        allowance: VerificationAllowance,
+    ) -> Self {
+        Self {
+            requests,
+            allowance,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerificationAllowance {
+    worker_lanes: usize,
+    resident_bytes: u64,
+    elapsed_time: Duration,
+    cpu_time: Duration,
+}
+
+impl VerificationAllowance {
+    const fn none() -> Self {
+        Self {
+            worker_lanes: 0,
+            resident_bytes: 0,
+            elapsed_time: Duration::ZERO,
+            cpu_time: Duration::ZERO,
+        }
+    }
+
+    pub(crate) const fn new(
+        worker_lanes: usize,
+        resident_bytes: u64,
+        elapsed_time: Duration,
+        cpu_time: Duration,
+    ) -> Self {
+        Self {
+            worker_lanes,
+            resident_bytes,
+            elapsed_time,
+            cpu_time,
+        }
+    }
+
+    #[must_use]
+    pub fn worker_lanes(self) -> usize {
+        self.worker_lanes
+    }
+
+    #[must_use]
+    pub fn resident_bytes(self) -> u64 {
+        self.resident_bytes
+    }
+
+    #[must_use]
+    pub fn elapsed_time(self) -> Duration {
+        self.elapsed_time
+    }
+
+    #[must_use]
+    pub fn cpu_time(self) -> Duration {
+        self.cpu_time
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExternalVerificationUsage {
+    worker_lanes: usize,
+    peak_resident_bytes: u64,
+    elapsed_time: Duration,
+    cpu_time: Duration,
+}
+
+impl ExternalVerificationUsage {
+    #[must_use]
+    pub fn new(
+        worker_lanes: usize,
+        peak_resident_bytes: u64,
+        elapsed_time: Duration,
+        cpu_time: Duration,
+    ) -> Self {
+        Self {
+            worker_lanes,
+            peak_resident_bytes,
+            elapsed_time,
+            cpu_time,
+        }
+    }
+
+    #[must_use]
+    pub fn worker_lanes(self) -> usize {
+        self.worker_lanes
+    }
+
+    #[must_use]
+    pub fn peak_resident_bytes(self) -> u64 {
+        self.peak_resident_bytes
+    }
+
+    #[must_use]
+    pub fn elapsed_time(self) -> Duration {
+        self.elapsed_time
+    }
+
+    #[must_use]
+    pub fn cpu_time(self) -> Duration {
+        self.cpu_time
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerificationBatchReport {
+    external_usage: ExternalVerificationUsage,
+    worker_failed: bool,
+}
+
+#[derive(Debug)]
+#[must_use = "Verification batch usage and failure must be inspected"]
+pub struct VerificationBatchOutcome<E> {
+    report: VerificationBatchReport,
+    error: Option<E>,
+}
+
+impl<E> VerificationBatchOutcome<E> {
+    pub const fn completed(report: VerificationBatchReport) -> Self {
+        Self {
+            report,
+            error: None,
+        }
+    }
+
+    pub const fn domain_error(report: VerificationBatchReport, error: E) -> Self {
+        Self {
+            report,
+            error: Some(error),
+        }
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (VerificationBatchReport, Option<E>) {
+        (self.report, self.error)
+    }
+}
+
+impl VerificationBatchReport {
+    #[must_use]
+    pub const fn in_process() -> Self {
+        Self {
+            external_usage: ExternalVerificationUsage {
+                worker_lanes: 0,
+                peak_resident_bytes: 0,
+                elapsed_time: Duration::ZERO,
+                cpu_time: Duration::ZERO,
+            },
+            worker_failed: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn external(usage: ExternalVerificationUsage, worker_failed: bool) -> Self {
+        Self {
+            external_usage: usage,
+            worker_failed,
+        }
+    }
+
+    #[must_use]
+    pub fn external_usage(self) -> ExternalVerificationUsage {
+        self.external_usage
+    }
+
+    #[must_use]
+    pub fn worker_failed(self) -> bool {
+        self.worker_failed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerificationWorkerRequirements {
+    worker_lanes: usize,
+    resident_bytes: u64,
+}
+
+impl VerificationWorkerRequirements {
+    #[must_use]
+    pub const fn in_process() -> Self {
+        Self {
+            worker_lanes: 0,
+            resident_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn external(worker_lanes: NonZeroUsize, resident_bytes: NonZeroU64) -> Self {
+        Self {
+            worker_lanes: worker_lanes.get(),
+            resident_bytes: resident_bytes.get(),
+        }
+    }
+
+    #[must_use]
+    pub fn worker_lanes(self) -> usize {
+        self.worker_lanes
+    }
+
+    #[must_use]
+    pub fn resident_bytes(self) -> u64 {
+        self.resident_bytes
     }
 }
 
@@ -484,17 +704,36 @@ pub struct VerificationReplayRequest<'a, D: DomainDefinition, C, E> {
 
 pub struct VerificationReplayBatch<'a, D: DomainDefinition, C, E> {
     requests: &'a [VerificationReplayRequest<'a, D, C, E>],
+    allowance: VerificationAllowance,
 }
 
 impl<'a, D: DomainDefinition, C, E> VerificationReplayBatch<'a, D, C, E> {
     #[must_use]
     pub fn new(requests: &'a [VerificationReplayRequest<'a, D, C, E>]) -> Self {
-        Self { requests }
+        Self {
+            requests,
+            allowance: VerificationAllowance::none(),
+        }
     }
 
     #[must_use]
     pub fn requests(&self) -> &'a [VerificationReplayRequest<'a, D, C, E>] {
         self.requests
+    }
+
+    #[must_use]
+    pub fn allowance(&self) -> VerificationAllowance {
+        self.allowance
+    }
+
+    pub(crate) const fn with_allowance(
+        requests: &'a [VerificationReplayRequest<'a, D, C, E>],
+        allowance: VerificationAllowance,
+    ) -> Self {
+        Self {
+            requests,
+            allowance,
+        }
     }
 }
 
@@ -584,6 +823,9 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
     type Scratch: Default + Send + 'static;
 
     fn revision(&self) -> KernelRevision;
+    fn worker_requirements(&self) -> VerificationWorkerRequirements {
+        VerificationWorkerRequirements::in_process()
+    }
     fn claim_for_candidate(
         &self,
         seed: &D::Artifact,
@@ -594,13 +836,13 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
         requests: VerificationBatch<'_, D, Self::Claim>,
         output: &mut VerdictWriter<'_, Self::Evidence>,
         scratch: &mut Self::Scratch,
-    ) -> Result<(), D::Error>;
+    ) -> VerificationBatchOutcome<D::Error>;
     fn replay_batch(
         &self,
         records: VerificationReplayBatch<'_, D, Self::Claim, Self::Evidence>,
         output: &mut ReplayVerdictWriter<'_>,
         scratch: &mut Self::Scratch,
-    ) -> Result<(), D::Error>;
+    ) -> VerificationBatchOutcome<D::Error>;
     fn encode_claim(&self, claim: &Self::Claim, output: &mut Vec<u8>) -> Result<(), D::Error>;
     fn decode_claim(&self, bytes: &[u8]) -> Result<Self::Claim, D::Error>;
     fn encode_evidence(

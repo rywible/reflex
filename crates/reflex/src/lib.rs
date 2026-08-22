@@ -15,11 +15,13 @@ mod runtime;
 
 pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
-    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, KernelRevision,
-    OperatorAlgebra, OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage, SeedSource,
-    SeedWriter, SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
-    VerdictWriter, VerificationBatch, VerificationKernel, VerificationRecord,
-    VerificationReplayBatch,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
+    ExternalVerificationUsage, KernelRevision, OperatorAlgebra, OperatorDescriptor,
+    OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter, SemanticIdentity,
+    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
+    VerificationAllowance, VerificationBatch, VerificationBatchOutcome, VerificationBatchReport,
+    VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    VerificationWorkerRequirements,
 };
 pub use goal::{
     Direction, EmptyGoalSet, GoalError, GoalSet, MeasurementConstraint, MeasurementTolerance,

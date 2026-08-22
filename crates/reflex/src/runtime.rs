@@ -10,11 +10,10 @@ use sha2::{Digest, Sha256};
 
 use crate::bundle::DomainBundle;
 use crate::domain::{
-    ApplicationWriter, Candidate, CandidateWriter, DomainDefinition, OperatorAlgebra,
-    OperatorEnumerationBatch, ReplayVerdictWriter, Seed, SeedSource, SeedWriter,
-    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
-    VerificationBatch, VerificationKernel, VerificationRecord, VerificationReplayBatch,
-    VerificationReplayRequest, VerificationRequest,
+    ApplicationWriter, Candidate, CandidateWriter, ClaimOf, DomainDefinition, EvidenceOf,
+    OperatorAlgebra, OperatorEnumerationBatch, Seed, SeedSource, SeedWriter, StructuralLocation,
+    StructuralProtocol, StructuralView, Verdict, VerificationBatchReport, VerificationKernel,
+    VerificationRecord, VerificationReplayRequest, VerificationWorkerRequirements,
 };
 use crate::durability;
 use crate::instrumentation::{Phase, Recorder};
@@ -34,6 +33,7 @@ mod bundle;
 mod epoch;
 mod experience;
 mod goals;
+mod scheduler;
 
 use bundle::RestartBundleCodec;
 use epoch::EpochTransition;
@@ -42,6 +42,7 @@ use experience::{
     MeasurementObservation,
 };
 use goals::GoalEvaluator;
+use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
@@ -51,6 +52,7 @@ struct StoredArtifact<D: DomainDefinition> {
     parent_key: Option<ArtifactKey>,
 }
 type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize, [u8; 32]);
+type ClaimedVerdicts<D> = Vec<(ClaimOf<D>, Verdict<EvidenceOf<D>>)>;
 struct RecoveredBundle<D: DomainDefinition> {
     artifacts: Vec<StoredArtifact<D>>,
     pareto_keys: Vec<ArtifactKey>,
@@ -59,6 +61,7 @@ struct RecoveredBundle<D: DomainDefinition> {
     interrupted_usage: Option<ResourceUsage>,
     knowledge: KnowledgeState,
     learning: LearningState,
+    resident_bytes: u64,
 }
 
 impl<D: DomainDefinition> Default for RecoveredBundle<D> {
@@ -71,6 +74,7 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
             interrupted_usage: None,
             knowledge: KnowledgeState::default(),
             learning: LearningState::default(),
+            resident_bytes: 0,
         }
     }
 }
@@ -114,6 +118,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
+const RUNTIME_REVISION: u64 = 2;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -128,14 +133,25 @@ where
 {
     let resource_meter =
         ResourceEnvelopeGuard::start(&request.resources).map_err(|()| SessionError::Resource)?;
-    let worker_resident_bytes = (request.resources.worker_threads.get() as u64)
+    let requirements = domain.kernel().worker_requirements();
+    let runtime_lanes = request
+        .resources
+        .worker_threads
+        .get()
+        .checked_sub(requirements.worker_lanes())
+        .filter(|lanes| *lanes != 0)
+        .ok_or(SessionError::Resource)?;
+    let scheduler =
+        Scheduler::from_environment(runtime_lanes).map_err(|()| SessionError::Resource)?;
+    let worker_resident_bytes = (runtime_lanes as u64)
         .saturating_mul(WORKER_STACK_BYTES as u64)
-        .saturating_add(DURABILITY_STACK_BYTES as u64);
+        .saturating_add(DURABILITY_STACK_BYTES as u64)
+        .saturating_add(requirements.resident_bytes());
     if !resource_meter.reserve(ResidentReservation::live(worker_resident_bytes)) {
         return Err(SessionError::Resource);
     }
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(request.resources.worker_threads.get())
+        .num_threads(runtime_lanes)
         .stack_size(WORKER_STACK_BYTES)
         .thread_name(|index| format!("reflex-worker-{index}"))
         .build()
@@ -147,6 +163,8 @@ where
             observer,
             &resource_meter,
             worker_resident_bytes,
+            &scheduler,
+            requirements,
         )
     })
 }
@@ -161,6 +179,8 @@ fn improve_on_workers<D, O>(
     mut observer: O,
     resource_meter: &ResourceEnvelopeGuard,
     worker_resident_bytes: u64,
+    scheduler: &Scheduler,
+    verification_workers: VerificationWorkerRequirements,
 ) -> Result<SessionOutcome<D>, SessionError<D::Error>>
 where
     D: DomainDefinition,
@@ -176,6 +196,7 @@ where
         .map(|source| bundle_codec.recover(source, resource_meter, worker_resident_bytes))
         .transpose()?
         .unwrap_or_default();
+    let recovered_resident_bytes = recovered_bundle.resident_bytes;
     let recovered_keys = recovered_bundle.pareto_keys;
     let recovered_stored = recovered_bundle.artifacts;
     let mut ledger = recovered_bundle.ledger;
@@ -223,17 +244,132 @@ where
     {
         return Err(SessionError::Resource);
     }
-    replay_stored(domain, &recovered_stored)?;
+    let recovery_resident = worker_resident_bytes
+        .saturating_add(recovered_resident_bytes)
+        .saturating_add(vector_bytes(&seeds));
+    let failure_publication_bytes = if verification_workers.worker_lanes() == 0 {
+        0
+    } else if let Some(source) = request.bundle.source() {
+        std::fs::metadata(source)
+            .map_err(SessionError::Durability)?
+            .len()
+            .saturating_mul(3)
+    } else {
+        let usage = resource_meter
+            .usage(verification_requests, 0)
+            .map_err(|()| SessionError::Resource)?;
+        let probe = bundle_codec.seal(
+            &seed_cursor,
+            &[],
+            &[],
+            &ledger,
+            &knowledge,
+            &learning,
+            SessionSeal::Interrupted(usage),
+        )?;
+        if !resource_meter.checkpoint_fits(probe.len() as u64) {
+            return Err(SessionError::Resource);
+        }
+        probe.capacity() as u64
+    };
+    if !resource_meter.reserve(
+        ResidentReservation::live(recovery_resident).with_transient(failure_publication_bytes),
+    ) {
+        return Err(SessionError::Resource);
+    }
+    let stored_replay = replay_stored(
+        domain,
+        &recovered_stored,
+        scheduler,
+        resource_meter,
+        verification_workers,
+        recovery_resident,
+    );
+    if let Err(error) = stored_replay {
+        if verification_workers.worker_lanes() != 0 {
+            let usage = resource_meter
+                .usage(verification_requests, 0)
+                .map_err(|()| SessionError::Resource)?;
+            persist_setup_interruption(
+                domain,
+                request,
+                &bundle_codec,
+                &seed_cursor,
+                &ledger,
+                &knowledge,
+                &learning,
+                usage,
+                resource_meter,
+                recovery_resident,
+            )?;
+        }
+        return Err(error);
+    }
     if resource_meter
         .time_exhausted()
         .map_err(|()| SessionError::Resource)?
     {
         return Err(SessionError::Resource);
     }
-    replay_seeds(domain, &seeds)?;
+    let seed_replay = replay_seeds(
+        domain,
+        &seeds,
+        scheduler,
+        resource_meter,
+        verification_workers,
+        recovery_resident,
+    );
+    if let Err(error) = seed_replay {
+        if verification_workers.worker_lanes() != 0 {
+            let usage = resource_meter
+                .usage(verification_requests, 0)
+                .map_err(|()| SessionError::Resource)?;
+            persist_setup_interruption(
+                domain,
+                request,
+                &bundle_codec,
+                &seed_cursor,
+                &ledger,
+                &knowledge,
+                &learning,
+                usage,
+                resource_meter,
+                recovery_resident,
+            )?;
+        }
+        return Err(error);
+    }
     let environment = crate::MeasurementEnvironment::local_process();
     let recovered = materialize(domain, recovered_stored, &environment)?;
-    replay_experience(domain, &recovered, ledger.entries())?;
+    let experience_replay = replay_experience(
+        domain,
+        &recovered,
+        ledger.entries(),
+        scheduler,
+        resource_meter,
+        verification_workers,
+        recovery_resident,
+    );
+    if let Err(error) = experience_replay {
+        if verification_workers.worker_lanes() != 0 {
+            let usage = resource_meter
+                .usage(verification_requests, 0)
+                .map_err(|()| SessionError::Resource)?;
+            persist_setup_interruption(
+                domain,
+                request,
+                &bundle_codec,
+                &seed_cursor,
+                &ledger,
+                &knowledge,
+                &learning,
+                usage,
+                resource_meter,
+                recovery_resident,
+            )?;
+        }
+        return Err(error);
+    }
     if recovered_revisions.is_some_and(|revisions| {
         let expected = revision_ids(
             domain.semantic_identity().as_str(),
@@ -565,8 +701,13 @@ where
         let transient_bytes = application_bytes
             .saturating_add(vector_bytes(&candidates))
             .saturating_add(candidate_pipeline_reserve(domain, &candidates));
+        let verification_resident = ResidentReservation::live(resident_before_epoch)
+            .with_transient(transient_bytes)
+            .peak_bytes();
         if !resource_meter.reserve(
-            ResidentReservation::live(resident_before_epoch).with_transient(transient_bytes),
+            ResidentReservation::live(verification_resident)
+                .with_transient(checkpoint.capacity() as u64)
+                .with_pending_durability(durability.pending_bytes()),
         ) {
             resident_budget_exhausted = true;
             break;
@@ -593,7 +734,39 @@ where
             .map(|(artifact, _)| artifact.key())
             .collect::<Vec<_>>();
         let verification_started = instrumentation.start();
-        let verification = verify_candidates(domain, &roots, &origins, &parent_keys, candidates)?;
+        let verification_result = verify_candidates(
+            domain,
+            &roots,
+            &origins,
+            &parent_keys,
+            candidates,
+            scheduler,
+            resource_meter,
+            verification_workers,
+            verification_resident,
+            &mut instrumentation,
+        );
+        let verification = match verification_result {
+            Ok(verification) => verification,
+            Err(error) => {
+                if verification_workers.worker_lanes() != 0 {
+                    let usage = resource_meter
+                        .usage(verification_requests, checkpoint.len() as u64)
+                        .map_err(|()| SessionError::Resource)?;
+                    persist_active_interruption(
+                        domain,
+                        request,
+                        &seed_cursor,
+                        &checkpoint,
+                        usage,
+                        resource_meter,
+                        verification_resident,
+                        &mut durability,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         instrumentation.finish(Phase::Verification, verification_started);
         test_fault_point("verdict-recorded");
         let experience_checkpoint_state = ledger.checkpoint_entries();
@@ -1674,7 +1847,7 @@ fn decode_bundle<D: DomainDefinition>(
     if !resource_meter.checkpoint_fits(bundle_bytes)
         || !resource_meter.reserve(
             ResidentReservation::live(resident_before_bundle)
-                .with_transient(bundle_bytes.saturating_mul(4)),
+                .with_transient(bundle_bytes.saturating_mul(6)),
         )
     {
         return Err(SessionError::Resource);
@@ -2041,6 +2214,7 @@ fn decode_bundle<D: DomainDefinition>(
         interrupted_usage,
         knowledge,
         learning,
+        resident_bytes: bundle_bytes.saturating_mul(3),
     })
 }
 
@@ -2053,6 +2227,9 @@ fn validate_session<D: DomainDefinition>(
     let disposition = take_bundle(&mut input, 1)?[0];
     if !matches!(disposition, 0 | 1) {
         return Err(SessionError::CorruptBundle);
+    }
+    if read_bundle_u64(&mut input)? != RUNTIME_REVISION {
+        return Err(SessionError::IncompatibleBundle);
     }
     let _goal_fingerprint = take_bundle(&mut input, 32)?;
     let scope_fingerprint = take_bundle(&mut input, 32)?;
@@ -2138,9 +2315,116 @@ fn validate_session<D: DomainDefinition>(
     Ok((disposition == 0).then_some(usage))
 }
 
+fn finish_scheduled<D: DomainDefinition, T>(
+    result: Result<(T, VerificationBatchReport), ScheduleError<D::Error>>,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    allowance: crate::VerificationAllowance,
+    resident_overlap: u64,
+    corrupt_contract: bool,
+) -> Result<T, SessionError<D::Error>> {
+    let charge = |report: VerificationBatchReport| {
+        resource_meter
+            .charge_external_verification(
+                requirements,
+                allowance,
+                report.external_usage(),
+                resident_overlap,
+            )
+            .map_err(|()| SessionError::Resource)?;
+        if report.worker_failed() {
+            Err(SessionError::VerificationWorker)
+        } else {
+            Ok(())
+        }
+    };
+    match result {
+        Ok((value, report)) => {
+            charge(report)?;
+            Ok(value)
+        }
+        Err(ScheduleError::Domain { error, report }) => {
+            charge(report)?;
+            Err(SessionError::Domain(error))
+        }
+        Err(ScheduleError::Contract { report }) => {
+            charge(report)?;
+            Err(if corrupt_contract {
+                SessionError::CorruptBundle
+            } else {
+                SessionError::InvalidSeed
+            })
+        }
+    }
+}
+
+fn scheduled_verify<D: DomainDefinition>(
+    domain: &D,
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
+    requests: &[ClaimVerificationRequest<'_, D>],
+    corrupt_contract: bool,
+) -> Result<ClaimedVerdicts<D>, SessionError<D::Error>> {
+    let lanes = if requirements.worker_lanes() == 0 {
+        scheduler.lanes()
+    } else {
+        requirements.worker_lanes()
+    };
+    let allowance = resource_meter
+        .verification_allowance(
+            lanes,
+            resident_overlap.saturating_sub(requirements.resident_bytes()),
+        )
+        .map_err(|()| SessionError::Resource)?;
+    finish_scheduled::<D, _>(
+        scheduler.claim_and_verify(domain, requests, allowance, requirements),
+        resource_meter,
+        requirements,
+        allowance,
+        resident_overlap,
+        corrupt_contract,
+    )
+}
+
+fn scheduled_replay<D: DomainDefinition>(
+    domain: &D,
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
+    requests: &[VerificationReplayRequest<'_, D, ClaimOf<D>, EvidenceOf<D>>],
+    corrupt_contract: bool,
+) -> Result<Vec<bool>, SessionError<D::Error>> {
+    let lanes = if requirements.worker_lanes() == 0 {
+        scheduler.lanes()
+    } else {
+        requirements.worker_lanes()
+    };
+    let allowance = resource_meter
+        .verification_allowance(
+            lanes,
+            resident_overlap.saturating_sub(requirements.resident_bytes()),
+        )
+        .map_err(|()| SessionError::Resource)?;
+    finish_scheduled::<D, _>(
+        scheduler.replay(domain, requests, allowance, requirements),
+        resource_meter,
+        requirements,
+        allowance,
+        resident_overlap,
+        corrupt_contract,
+    )
+}
+
 fn replay_stored<D: DomainDefinition>(
     domain: &D,
     stored: &[StoredArtifact<D>],
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
 ) -> Result<(), SessionError<D::Error>> {
     let replay_requests = stored
         .iter()
@@ -2151,21 +2435,16 @@ fn replay_stored<D: DomainDefinition>(
             kernel_revision: stored.verification.kernel_revision,
         })
         .collect::<Vec<_>>();
-    let mut replayed = Vec::with_capacity(replay_requests.len());
-    let mut kernel_scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
-    let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, replay_requests.len());
-    domain
-        .kernel()
-        .replay_batch(
-            VerificationReplayBatch::new(&replay_requests),
-            &mut writer,
-            &mut kernel_scratch,
-        )
-        .map_err(SessionError::Domain)?;
-    if writer.overflowed()
-        || replayed.len() != stored.len()
-        || replayed.iter().any(|accepted| !accepted)
-    {
+    let replayed = scheduled_replay(
+        domain,
+        scheduler,
+        resource_meter,
+        requirements,
+        resident_overlap,
+        &replay_requests,
+        false,
+    )?;
+    if replayed.len() != stored.len() || replayed.iter().any(|accepted| !accepted) {
         return Err(SessionError::InvalidSeed);
     }
     Ok(())
@@ -2175,9 +2454,12 @@ fn replay_experience<D: DomainDefinition>(
     domain: &D,
     known: &[VerifiedArtifact<D>],
     experience: &[ExperienceEntry],
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
 ) -> Result<(), SessionError<D::Error>> {
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
-    let mut kernel_scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
     for entries in experience.chunks(256) {
         let candidates = entries
             .iter()
@@ -2198,17 +2480,24 @@ fn replay_experience<D: DomainDefinition>(
                     .ok_or(SessionError::CorruptBundle)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let claims = seeds
+        let requests = seeds
             .iter()
             .zip(&candidates)
-            .map(|(seed, candidate)| {
-                domain
-                    .kernel()
-                    .claim_for_candidate(seed, candidate)
-                    .map_err(SessionError::Domain)
+            .map(|(seed, candidate)| ClaimVerificationRequest {
+                seed: *seed,
+                candidate,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (entry, claim) in entries.iter().zip(&claims) {
+            .collect::<Vec<_>>();
+        let claims_and_verdicts = scheduled_verify(
+            domain,
+            scheduler,
+            resource_meter,
+            requirements,
+            resident_overlap,
+            &requests,
+            true,
+        )?;
+        for (entry, (claim, _)) in entries.iter().zip(&claims_and_verdicts) {
             let mut encoded = Vec::new();
             domain
                 .kernel()
@@ -2218,36 +2507,18 @@ fn replay_experience<D: DomainDefinition>(
                 return Err(SessionError::CorruptBundle);
             }
         }
-        let requests = seeds
-            .iter()
-            .zip(&candidates)
-            .zip(&claims)
-            .map(|((seed, candidate), claim)| VerificationRequest {
-                seed: *seed,
-                candidate,
-                claim,
-            })
-            .collect::<Vec<_>>();
-        let mut verdicts = Vec::with_capacity(entries.len());
-        let mut writer = VerdictWriter::with_limit(&mut verdicts, entries.len());
-        domain
-            .kernel()
-            .verify_batch(
-                VerificationBatch::new(&requests),
-                &mut writer,
-                &mut kernel_scratch,
-            )
-            .map_err(SessionError::Domain)?;
-        if writer.overflowed()
-            || verdicts.len() != entries.len()
-            || entries.iter().zip(verdicts).any(|(entry, verdict)| {
-                !matches!(
-                    (entry.verdict, verdict),
-                    (ExperienceVerdict::Accepted, Verdict::Accepted { .. })
-                        | (ExperienceVerdict::Refuted, Verdict::Refuted)
-                        | (ExperienceVerdict::Unknown, Verdict::Unknown)
-                )
-            })
+        if claims_and_verdicts.len() != entries.len()
+            || entries
+                .iter()
+                .zip(claims_and_verdicts)
+                .any(|(entry, (_, verdict))| {
+                    !matches!(
+                        (entry.verdict, verdict),
+                        (ExperienceVerdict::Accepted, Verdict::Accepted { .. })
+                            | (ExperienceVerdict::Refuted, Verdict::Refuted)
+                            | (ExperienceVerdict::Unknown, Verdict::Unknown)
+                    )
+                })
         {
             return Err(SessionError::CorruptBundle);
         }
@@ -2355,6 +2626,10 @@ fn read_seeds<D: DomainDefinition>(
 fn replay_seeds<D: DomainDefinition>(
     domain: &D,
     seeds: &[Seed<D>],
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
 ) -> Result<(), SessionError<D::Error>> {
     let requests = seeds
         .iter()
@@ -2365,26 +2640,25 @@ fn replay_seeds<D: DomainDefinition>(
             kernel_revision: seed.verification.kernel_revision,
         })
         .collect::<Vec<_>>();
-    let mut replayed = Vec::new();
-    let mut scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
-    let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, requests.len());
-    domain
-        .kernel()
-        .replay_batch(
-            VerificationReplayBatch::new(&requests),
-            &mut writer,
-            &mut scratch,
-        )
-        .map_err(SessionError::Domain)?;
-    if writer.overflowed()
-        || replayed.len() != seeds.len()
-        || replayed.iter().any(|accepted| !accepted)
-    {
+    let replayed = scheduled_replay(
+        domain,
+        scheduler,
+        resource_meter,
+        requirements,
+        resident_overlap,
+        &requests,
+        false,
+    )?;
+    if replayed.len() != seeds.len() || replayed.iter().any(|accepted| !accepted) {
         return Err(SessionError::InvalidSeed);
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "candidate verification names its immutable roots and resource authority explicitly"
+)]
 #[expect(
     clippy::too_many_lines,
     reason = "batched Verification and immutable Experience creation share one audited transaction"
@@ -2395,6 +2669,11 @@ fn verify_candidates<D: DomainDefinition>(
     parent_origins: &[usize],
     parent_keys: &[ArtifactKey],
     candidates: Vec<ProposedCandidate<D>>,
+    scheduler: &Scheduler,
+    resource_meter: &ResourceEnvelopeGuard,
+    requirements: VerificationWorkerRequirements,
+    resident_overlap: u64,
+    instrumentation: &mut Recorder,
 ) -> Result<VerificationOutcome<D>, SessionError<D::Error>> {
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
     let identity = domain.semantic_identity();
@@ -2416,49 +2695,38 @@ fn verify_candidates<D: DomainDefinition>(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut claims = Vec::with_capacity(candidates.len());
-    for candidate in &candidates {
-        let origin = *parent_origins
-            .get(candidate.candidate.source_index)
-            .ok_or(SessionError::InvalidSeed)?;
-        let seed = roots.get(origin).ok_or(SessionError::InvalidSeed)?;
-        claims.push(
-            domain
-                .kernel()
-                .claim_for_candidate(seed.artifact(), &candidate.candidate.artifact)
-                .map_err(SessionError::Domain)?,
-        );
-    }
     let requests = candidates
         .iter()
-        .zip(&claims)
-        .map(|(candidate, claim)| {
+        .map(|candidate| {
             let origin = parent_origins[candidate.candidate.source_index];
-            VerificationRequest {
+            ClaimVerificationRequest {
                 seed: roots[origin].artifact(),
                 candidate: &candidate.candidate.artifact,
-                claim,
             }
         })
         .collect::<Vec<_>>();
-    let mut verdicts = Vec::new();
-    let mut scratch = <D::Kernel as VerificationKernel<D>>::Scratch::default();
-    let mut writer = VerdictWriter::with_limit(&mut verdicts, requests.len());
-    domain
-        .kernel()
-        .verify_batch(VerificationBatch::new(&requests), &mut writer, &mut scratch)
-        .map_err(SessionError::Domain)?;
-    if writer.overflowed() || verdicts.len() != candidates.len() {
+    let kernel_started = instrumentation.start();
+    let claims_and_verdicts = scheduled_verify(
+        domain,
+        scheduler,
+        resource_meter,
+        requirements,
+        resident_overlap,
+        &requests,
+        false,
+    );
+    instrumentation.finish(Phase::VerificationKernel, kernel_started);
+    let claims_and_verdicts = claims_and_verdicts?;
+    if claims_and_verdicts.len() != candidates.len() {
         return Err(SessionError::InvalidSeed);
     }
     let revision = domain.kernel().revision();
     let mut accepted = Vec::new();
     let mut experience = Vec::with_capacity(candidates.len());
-    for (((candidate, (candidate_key, canonical_candidate)), claim), verdict) in candidates
+    for ((candidate, (candidate_key, canonical_candidate)), (claim, verdict)) in candidates
         .into_iter()
         .zip(candidate_encodings)
-        .zip(claims)
-        .zip(verdicts)
+        .zip(claims_and_verdicts)
     {
         let origin = parent_origins[candidate.candidate.source_index];
         let origin_key = roots[origin].key();
@@ -2516,6 +2784,144 @@ fn verify_candidates<D: DomainDefinition>(
         accepted,
         experience,
     })
+}
+
+fn replace_interrupted_session<D: DomainDefinition>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    seed_cursor: &[u8],
+    encoded_bundle: &[u8],
+    usage: ResourceUsage,
+) -> Result<Vec<u8>, SessionError<D::Error>> {
+    let mut bundle =
+        CanonicalBundle::decode(encoded_bundle).map_err(|_| SessionError::CorruptBundle)?;
+    if bundle.identity() != domain.semantic_identity().as_str().as_bytes() {
+        return Err(SessionError::IncompatibleBundle);
+    }
+    bundle.replace_segment(
+        SegmentKind::Session,
+        encode_session(
+            domain,
+            request,
+            seed_cursor,
+            SessionSeal::Interrupted(usage),
+        )?,
+    );
+    Ok(bundle.encode())
+}
+
+fn publish_recovery_interruption<D: DomainDefinition>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    seed_cursor: &[u8],
+    source: &std::path::Path,
+    usage: ResourceUsage,
+    resource_meter: &ResourceEnvelopeGuard,
+    resident_overlap: u64,
+) -> Result<(), SessionError<D::Error>> {
+    let bundle_bytes = std::fs::metadata(source)
+        .map_err(SessionError::Durability)?
+        .len();
+    if !resource_meter.reserve(
+        ResidentReservation::live(resident_overlap).with_transient(bundle_bytes.saturating_mul(3)),
+    ) {
+        return Err(SessionError::Resource);
+    }
+    let encoded = std::fs::read(source).map_err(SessionError::Durability)?;
+    let interrupted = replace_interrupted_session(domain, request, seed_cursor, &encoded, usage)?;
+    if !resource_meter.checkpoint_fits(interrupted.len() as u64) {
+        return Err(SessionError::Resource);
+    }
+    publish_interrupted_bytes(request, interrupted)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "failure publication carries the complete restart boundary explicitly"
+)]
+fn persist_setup_interruption<D: DomainDefinition>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    bundle_codec: &RestartBundleCodec<'_, D>,
+    seed_cursor: &[u8],
+    ledger: &ExperienceLedger,
+    knowledge: &KnowledgeState,
+    learning: &LearningState,
+    usage: ResourceUsage,
+    resource_meter: &ResourceEnvelopeGuard,
+    resident_overlap: u64,
+) -> Result<(), SessionError<D::Error>> {
+    if let Some(source) = request.bundle.source() {
+        return publish_recovery_interruption(
+            domain,
+            request,
+            seed_cursor,
+            source,
+            usage,
+            resource_meter,
+            resident_overlap,
+        );
+    }
+    let interrupted = bundle_codec.seal(
+        seed_cursor,
+        &[],
+        &[],
+        ledger,
+        knowledge,
+        learning,
+        SessionSeal::Interrupted(usage),
+    )?;
+    if !resource_meter.checkpoint_fits(interrupted.len() as u64)
+        || !resource_meter.reserve(
+            ResidentReservation::live(resident_overlap)
+                .with_transient(interrupted.capacity() as u64),
+        )
+    {
+        return Err(SessionError::Resource);
+    }
+    publish_interrupted_bytes(request, interrupted)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "active failure publication carries the restart boundary explicitly"
+)]
+fn persist_active_interruption<D: DomainDefinition>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    seed_cursor: &[u8],
+    checkpoint: &[u8],
+    usage: ResourceUsage,
+    resource_meter: &ResourceEnvelopeGuard,
+    resident_overlap: u64,
+    durability: &mut durability::CheckpointWriter,
+) -> Result<(), SessionError<D::Error>> {
+    let interrupted = replace_interrupted_session(domain, request, seed_cursor, checkpoint, usage)?;
+    if !resource_meter.checkpoint_fits(interrupted.len() as u64)
+        || !resource_meter.reserve(
+            ResidentReservation::live(resident_overlap)
+                .with_transient(interrupted.capacity() as u64)
+                .with_pending_durability(durability.pending_bytes()),
+        )
+    {
+        return Err(SessionError::Resource);
+    }
+    durability
+        .submit(interrupted)
+        .and_then(|()| durability.barrier().map(|_| ()))
+        .map_err(SessionError::Durability)
+}
+
+fn publish_interrupted_bytes<D: DomainDefinition>(
+    request: &ImprovementRequest<D>,
+    interrupted: Vec<u8>,
+) -> Result<(), SessionError<D::Error>> {
+    let mut durability = durability::CheckpointWriter::start(request.bundle.target().to_path_buf())
+        .map_err(SessionError::Durability)?;
+    durability
+        .submit(interrupted)
+        .map_err(SessionError::Durability)?;
+    durability.finish().map_err(SessionError::Durability)
 }
 
 #[expect(
@@ -2651,6 +3057,7 @@ fn encode_session<D: DomainDefinition>(
     let goals = GoalEvaluator::encode_set(domain, &request.goals)?;
     let mut payload = Vec::new();
     payload.push(u8::from(matches!(session_seal, SessionSeal::Completed(..))));
+    push_u64(&mut payload, RUNTIME_REVISION);
     payload.extend_from_slice(&Sha256::digest(&goals));
     payload.extend_from_slice(&Sha256::digest(&scope));
     push_bytes(&mut payload, &scope);
