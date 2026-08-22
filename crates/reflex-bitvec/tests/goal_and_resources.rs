@@ -57,6 +57,128 @@ fn verification_budget_exhaustion_is_a_successful_completion() {
 }
 
 #[test]
+fn resume_does_not_charge_verification_for_refuted_experience() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-negative-experience-budget-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let request = |verification_requests, bundle| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::one(Expression::xor(
+                Expression::input(),
+                Expression::constant(1),
+            )),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(verification_requests).unwrap(),
+            ),
+            bundle,
+        )
+        .unwrap()
+    };
+    improve(
+        BitVecDomain::unary_u8(),
+        request(
+            10_000,
+            BundlePlan::Fresh {
+                target: bundle_path.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    let outcome = improve(
+        BitVecDomain::unary_u8(),
+        request(
+            2,
+            BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    assert!(
+        outcome.completion() == Completion::ResourceEnvelopeExhausted
+            && outcome.usage().verification_requests == 2,
+        "only the retained Artifact and current Seed consume mandatory recovery Verification"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
+fn resume_still_replays_accepted_experience() {
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-positive-experience-budget-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let request = |verification_requests, bundle| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::one(Expression::xor(
+                Expression::input(),
+                Expression::constant(0),
+            )),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(verification_requests).unwrap(),
+            ),
+            bundle,
+        )
+        .unwrap()
+    };
+    improve(
+        BitVecDomain::unary_u8(),
+        request(
+            10_000,
+            BundlePlan::Fresh {
+                target: bundle_path.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    let result = improve(
+        BitVecDomain::unary_u8(),
+        request(
+            3,
+            BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    );
+
+    assert!(
+        matches!(result, Err(SessionError::Resource)),
+        "two retained Artifacts, one current Seed, and one Accepted Experience outcome require four replays"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
 fn seed_ingestion_cannot_spend_candidate_verifications() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-seed-budget-{}-{}.bundle",

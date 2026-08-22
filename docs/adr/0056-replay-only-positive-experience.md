@@ -1,0 +1,5 @@
+# Replay only positive Experience
+
+Domain Bundle recovery replays every retained Artifact and every Accepted Experience outcome through the installed Verification Kernel, but it does not re-run historical Refuted or Unknown Candidates. Positive Experience can support Knowledge Consolidation and positive Training Targets, so its verdict remains mechanically checked; non-positive Experience can suppress repeated work and guide allocation, but the Runtime Controller never lets it establish correctness or bypass Verification for a future Candidate.
+
+Replaying every failed attempt made recovery cost grow with all prior search and repeatedly spent the new Session's Verification budget on work that could not produce a Verified Artifact. Canonical decoding, content identities, revision digests, and Semantic Identity still protect the internal consistency of all Experience, while Artifact Verification Records remain the correctness authority. A corrupted negative observation can at worst degrade advisory search behavior, just as a corrupted Model Revision could; it cannot admit or export an unverified result.

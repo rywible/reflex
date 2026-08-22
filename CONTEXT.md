@@ -101,7 +101,7 @@ The persistent network of Artifacts and their derivation, dependency, reuse, and
 _Avoid_: Agenda Graph, training dataset
 
 **Experience Ledger**:
-The cross-Campaign history of search attempts, outcomes, resource costs, provenance, predictions, and later-attributed effects from which training data can be derived.
+The cross-Campaign history of search attempts, outcomes, resource costs, provenance, predictions, and later-attributed effects from which training data can be derived. Its observations inform search but never establish correctness.
 _Avoid_: Discovery Graph, training dataset, event log
 
 **Training Target**:

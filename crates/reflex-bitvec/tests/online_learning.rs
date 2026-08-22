@@ -47,8 +47,13 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     std::fs::copy(&trained, &constrained).unwrap();
     std::fs::copy(&trained, &learned_full).unwrap();
     let heldout = heldout_seeds();
-    let replay_count =
-        trained_snapshot.artifact_count + trained_snapshot.attempts.len() + heldout.len();
+    let replay_count = trained_snapshot.artifact_count
+        + trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted)
+            .count()
+        + heldout.len();
     improve(
         BitVecDomain::unary_u8(),
         request(

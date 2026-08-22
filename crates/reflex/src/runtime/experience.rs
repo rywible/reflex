@@ -81,6 +81,13 @@ impl ExperienceLedger {
         self.entries.len()
     }
 
+    pub(super) fn accepted_len(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.verdict == ExperienceVerdict::Accepted)
+            .count()
+    }
+
     pub(super) fn entries(&self) -> &[ExperienceEntry] {
         &self.entries
     }

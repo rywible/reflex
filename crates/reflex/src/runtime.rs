@@ -213,11 +213,14 @@ where
             .map_err(|()| SessionError::Resource)?;
     }
     let recovered_replays = recovered_stored.len();
+    let accepted_experience_replays = ledger.accepted_len();
     let verification_budget = resource_meter.verification_limit();
     let replay_budget = verification_budget
         .checked_sub(prior_usage.verification_requests)
         .and_then(|remaining| remaining.checked_sub(u64::try_from(recovered_replays).ok()?))
-        .and_then(|remaining| remaining.checked_sub(u64::try_from(ledger.len()).ok()?))
+        .and_then(|remaining| {
+            remaining.checked_sub(u64::try_from(accepted_experience_replays).ok()?)
+        })
         .ok_or(SessionError::Resource)?;
     let ReadSeeds {
         mut seeds,
@@ -229,7 +232,7 @@ where
     }
     let required_replays = recovered_replays
         .checked_add(seed_replays)
-        .and_then(|count| count.checked_add(ledger.len()))
+        .and_then(|count| count.checked_add(accepted_experience_replays))
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(SessionError::Resource)?;
     let mut verification_requests = prior_usage
@@ -342,7 +345,7 @@ where
     }
     let environment = crate::MeasurementEnvironment::local_process();
     let recovered = materialize(domain, recovered_stored, &environment)?;
-    let experience_replay = replay_experience(
+    let experience_replay = replay_accepted_experience(
         domain,
         &recovered,
         ledger.entries(),
@@ -2470,7 +2473,7 @@ fn replay_stored<D: DomainDefinition>(
     Ok(())
 }
 
-fn replay_experience<D: DomainDefinition>(
+fn replay_accepted_experience<D: DomainDefinition>(
     domain: &D,
     known: &[VerifiedArtifact<D>],
     experience: &[ExperienceEntry],
@@ -2480,7 +2483,11 @@ fn replay_experience<D: DomainDefinition>(
     resident_overlap: u64,
 ) -> Result<(), SessionError<D::Error>> {
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
-    for entries in experience.chunks(1) {
+    for entry in experience
+        .iter()
+        .filter(|entry| entry.verdict == ExperienceVerdict::Accepted)
+    {
+        let entries = std::slice::from_ref(entry);
         let candidates = entries
             .iter()
             .map(|entry| {

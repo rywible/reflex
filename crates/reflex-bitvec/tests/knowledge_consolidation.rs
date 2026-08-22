@@ -54,8 +54,13 @@ fn verified_chains_become_bounded_macros_for_later_sessions() {
     std::fs::copy(&trained, &constrained).unwrap();
     std::fs::copy(&trained, &learned_full).unwrap();
     let heldout = nested_seeds(9..=16);
-    let replay_count =
-        trained_snapshot.artifact_count + trained_snapshot.attempts.len() + heldout.len();
+    let replay_count = trained_snapshot.artifact_count
+        + trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted)
+            .count()
+        + heldout.len();
     improve(
         BitVecDomain::unary_u8(),
         request(
