@@ -34,14 +34,17 @@ use crate::session::{
 mod bundle;
 mod epoch;
 mod experience;
+mod generation;
 mod goals;
 mod scheduler;
 
 use bundle::RestartBundleCodec;
 use epoch::EpochTransition;
+#[cfg(feature = "internal-experiments")]
+use experience::CandidateFateKey;
 use experience::{
-    CandidateFateDisposition, CandidateFateKey, CandidateFateObservation, CandidateRank,
-    ExperienceEntry, ExperienceLedger, ExperienceVerdict, candidate_fate_batches_are_valid,
+    CandidateFateDisposition, CandidateFateObservation, CandidateRank, ExperienceEntry,
+    ExperienceLedger, ExperienceVerdict, candidate_fate_batches_are_valid,
 };
 use goals::GoalEvaluator;
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
@@ -57,7 +60,6 @@ struct StoredArtifact<D: DomainDefinition> {
     parent_key: Option<ArtifactKey>,
 }
 type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize, [u8; 32]);
-#[cfg(feature = "internal-experiments")]
 type ClaimedVerdicts<D> = Vec<(ClaimOf<D>, Verdict<EvidenceOf<D>>)>;
 struct RecoveredBundle<D: DomainDefinition> {
     artifacts: Vec<StoredArtifact<D>>,
@@ -149,9 +151,9 @@ enum SessionSeal {
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
-const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
+const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 6;
+const RUNTIME_REVISION: u64 = 7;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -927,6 +929,10 @@ where
                 node_count: structural_node_count(domain, artifact),
             })
             .collect::<Vec<_>>();
+        let parent_claims = frontier
+            .iter()
+            .map(|(artifact, _)| artifact.inner.claim_digest)
+            .collect::<Vec<_>>();
         let origins = frontier
             .iter()
             .map(|(_, origin)| *origin)
@@ -943,6 +949,15 @@ where
         )
         .unwrap_or(usize::MAX);
         if generation_limit == 0 {
+            resident_budget_exhausted = true;
+            break;
+        }
+        let generation_transient_bound =
+            (generation_limit as u64).saturating_mul(MIN_CHOICE_RESIDENT_BYTES);
+        if !resource_meter.reserve(
+            ResidentReservation::live(resident_before_epoch)
+                .with_transient(generation_transient_bound),
+        ) {
             resident_budget_exhausted = true;
             break;
         }
@@ -975,22 +990,85 @@ where
             let operators_left = catalog.len() - operator_index;
             let operator_limit = primitive_budget.div_ceil(operators_left);
             let locations = root_locations(domain, &parents);
-            let mut applications = Vec::new();
-            let mut application_writer =
-                ApplicationWriter::with_limit(&mut applications, operator_limit);
-            domain
-                .operators()
-                .enumerate_legal(
-                    OperatorEnumerationBatch::new(
-                        &parents,
-                        &locations,
-                        std::slice::from_ref(&descriptor.operator()),
-                    ),
-                    &mut application_writer,
-                    &mut operator_scratch,
+            let location_groups = generation::group_locations(&locations, &parent_claims);
+            let claim_complete =
+                location_groups.len() > 1 && location_groups.len() <= operator_limit;
+            let (operator_candidate_groups, operator_transient_bytes, truncated) = if claim_complete
+            {
+                let application_batch = generation::fill_claim_complete(
+                    &location_groups,
+                    operator_limit,
+                    |selected_locations, limit, applications| {
+                        let mut writer = ApplicationWriter::with_limit(applications, limit);
+                        domain.operators().enumerate_legal(
+                            OperatorEnumerationBatch::new(
+                                &parents,
+                                selected_locations,
+                                std::slice::from_ref(&descriptor.operator()),
+                            ),
+                            &mut writer,
+                            &mut operator_scratch,
+                        )?;
+                        Ok::<_, D::Error>(writer.overflowed())
+                    },
                 )
                 .map_err(SessionError::Domain)?;
-            choice_window_exhausted |= application_writer.overflowed();
+                let candidate_batch = generation::fill_claim_complete(
+                    &application_batch.groups,
+                    operator_limit,
+                    |applications, limit, candidates| {
+                        let mut writer = CandidateWriter::with_limit(candidates, limit);
+                        domain.operators().apply_batch(
+                            applications,
+                            &mut writer,
+                            &mut operator_scratch,
+                        )?;
+                        Ok::<_, D::Error>(writer.overflowed())
+                    },
+                )
+                .map_err(SessionError::Domain)?;
+                let transient_bytes = vector_bytes(&locations)
+                    .saturating_add(vector_bytes(&parent_claims))
+                    .saturating_add(grouped_vector_bytes(&location_groups))
+                    .saturating_add(grouped_vector_bytes(&application_batch.groups))
+                    .saturating_add(grouped_vector_bytes(&candidate_batch.groups))
+                    .saturating_add(application_batch.working_metadata_bytes)
+                    .saturating_add(candidate_batch.working_metadata_bytes);
+                let truncated = application_batch.truncated || candidate_batch.truncated;
+                (candidate_batch.groups, transient_bytes, truncated)
+            } else {
+                let mut applications = Vec::new();
+                let mut application_writer =
+                    ApplicationWriter::with_limit(&mut applications, operator_limit);
+                domain
+                    .operators()
+                    .enumerate_legal(
+                        OperatorEnumerationBatch::new(
+                            &parents,
+                            &locations,
+                            std::slice::from_ref(&descriptor.operator()),
+                        ),
+                        &mut application_writer,
+                        &mut operator_scratch,
+                    )
+                    .map_err(SessionError::Domain)?;
+                let application_truncated = application_writer.overflowed();
+                let mut operator_candidates = Vec::new();
+                let mut candidate_writer =
+                    CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
+                domain
+                    .operators()
+                    .apply_batch(&applications, &mut candidate_writer, &mut operator_scratch)
+                    .map_err(SessionError::Domain)?;
+                let truncated = application_truncated || candidate_writer.overflowed();
+                let transient_bytes = vector_bytes(&locations)
+                    .saturating_add(vector_bytes(&parent_claims))
+                    .saturating_add(grouped_vector_bytes(&location_groups))
+                    .saturating_add(vector_bytes(&applications))
+                    .saturating_add(vector_bytes(&operator_candidates));
+                (vec![operator_candidates], transient_bytes, truncated)
+            };
+            choice_window_exhausted |= truncated;
             if resource_meter
                 .search_time_exhausted()
                 .map_err(|()| SessionError::Resource)?
@@ -998,20 +1076,14 @@ where
                 time_exhausted = true;
                 break;
             }
-            let mut operator_candidates = Vec::new();
-            let mut candidate_writer =
-                CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
-            domain
-                .operators()
-                .apply_batch(&applications, &mut candidate_writer, &mut operator_scratch)
-                .map_err(SessionError::Domain)?;
-            choice_window_exhausted |= candidate_writer.overflowed();
-            primitive_budget = primitive_budget.saturating_sub(operator_candidates.len());
-            application_bytes = application_bytes
-                .saturating_add(vector_bytes(&locations))
-                .saturating_add(vector_bytes(&applications));
+            let operator_candidate_count = operator_candidate_groups
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+            primitive_budget = primitive_budget.saturating_sub(operator_candidate_count);
+            application_bytes = application_bytes.max(operator_transient_bytes);
             let operator_features = operator_feature_values(descriptor.symbol().as_str());
-            for candidate in operator_candidates {
+            for candidate in operator_candidate_groups.into_iter().flatten() {
                 let parent = parent_summaries
                     .get(candidate.source_index)
                     .ok_or(SessionError::InvalidSeed)?;
@@ -1055,7 +1127,7 @@ where
             candidate_epoch,
             &mut candidates,
         )?;
-        application_bytes = application_bytes.saturating_add(derived_bytes);
+        application_bytes = application_bytes.max(derived_bytes);
         choice_window_exhausted |= derived_truncated;
         instrumentation.generated(candidates.len());
         instrumentation.finish(Phase::Generation, generation_started);
@@ -1620,6 +1692,12 @@ fn resident_state_bytes<D: DomainDefinition, O>(
 
 fn vector_bytes<T>(values: &Vec<T>) -> u64 {
     (values.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+}
+
+fn grouped_vector_bytes<T>(groups: &Vec<Vec<T>>) -> u64 {
+    groups.iter().fold(vector_bytes(groups), |bytes, group| {
+        bytes.saturating_add(vector_bytes(group))
+    })
 }
 
 fn root_locations<D: DomainDefinition>(
