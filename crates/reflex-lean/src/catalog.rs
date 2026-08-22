@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::ast::{LeanEnvironmentIdentity, LeanName};
 use crate::worker::{LeanWorker, WorkerError};
 
-const MAGIC: &[u8; 8] = b"RFLCAT02";
+const MAGIC: &[u8; 8] = b"RFLCAT03";
 const CHECKSUM_BYTES: usize = 32;
 
 #[derive(Debug)]
@@ -65,7 +65,12 @@ pub enum DeclarationKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogEntry {
     pub name: u32,
+    pub module_name: u32,
     pub statement_hash: u64,
+    pub statement_nodes: usize,
+    pub statement_depth: usize,
+    pub value_nodes: usize,
+    pub value_depth: usize,
     pub dependencies: Vec<u32>,
     pub kind: DeclarationKind,
     pub locally_eligible: bool,
@@ -106,6 +111,7 @@ impl LeanCatalog {
             total = page.total;
             for fingerprint in page.fingerprints {
                 let name = intern_name(&fingerprint.name, &mut names, &mut name_ids)?;
+                let module_name = intern_name(&fingerprint.module_name, &mut names, &mut name_ids)?;
                 let statement_hash = fingerprint.statement_hash.parse().map_err(|_| {
                     CatalogError::Invalid("statement hash is not an unsigned 64-bit value".into())
                 })?;
@@ -116,7 +122,12 @@ impl LeanCatalog {
                     .collect::<Result<Vec<_>, _>>()?;
                 entries.push(CatalogEntry {
                     name,
+                    module_name,
                     statement_hash,
+                    statement_nodes: fingerprint.statement_nodes,
+                    statement_depth: fingerprint.statement_depth,
+                    value_nodes: fingerprint.value_nodes,
+                    value_depth: fingerprint.value_depth,
                     dependencies,
                     kind: DeclarationKind::parse(&fingerprint.kind)?,
                     locally_eligible: fingerprint.locally_eligible,
@@ -179,7 +190,12 @@ impl LeanCatalog {
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let name = decoder.name_id(name_count)?;
+            let module_name = decoder.name_id(name_count)?;
             let statement_hash = decoder.u64()?;
+            let statement_nodes = decoder.usize()?;
+            let statement_depth = decoder.usize()?;
+            let value_nodes = decoder.usize()?;
+            let value_depth = decoder.usize()?;
             let dependency_count = decoder.usize()?;
             let mut dependencies = Vec::with_capacity(dependency_count);
             for _ in 0..dependency_count {
@@ -187,7 +203,12 @@ impl LeanCatalog {
             }
             entries.push(CatalogEntry {
                 name,
+                module_name,
                 statement_hash,
+                statement_nodes,
+                statement_depth,
+                value_nodes,
+                value_depth,
                 dependencies,
                 kind: DeclarationKind::decode(decoder.byte()?)?,
                 locally_eligible: decoder.boolean()?,
@@ -327,7 +348,12 @@ impl LeanCatalog {
         write_usize(&mut output, self.entries.len())?;
         for entry in &self.entries {
             write_varint(&mut output, u64::from(entry.name));
+            write_varint(&mut output, u64::from(entry.module_name));
             output.extend_from_slice(&entry.statement_hash.to_le_bytes());
+            write_usize(&mut output, entry.statement_nodes)?;
+            write_usize(&mut output, entry.statement_depth)?;
+            write_usize(&mut output, entry.value_nodes)?;
+            write_usize(&mut output, entry.value_depth)?;
             write_usize(&mut output, entry.dependencies.len())?;
             for dependency in &entry.dependencies {
                 write_varint(&mut output, u64::from(*dependency));
@@ -649,7 +675,12 @@ mod tests {
         };
         let entry = |name, dependencies, locally_eligible| CatalogEntry {
             name,
+            module_name: name,
             statement_hash: u64::from(name),
+            statement_nodes: 3,
+            statement_depth: 2,
+            value_nodes: 5,
+            value_depth: 3,
             dependencies,
             kind: DeclarationKind::Theorem,
             locally_eligible,

@@ -237,7 +237,12 @@ pub struct VerificationResult {
 #[serde(rename_all = "camelCase")]
 pub struct TheoremFingerprint {
     pub name: LeanName,
+    pub module_name: LeanName,
     pub statement_hash: String,
+    pub statement_nodes: usize,
+    pub statement_depth: usize,
+    pub value_nodes: usize,
+    pub value_depth: usize,
     pub dependencies: Vec<LeanName>,
     pub kind: String,
     pub locally_eligible: bool,

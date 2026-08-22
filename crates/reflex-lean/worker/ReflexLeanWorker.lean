@@ -85,7 +85,12 @@ structure IndexedTheorem where
 
 structure TheoremFingerprint where
   name : WireName
+  moduleName : WireName
   statementHash : UInt64
+  statementNodes : Nat
+  statementDepth : Nat
+  valueNodes : Nat
+  valueDepth : Nat
   dependencies : Array WireName
   kind : String
   locallyEligible : Bool
@@ -360,6 +365,30 @@ def locallyEligible (name : Name) (info : ConstantInfo) : Bool :=
     | some value => !value.hasSorry
     | none => true
 
+partial def expressionNodes : Expr → Nat
+  | .app function argument => 1 + expressionNodes function + expressionNodes argument
+  | .lam _ type body _ | .forallE _ type body _ => 1 + expressionNodes type + expressionNodes body
+  | .letE _ type value body _ =>
+      1 + expressionNodes type + expressionNodes value + expressionNodes body
+  | .mdata _ expression => 1 + expressionNodes expression
+  | .proj _ _ subject => 1 + expressionNodes subject
+  | _ => 1
+
+partial def expressionDepth : Expr → Nat
+  | .app function argument => 1 + max (expressionDepth function) (expressionDepth argument)
+  | .lam _ type body _ | .forallE _ type body _ =>
+      1 + max (expressionDepth type) (expressionDepth body)
+  | .letE _ type value body _ =>
+      1 + max (expressionDepth type) (max (expressionDepth value) (expressionDepth body))
+  | .mdata _ expression => 1 + expressionDepth expression
+  | .proj _ _ subject => 1 + expressionDepth subject
+  | _ => 1
+
+def declarationModule (env : Environment) (name : Name) : Name :=
+  match env.getModuleIdxFor? name with
+  | some index => (env.allImportedModuleNames.get? index).getD .anonymous
+  | none => .anonymous
+
 def writeResponse (output : IO.FS.Stream) (response : Response) : IO Unit := do
   output.putStrLn (toJson response).compress
   output.flush
@@ -397,7 +426,12 @@ partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allN
             return sortedNames found.toArray
           some {
             name := WireName.ofLean name
+            moduleName := WireName.ofLean (declarationModule env name)
             statementHash := hash info.type
+            statementNodes := expressionNodes info.type
+            statementDepth := expressionDepth info.type
+            valueNodes := info.value?.map expressionNodes |>.getD 0
+            valueDepth := info.value?.map expressionDepth |>.getD 0
             dependencies := dependencies.map WireName.ofLean
             kind := declarationKind info
             locallyEligible := locallyEligible name info
