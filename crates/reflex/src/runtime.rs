@@ -11,16 +11,17 @@ use sha2::{Digest, Sha256};
 use crate::bundle::DomainBundle;
 use crate::domain::{
     ApplicationWriter, Candidate, CandidateWriter, ClaimOf, DomainDefinition, EvidenceOf,
-    OperatorAlgebra, OperatorEnumerationBatch, Seed, SeedSource, SeedWriter, StructuralLocation,
-    StructuralProtocol, StructuralView, Verdict, VerificationBatchReport, VerificationKernel,
-    VerificationRecord, VerificationReplayRequest, VerificationWorkerRequirements,
+    OperatorAlgebra, OperatorEnumerationBatch, ProposalFeatures, Seed, SeedSource, SeedWriter,
+    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerificationBatchReport,
+    VerificationKernel, VerificationRecord, VerificationReplayRequest,
+    VerificationWorkerRequirements,
 };
 use crate::durability;
 use crate::instrumentation::{Phase, Recorder};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
-    LearningState, PotentialForecast, compare_forecasts, derive_targets,
+    LearningState, compare_forecasts, cooperative_ranked_indices, derive_targets,
 };
 use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
 use crate::resource::{ResidentReservation, ResourceEnvelopeGuard};
@@ -111,6 +112,13 @@ struct ShapeSummary<C> {
     root_constructor: Option<C>,
 }
 
+#[cfg(feature = "internal-experiments")]
+struct CandidateFeatureDiagnostics {
+    distinct_vectors: usize,
+    mixed_verdict_vectors: usize,
+    proposal_informed_examples: usize,
+}
+
 struct ReadSeeds<D: DomainDefinition> {
     seeds: Vec<Seed<D>>,
     encoded_cursor: Vec<u8>,
@@ -126,7 +134,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 4;
+const RUNTIME_REVISION: u64 = 5;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -205,6 +213,7 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         }
     }
     let baseline_attempts = recovered.ledger.attempts();
+    let diagnostics = candidate_feature_diagnostics(&baseline_attempts, recovered.ledger.entries());
     let mut structural_attempts = baseline_attempts.clone();
     for (entry, attempt) in recovered
         .ledger
@@ -223,7 +232,8 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
             shape_summary(domain, &candidate).map_err(|()| SessionError::CorruptBundle)?;
         let operator =
             std::str::from_utf8(&entry.operator_symbol).map_err(|_| SessionError::CorruptBundle)?;
-        attempt.features = structural_opportunity_features(parent, &candidate, operator);
+        attempt.features =
+            structural_opportunity_features(parent, &candidate, operator, entry.proposal_features);
     }
     let feature_extraction_cpu = feature_started.elapsed();
     let comparison = recovered
@@ -236,6 +246,9 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         .map_err(|()| SessionError::CorruptBundle)?;
     Ok(crate::internal_experiments::CandidateFeatureComparison {
         examples: baseline_attempts.len(),
+        distinct_feature_vectors: diagnostics.distinct_vectors,
+        mixed_verdict_feature_vectors: diagnostics.mixed_verdict_vectors,
+        proposal_informed_examples: diagnostics.proposal_informed_examples,
         replay_claims: comparison.replay_claims,
         selection_claims: comparison.selection_claims,
         baseline_selection_loss: comparison.baseline_loss,
@@ -252,12 +265,53 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         baseline_reproduces_champion: comparison.baseline_reproduces_champion,
         structural_promotes_over_baseline: comparison.structural_promotes,
         ranking_budgets: comparison.ranking_budgets,
+        bootstrap_accepted_at_k: comparison.bootstrap_accepted_at_k,
         baseline_accepted_at_k: comparison.baseline_accepted_at_k,
         structural_accepted_at_k: comparison.structural_accepted_at_k,
         balanced_structural_accepted_at_k: comparison.balanced_structural_accepted_at_k,
+        global_bootstrap_accepted_at_k: comparison.global_bootstrap_accepted_at_k,
+        global_baseline_accepted_at_k: comparison.global_baseline_accepted_at_k,
+        global_structural_accepted_at_k: comparison.global_structural_accepted_at_k,
+        global_balanced_structural_accepted_at_k: comparison
+            .global_balanced_structural_accepted_at_k,
         evaluated_at_k: comparison.evaluated_at_k,
         selection_accepted: comparison.selection_accepted,
     })
+}
+
+#[cfg(feature = "internal-experiments")]
+fn candidate_feature_diagnostics(
+    attempts: &[AttemptObservation],
+    entries: &[ExperienceEntry],
+) -> CandidateFeatureDiagnostics {
+    let mut outcomes = HashMap::<[u32; crate::learning::FEATURE_COUNT], u8>::new();
+    for attempt in attempts {
+        let verdict = match attempt.verdict {
+            crate::learning::VerdictTarget::Accepted => 1,
+            crate::learning::VerdictTarget::Refuted => 2,
+            crate::learning::VerdictTarget::Unknown => 4,
+        };
+        *outcomes
+            .entry(attempt.features.0.map(f32::to_bits))
+            .or_default() |= verdict;
+    }
+    CandidateFeatureDiagnostics {
+        distinct_vectors: outcomes.len(),
+        mixed_verdict_vectors: outcomes
+            .values()
+            .filter(|verdicts| verdicts.count_ones() > 1)
+            .count(),
+        proposal_informed_examples: entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .proposal_features
+                    .as_array()
+                    .into_iter()
+                    .any(|feature| feature != 0.0)
+            })
+            .count(),
+    }
 }
 
 #[expect(
@@ -718,7 +772,7 @@ where
             application_bytes = application_bytes
                 .saturating_add(vector_bytes(&locations))
                 .saturating_add(vector_bytes(&applications));
-            let operator_bucket = operator_feature_bucket(descriptor.symbol().as_str());
+            let operator_features = operator_feature_values(descriptor.symbol().as_str());
             for candidate in operator_candidates {
                 let parent = parent_summaries
                     .get(candidate.source_index)
@@ -728,8 +782,9 @@ where
                         domain,
                         *parent,
                         &candidate.artifact,
-                        operator_bucket,
+                        operator_features,
                         sequence,
+                        candidate.proposal_features,
                     ),
                     candidate,
                     operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
@@ -1339,8 +1394,9 @@ fn opportunity_features<D: DomainDefinition>(
     domain: &D,
     parent: StructuralSummary,
     candidate: &D::Artifact,
-    operator_bucket: usize,
+    operator_features: [f32; 8],
     epoch: u64,
+    proposal_features: ProposalFeatures,
 ) -> Features {
     let parent_nodes = parent.node_count;
     let candidate_nodes = structural_node_count(domain, candidate);
@@ -1351,11 +1407,17 @@ fn opportunity_features<D: DomainDefinition>(
     values[2] = (candidate_nodes / 1024.0).min(1.0);
     values[3] = reduction;
     values[4] = f32::from(u16::try_from(epoch).unwrap_or(u16::MAX)) / 1024.0;
-    values[operator_bucket] = 1.0;
-    values[13] = reduction * values[operator_bucket];
+    values[5..13].copy_from_slice(&operator_features);
+    values[13] = reduction;
     values[14] = f32::from(candidate_nodes > parent_nodes);
     values[15] = (candidate_nodes / parent_nodes.max(1.0)).min(4.0) / 4.0;
-    Features(values)
+    let mut features = Features(values);
+    append_proposal_features(&mut features, proposal_features);
+    features
+}
+
+fn append_proposal_features(features: &mut Features, proposal: ProposalFeatures) {
+    features.0[16..].copy_from_slice(&proposal.as_array());
 }
 
 fn structural_node_count<D: DomainDefinition>(domain: &D, artifact: &D::Artifact) -> f32 {
@@ -1416,6 +1478,7 @@ fn structural_opportunity_features<C: Copy + Eq>(
     parent: &ShapeSummary<C>,
     candidate: &ShapeSummary<C>,
     operator_symbol: &str,
+    proposal_features: ProposalFeatures,
 ) -> Features {
     const NODE_SCALE: f32 = 11.512_936;
     const DEPTH_SCALE: f32 = 11.090_37;
@@ -1428,8 +1491,7 @@ fn structural_opportunity_features<C: Copy + Eq>(
     values[2] = (candidate_nodes / 1024.0).min(1.0);
     values[3] = reduction;
     values[4] = (candidate.node_count.ln_1p() / NODE_SCALE).min(1.0);
-    let digest = Sha256::digest(operator_symbol.as_bytes());
-    values[5 + usize::from(digest[0] % 8)] = 1.0;
+    values[5..13].copy_from_slice(&operator_feature_values(operator_symbol));
     values[13] = (candidate.depth.ln_1p() / DEPTH_SCALE).min(1.0);
     values[14] = parent
         .constructor_frequencies
@@ -1441,7 +1503,9 @@ fn structural_opportunity_features<C: Copy + Eq>(
     values[15] = f32::from(
         parent.root_constructor.is_some() && parent.root_constructor == candidate.root_constructor,
     );
-    Features(values)
+    let mut features = Features(values);
+    append_proposal_features(&mut features, proposal_features);
+    features
 }
 
 #[cfg(feature = "internal-experiments")]
@@ -1456,9 +1520,13 @@ fn bounded_u32_f32(value: u32) -> f32 {
     f32::from(high) * 65_536.0 + f32::from(low)
 }
 
-fn operator_feature_bucket(operator_symbol: &str) -> usize {
+fn operator_feature_values(operator_symbol: &str) -> [f32; 8] {
     let operator_digest = Sha256::digest(operator_symbol.as_bytes());
-    5 + usize::from(operator_digest[0] % 8)
+    let mut values = [0.0; 8];
+    for (digest_byte, magnitude) in operator_digest.iter().zip([1.0, 0.5, 0.25]) {
+        values[usize::from(*digest_byte % 8)] += magnitude;
+    }
+    values
 }
 
 fn append_derived_candidates<D: DomainDefinition>(
@@ -1546,7 +1614,7 @@ fn append_derived_candidates<D: DomainDefinition>(
         }
         let symbol = std::str::from_utf8(derived.symbol())
             .expect("canonical Derived Operator symbols are UTF-8");
-        let operator_bucket = operator_feature_bucket(symbol);
+        let operator_features = operator_feature_values(symbol);
         emitted = emitted.saturating_add(current.len());
         for candidate in current {
             let parent = parents
@@ -1559,8 +1627,9 @@ fn append_derived_candidates<D: DomainDefinition>(
                         node_count: structural_node_count(domain, parent),
                     },
                     &candidate.artifact,
-                    operator_bucket,
+                    operator_features,
                     epoch,
+                    candidate.proposal_features,
                 ),
                 candidate,
                 operator_symbol: derived.symbol().to_vec(),
@@ -1618,53 +1687,59 @@ fn order_by_learned_potential<D: DomainDefinition>(
     let (origin_exploration, remaining) =
         partition_origin_exploration(frontier, std::mem::take(candidates), limit);
     let (derived_exploration, ordinary) = partition_derived_exploration(remaining);
-    let mut ranked = Vec::new();
-    let mut exploration = Vec::new();
-    for (index, candidate) in ordinary.into_iter().enumerate() {
-        if index.is_multiple_of(8) {
-            exploration.push(candidate);
-        } else {
-            ranked.push(candidate);
-        }
-    }
-    let ranked_features = ranked
+    let bootstrap_compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
+        goals.compare_parents(frontier, left, right).then_with(|| {
+            left.operator_symbol
+                .cmp(&right.operator_symbol)
+                .then_with(|| {
+                    left.candidate
+                        .source_index
+                        .cmp(&right.candidate.source_index)
+                })
+        })
+    };
+    let mut bootstrap = (0..ordinary.len()).collect::<Vec<_>>();
+    bootstrap
+        .sort_unstable_by(|left, right| bootstrap_compare(&ordinary[*left], &ordinary[*right]));
+    let ranked_features = ordinary
         .iter()
         .map(|candidate| candidate.features)
         .collect::<Vec<_>>();
     let mut forecasts = Vec::with_capacity(ranked_features.len());
     model.forecast_batch(&ranked_features, &mut forecasts);
-    let mut ranked = ranked.into_iter().zip(forecasts).collect::<Vec<_>>();
-    let compare =
-        |(left, left_forecast): &(ProposedCandidate<D>, PotentialForecast),
-         (right, right_forecast): &(ProposedCandidate<D>, PotentialForecast)| {
-            compare_forecasts(*left_forecast, *right_forecast)
-                .then_with(|| goals.compare_parents(frontier, left, right))
-                .then_with(|| {
-                    left.operator_symbol
-                        .cmp(&right.operator_symbol)
-                        .then_with(|| {
-                            left.candidate
-                                .source_index
-                                .cmp(&right.candidate.source_index)
-                        })
-                })
-        };
-    sort_prefix_by(&mut ranked, limit, compare);
+    let mut learned = (0..ordinary.len()).collect::<Vec<_>>();
+    learned.sort_unstable_by(|left, right| {
+        compare_forecasts(forecasts[*left], forecasts[*right])
+            .then_with(|| goals.compare_parents(frontier, &ordinary[*left], &ordinary[*right]))
+            .then_with(|| {
+                ordinary[*left]
+                    .operator_symbol
+                    .cmp(&ordinary[*right].operator_symbol)
+                    .then_with(|| {
+                        ordinary[*left]
+                            .candidate
+                            .source_index
+                            .cmp(&ordinary[*right].candidate.source_index)
+                    })
+            })
+    });
+    let cooperative = cooperative_ranked_indices(&bootstrap, &learned, limit);
+    let mut ordinary = ordinary.into_iter().map(Some).collect::<Vec<_>>();
+    let mut cooperative = cooperative.into_iter().map(|index| {
+        ordinary[index]
+            .take()
+            .expect("cooperative ordering emits each Candidate once")
+    });
     candidates.extend(origin_exploration);
     if candidates.len() >= limit {
         candidates.truncate(limit);
         return;
     }
-    let mut ranked = ranked.into_iter().map(|(candidate, _)| candidate);
-    let mut exploration = exploration.into_iter();
     let mut derived_exploration = derived_exploration.into_iter();
     loop {
         let before = candidates.len();
         candidates.extend(derived_exploration.by_ref().take(2));
-        if let Some(candidate) = exploration.next() {
-            candidates.push(candidate);
-        }
-        candidates.extend(ranked.by_ref().take(5));
+        candidates.extend(cooperative.by_ref().take(6));
         if candidates.len() == before || candidates.len() >= limit {
             break;
         }
@@ -2234,7 +2309,7 @@ fn decode_bundle<D: DomainDefinition>(
     let mut encoded_experience = decoded.segment(SegmentKind::Experience);
     let experience_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if experience_count > encoded_experience.len().saturating_div(181) {
+    if experience_count > encoded_experience.len().saturating_div(213) {
         return Err(SessionError::CorruptBundle);
     }
     let mut experience = Vec::with_capacity(experience_count);
@@ -2279,6 +2354,18 @@ fn decode_bundle<D: DomainDefinition>(
         {
             return Err(SessionError::CorruptBundle);
         }
+        let mut proposal_values = [0.0; crate::domain::PROPOSAL_FEATURE_COUNT];
+        for value in &mut proposal_values {
+            *value = f32::from_bits(u32::from_le_bytes(
+                take_bundle(&mut encoded_experience, 4)?
+                    .try_into()
+                    .expect("exactly four proposal-feature bytes were taken"),
+            ));
+            if !value.is_finite() {
+                return Err(SessionError::CorruptBundle);
+            }
+        }
+        let proposal_features = ProposalFeatures::new(proposal_values);
         let Some(origin_index) = recovered_index.get(&origin_key).copied() else {
             return Err(SessionError::CorruptBundle);
         };
@@ -2319,6 +2406,7 @@ fn decode_bundle<D: DomainDefinition>(
                 parent_key,
                 &operator_symbol,
                 epoch,
+                proposal_features,
             ) != attempt_id
             || opportunity_features(
                 domain,
@@ -2326,8 +2414,9 @@ fn decode_bundle<D: DomainDefinition>(
                     node_count: structural_node_count(domain, &recovered[parent_index].artifact),
                 },
                 &candidate_artifact,
-                operator_feature_bucket(operator),
+                operator_feature_values(operator),
                 epoch,
+                proposal_features,
             ) != features
         {
             return Err(SessionError::CorruptBundle);
@@ -2341,6 +2430,7 @@ fn decode_bundle<D: DomainDefinition>(
             canonical_candidate,
             verdict,
             operator_symbol,
+            proposal_features,
             features,
             verification_requests,
             epoch,
@@ -3002,6 +3092,7 @@ fn verify_candidates<D: DomainDefinition>(
             parent_key,
             &candidate.operator_symbol,
             candidate.epoch,
+            candidate.candidate.proposal_features,
         );
         let experience_verdict = match verdict {
             Verdict::Accepted { evidence } => {
@@ -3034,6 +3125,7 @@ fn verify_candidates<D: DomainDefinition>(
             canonical_candidate,
             verdict: experience_verdict,
             operator_symbol: candidate.operator_symbol,
+            proposal_features: candidate.candidate.proposal_features,
             features: candidate.features,
             verification_requests: 1,
             epoch: candidate.epoch,
@@ -3387,15 +3479,19 @@ fn attempt_digest(
     parent_key: ArtifactKey,
     operator_symbol: &[u8],
     epoch: u64,
+    proposal_features: ProposalFeatures,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"reflex-attempt-observation-v1\0");
+    digest.update(b"reflex-attempt-observation-v2\0");
     digest.update(candidate_key.as_bytes());
     digest.update(origin_key.as_bytes());
     digest.update(parent_key.as_bytes());
     digest.update((operator_symbol.len() as u64).to_le_bytes());
     digest.update(operator_symbol);
     digest.update(epoch.to_le_bytes());
+    for feature in proposal_features.as_array() {
+        digest.update(feature.to_bits().to_le_bytes());
+    }
     digest.finalize().into()
 }
 
@@ -3423,7 +3519,35 @@ fn test_fault_point(_: &str) {}
 mod tests {
     use std::collections::{BTreeSet, HashSet};
 
-    use super::{protected_origin_keys, sort_prefix_by};
+    use super::{
+        append_proposal_features, operator_feature_values, protected_origin_keys, sort_prefix_by,
+    };
+    use crate::ProposalFeatures;
+    use crate::learning::{FEATURE_COUNT, Features};
+
+    #[test]
+    fn proposal_features_occupy_a_disjoint_model_feature_channel() {
+        let mut combined = Features([0.0; FEATURE_COUNT]);
+        combined.0[15] = 7.0;
+        append_proposal_features(
+            &mut combined,
+            ProposalFeatures::new([1.0, 0.5, 0.25, 0.0, -0.25, -0.5, -0.75, -1.0]),
+        );
+
+        assert_eq!(combined.0[15].to_bits(), 7.0_f32.to_bits());
+        assert_eq!(
+            &combined.0[16..],
+            &[1.0, 0.5, 0.25, 0.0, -0.25, -0.5, -0.75, -1.0]
+        );
+    }
+
+    #[test]
+    fn operator_features_separate_a_known_single_bucket_collision() {
+        assert_ne!(
+            operator_feature_values("probe-zero").map(f32::to_bits),
+            operator_feature_values("simplify-known-identity").map(f32::to_bits)
+        );
+    }
 
     #[test]
     fn bounded_selection_matches_the_complete_total_order_prefix() {

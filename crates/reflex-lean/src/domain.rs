@@ -8,8 +8,8 @@ use reflex::{
     ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
     ExternalVerificationUsage, Incomparable, KernelRevision, MeasurementDescriptor,
     MeasurementEnvironment, MeasurementSpace, MeasurementWriter, MetricOrdering, OperatorAlgebra,
-    OperatorDescriptor, OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter,
-    SemanticIdentity, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
+    OperatorDescriptor, OperatorEnumerationBatch, ProposalFeatures, Seed, SeedPage, SeedSource,
+    SeedWriter, SemanticIdentity, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
     VerificationBatch, VerificationBatchOutcome, VerificationBatchReport, VerificationKernel,
     VerificationRecord, VerificationReplayBatch, VerificationWorkerRequirements, VerifiedBatch,
 };
@@ -279,7 +279,7 @@ impl DomainDefinition for LeanDomain {
 
     fn semantic_identity(&self) -> SemanticIdentity {
         SemanticIdentity::new(format!(
-            "reflex-lean-v2:mathlib={}:toolchain={}:lean={}:artifact={}:kernel={}:worker={}",
+            "reflex-lean-v3:mathlib={}:toolchain={}:lean={}:artifact={}:kernel={}:worker={}",
             self.environment.mathlib_commit,
             self.environment.lean_toolchain,
             self.environment.lean_commit,
@@ -856,18 +856,18 @@ pub enum LeanOperator {
 
 pub struct LeanOperators {
     catalog: Vec<OperatorDescriptor<LeanOperator>>,
-    substitutions_by_proposition: HashMap<LeanExpr, Vec<LeanArtifact>>,
+    substitutions_by_proposition: HashMap<LeanExpr, Vec<usize>>,
     all_proofs: Vec<LeanArtifact>,
 }
 
 impl LeanOperators {
     fn new(substitutions: Vec<LeanArtifact>) -> Self {
         let mut substitutions_by_proposition = HashMap::new();
-        for artifact in &substitutions {
+        for (index, artifact) in substitutions.iter().enumerate() {
             substitutions_by_proposition
                 .entry(artifact.proposition.clone())
                 .or_insert_with(Vec::new)
-                .push(artifact.clone());
+                .push(index);
         }
         let descriptor =
             |operator, symbol| OperatorDescriptor::new(operator, SymbolId::new(symbol));
@@ -898,29 +898,36 @@ impl LeanOperators {
         output: &mut ApplicationWriter<'_, LeanApplication>,
     ) {
         if let Some(substitutions) = self.substitutions_by_proposition.get(&source.proposition) {
-            for substitution in substitutions {
+            for index in substitutions {
                 if output.is_full() {
                     return;
                 }
+                let substitution = &self.all_proofs[*index];
                 if substitution.proof_term != source.proof_term {
-                    output.push(LeanApplication {
+                    output.push(LeanApplication::supported(
                         source_index,
-                        candidate: candidate_with_proof(source, substitution.proof_term.clone()),
-                    });
+                        candidate_with_proof(source, substitution.proof_term.clone()),
+                        source,
+                        substitution,
+                        *index,
+                    ));
                 }
             }
         }
-        for substitution in &self.all_proofs {
+        for (index, substitution) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
             if substitution.proposition != source.proposition
                 && substitution.proof_term != source.proof_term
             {
-                output.push(LeanApplication {
+                output.push(LeanApplication::supported(
                     source_index,
-                    candidate: candidate_with_proof(source, substitution.proof_term.clone()),
-                });
+                    candidate_with_proof(source, substitution.proof_term.clone()),
+                    source,
+                    substitution,
+                    index,
+                ));
             }
         }
     }
@@ -932,7 +939,7 @@ impl LeanOperators {
         reverse: bool,
         output: &mut ApplicationWriter<'_, LeanApplication>,
     ) {
-        for other in &self.all_proofs {
+        for (index, other) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
@@ -941,16 +948,19 @@ impl LeanOperators {
             } else {
                 (source.proof_term.clone(), other.proof_term.clone())
             };
-            output.push(LeanApplication {
+            output.push(LeanApplication::supported(
                 source_index,
-                candidate: candidate_with_proof(
+                candidate_with_proof(
                     source,
                     LeanExpr::App {
                         function: Arc::new(function),
                         argument: Arc::new(argument),
                     },
                 ),
-            });
+                source,
+                other,
+                index,
+            ));
         }
     }
 
@@ -964,15 +974,18 @@ impl LeanOperators {
         let Some(node) = structural_preorder_index(source, node) else {
             return;
         };
-        for other in &self.all_proofs {
+        for (index, other) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
             if let Some(proof_term) = source.proof_term.replacing(node, &other.proof_term) {
-                output.push(LeanApplication {
+                output.push(LeanApplication::supported(
                     source_index,
-                    candidate: candidate_with_proof(source, proof_term),
-                });
+                    candidate_with_proof(source, proof_term),
+                    source,
+                    other,
+                    index,
+                ));
             }
         }
     }
@@ -983,7 +996,7 @@ impl LeanOperators {
         source: &LeanArtifact,
         output: &mut ApplicationWriter<'_, LeanApplication>,
     ) {
-        for shared in &self.all_proofs {
+        for (index, shared) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
@@ -1002,10 +1015,13 @@ impl LeanOperators {
                 body: Arc::new(body),
                 non_dep: false,
             };
-            output.push(LeanApplication {
+            output.push(LeanApplication::supported(
                 source_index,
-                candidate: candidate_with_proof(source, proof_term),
-            });
+                candidate_with_proof(source, proof_term),
+                source,
+                shared,
+                index,
+            ));
         }
     }
 
@@ -1022,7 +1038,7 @@ impl LeanOperators {
         let Some(target) = source.proof_term.expression_at(node) else {
             return;
         };
-        for analogous in &self.all_proofs {
+        for (index, analogous) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
@@ -1037,10 +1053,13 @@ impl LeanOperators {
             let Some(proof_term) = source.proof_term.replacing(node, &rewritten_target) else {
                 continue;
             };
-            output.push(LeanApplication {
+            output.push(LeanApplication::supported(
                 source_index,
-                candidate: candidate_with_proof(source, proof_term),
-            });
+                candidate_with_proof(source, proof_term),
+                source,
+                analogous,
+                index,
+            ));
         }
     }
 
@@ -1055,10 +1074,10 @@ impl LeanOperators {
             return;
         };
         if let Some(proof_term) = contracted_at(&source.proof_term, node, contract) {
-            output.push(LeanApplication {
+            output.push(LeanApplication::unassisted(
                 source_index,
-                candidate: candidate_with_proof(source, proof_term),
-            });
+                candidate_with_proof(source, proof_term),
+            ));
         }
     }
 
@@ -1068,7 +1087,7 @@ impl LeanOperators {
         source: &LeanArtifact,
         output: &mut ApplicationWriter<'_, LeanApplication>,
     ) {
-        for general in &self.all_proofs {
+        for (index, general) in self.all_proofs.iter().enumerate() {
             if output.is_full() {
                 return;
             }
@@ -1080,10 +1099,13 @@ impl LeanOperators {
                 &general.proof_term,
                 &source.proposition,
             ) {
-                output.push(LeanApplication {
+                output.push(LeanApplication::supported(
                     source_index,
-                    candidate: candidate_with_proof(source, proof_term),
-                });
+                    candidate_with_proof(source, proof_term),
+                    source,
+                    general,
+                    index,
+                ));
             }
         }
     }
@@ -1092,6 +1114,53 @@ impl LeanOperators {
 pub struct LeanApplication {
     source_index: usize,
     candidate: LeanArtifact,
+    proposal_features: ProposalFeatures,
+}
+
+impl LeanApplication {
+    fn supported(
+        source_index: usize,
+        candidate: LeanArtifact,
+        source: &LeanArtifact,
+        support: &LeanArtifact,
+        library_rank: usize,
+    ) -> Self {
+        Self {
+            source_index,
+            candidate,
+            proposal_features: proposal_features(source, support, library_rank),
+        }
+    }
+
+    fn unassisted(source_index: usize, candidate: LeanArtifact) -> Self {
+        Self {
+            source_index,
+            candidate,
+            proposal_features: ProposalFeatures::default(),
+        }
+    }
+}
+
+fn proposal_features(
+    source: &LeanArtifact,
+    support: &LeanArtifact,
+    library_rank: usize,
+) -> ProposalFeatures {
+    let exact_proposition = source.proposition == support.proposition;
+    let rank = u16::try_from(library_rank.saturating_add(1)).unwrap_or(u16::MAX);
+    let support_proposition_nodes =
+        u16::try_from(support.proposition.node_count()).unwrap_or(u16::MAX);
+    let support_proof_nodes = u16::try_from(support.proof_term.node_count()).unwrap_or(u16::MAX);
+    ProposalFeatures::new([
+        f32::from(exact_proposition),
+        f32::from(!exact_proposition),
+        f32::from(source.declaration.level_params == support.declaration.level_params),
+        1.0 / f32::from(rank),
+        (f32::from(support_proposition_nodes) / 1024.0).min(1.0),
+        (f32::from(support_proof_nodes) / 1024.0).min(1.0),
+        f32::from(source.allowed_axioms == support.allowed_axioms),
+        f32::from(source.dependencies == support.dependencies),
+    ])
 }
 
 impl OperatorAlgebra<LeanDomain> for LeanOperators {
@@ -1188,7 +1257,11 @@ impl OperatorAlgebra<LeanDomain> for LeanOperators {
         _scratch: &mut Self::Scratch,
     ) -> Result<(), LeanError> {
         for application in applications {
-            output.push(application.source_index, application.candidate.clone());
+            output.push_with_features(
+                application.source_index,
+                application.candidate.clone(),
+                application.proposal_features,
+            );
         }
         Ok(())
     }
@@ -1933,6 +2006,35 @@ mod tests {
             dependencies: vec![LeanName::from_dotted("Nat")],
             allowed_axioms: vec![],
         }
+    }
+
+    #[test]
+    fn proposal_features_distinguish_exact_and_unrelated_library_support() {
+        let source = artifact();
+        let exact = LeanArtifact {
+            proof_term: LeanExpr::constant(LeanName::from_dotted("exact"), vec![]),
+            ..source.clone()
+        };
+        let unrelated = LeanArtifact {
+            proposition: LeanExpr::constant(LeanName::from_dotted("False"), vec![]),
+            proof_term: LeanExpr::constant(LeanName::from_dotted("unrelated"), vec![]),
+            ..source.clone()
+        };
+
+        let exact_features = super::proposal_features(&source, &exact, 0);
+        let unrelated_features = super::proposal_features(&source, &unrelated, 1);
+
+        let exact_values = exact_features.as_array();
+        let unrelated_values = unrelated_features.as_array();
+        assert_eq!(
+            [exact_values[0].to_bits(), exact_values[1].to_bits()],
+            [1.0_f32.to_bits(), 0.0_f32.to_bits()]
+        );
+        assert_eq!(
+            [unrelated_values[0].to_bits(), unrelated_values[1].to_bits()],
+            [0.0_f32.to_bits(), 1.0_f32.to_bits()]
+        );
+        assert_ne!(exact_features, unrelated_features);
     }
 
     #[test]

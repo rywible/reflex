@@ -268,7 +268,7 @@ fn snapshot(path: &Path) -> Snapshot {
         let accepted = take(&mut input, 1)[0] == 1;
         let operator_length = usize::try_from(read_u64(&mut input)).unwrap();
         let operator = take(&mut input, operator_length).to_vec();
-        input = &input[16 * 4 + 4 + 8..];
+        input = &input[8 * 4 + 24 * 4 + 4 + 8..];
         attempts.push(Attempt {
             canonical,
             operator,

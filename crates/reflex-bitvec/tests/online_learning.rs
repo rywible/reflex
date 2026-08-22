@@ -232,7 +232,7 @@ fn snapshot(path: &Path) -> Snapshot {
         let accepted = input[0] == 1;
         input = &input[1..];
         let operator_length = usize::try_from(read_u64(&mut input)).unwrap();
-        input = &input[operator_length + 16 * 4 + 4 + 8..];
+        input = &input[operator_length + 8 * 4 + 24 * 4 + 4 + 8..];
         attempts.push(Attempt {
             canonical,
             accepted,

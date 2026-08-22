@@ -20,10 +20,10 @@ pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
     ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
     ExternalVerificationUsage, ImmediateArity, KernelRevision, OperatorAlgebra, OperatorDescriptor,
-    OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter, SemanticIdentity,
-    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
-    VerificationAllowance, VerificationBatch, VerificationBatchOutcome, VerificationBatchReport,
-    VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    OperatorEnumerationBatch, ProposalFeatures, Seed, SeedPage, SeedSource, SeedWriter,
+    SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
+    VerdictWriter, VerificationAllowance, VerificationBatch, VerificationBatchOutcome,
+    VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayBatch,
     VerificationWorkerRequirements,
 };
 pub use goal::{

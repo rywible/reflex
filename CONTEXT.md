@@ -224,6 +224,10 @@ _Avoid_: Fixed schedule, objective weight, predicted demand
 A proposed derivative of a Seed that has not yet passed Verification.
 _Avoid_: Artifact, solution
 
+**Proposal Features**:
+A bounded, domain-supplied advisory description of how an Operator formed a Candidate. Proposal Features may guide learned search but never establish correctness.
+_Avoid_: Verification evidence, reward, opaque metadata
+
 **Verified Candidate**:
 A Candidate that has passed Verification but has not necessarily earned retention.
 _Avoid_: Artifact

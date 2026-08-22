@@ -112,7 +112,7 @@ fn v3_experience_keeps_resource_admission_and_measurement_observations_separate(
     assert_eq!(experience[0], 1);
     experience = &experience[1..];
     let operator_length = usize::try_from(read_u64(&mut experience)).unwrap();
-    experience = &experience[operator_length + 16 * 4..];
+    experience = &experience[operator_length + 8 * 4 + 24 * 4..];
     let verification_requests = read_u32(&mut experience);
     let _epoch = read_u64(&mut experience);
     let consequence_count = usize::try_from(read_u64(&mut experience)).unwrap();

@@ -13,6 +13,9 @@ use crate::{DomainDefinition, ImprovementRequest, SessionError};
 #[derive(Clone, Debug)]
 pub struct CandidateFeatureComparison {
     pub examples: usize,
+    pub distinct_feature_vectors: usize,
+    pub mixed_verdict_feature_vectors: usize,
+    pub proposal_informed_examples: usize,
     pub replay_claims: usize,
     pub selection_claims: usize,
     pub baseline_selection_loss: [f32; 7],
@@ -29,9 +32,14 @@ pub struct CandidateFeatureComparison {
     pub baseline_reproduces_champion: bool,
     pub structural_promotes_over_baseline: bool,
     pub ranking_budgets: [usize; 7],
+    pub bootstrap_accepted_at_k: [usize; 7],
     pub baseline_accepted_at_k: [usize; 7],
     pub structural_accepted_at_k: [usize; 7],
     pub balanced_structural_accepted_at_k: [usize; 7],
+    pub global_bootstrap_accepted_at_k: [usize; 7],
+    pub global_baseline_accepted_at_k: [usize; 7],
+    pub global_structural_accepted_at_k: [usize; 7],
+    pub global_balanced_structural_accepted_at_k: [usize; 7],
     pub evaluated_at_k: [usize; 7],
     pub selection_accepted: usize,
 }

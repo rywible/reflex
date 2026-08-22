@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::domain::DomainDefinition;
+use crate::domain::{DomainDefinition, ProposalFeatures};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, VerdictTarget,
@@ -27,6 +27,7 @@ pub(super) struct ExperienceEntry {
     pub(super) canonical_candidate: Vec<u8>,
     pub(super) verdict: ExperienceVerdict,
     pub(super) operator_symbol: Vec<u8>,
+    pub(super) proposal_features: ProposalFeatures,
     pub(super) features: Features,
     pub(super) verification_requests: u32,
     pub(super) epoch: u64,
@@ -253,6 +254,9 @@ impl ExperienceLedger {
             push_bytes(&mut output, &entry.canonical_candidate);
             output.push(entry.verdict as u8);
             push_bytes(&mut output, &entry.operator_symbol);
+            for feature in entry.proposal_features.as_array() {
+                output.extend_from_slice(&feature.to_bits().to_le_bytes());
+            }
             for feature in entry.features.0 {
                 output.extend_from_slice(&feature.to_bits().to_le_bytes());
             }

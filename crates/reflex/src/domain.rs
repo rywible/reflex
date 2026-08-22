@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use crate::measurement::MeasurementSpace;
 
+pub const PROPOSAL_FEATURE_COUNT: usize = 8;
+
 pub trait DomainDefinition: Sized + Send + Sync + 'static {
     type Artifact: Send + Sync + 'static;
     type Error: Error + Send + Sync + 'static;
@@ -429,6 +431,41 @@ impl<'a, A> ApplicationWriter<'a, A> {
 pub struct Candidate<D: DomainDefinition> {
     pub source_index: usize,
     pub artifact: D::Artifact,
+    pub proposal_features: ProposalFeatures,
+}
+
+/// A bounded advisory description of how an Operator formed a Candidate.
+///
+/// Values are scoped by the Domain Definition's Semantic Identity and must be
+/// finite. They guide learned search but never establish correctness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProposalFeatures([f32; PROPOSAL_FEATURE_COUNT]);
+
+impl ProposalFeatures {
+    /// Creates a domain-scoped proposal feature channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any feature is not finite.
+    #[must_use]
+    pub fn new(values: [f32; PROPOSAL_FEATURE_COUNT]) -> Self {
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "proposal features must be finite"
+        );
+        Self(values)
+    }
+
+    #[must_use]
+    pub fn as_array(self) -> [f32; PROPOSAL_FEATURE_COUNT] {
+        self.0
+    }
+}
+
+impl Default for ProposalFeatures {
+    fn default() -> Self {
+        Self([0.0; PROPOSAL_FEATURE_COUNT])
+    }
 }
 
 pub struct CandidateWriter<'a, D: DomainDefinition> {
@@ -455,6 +492,15 @@ impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
     }
 
     pub fn push(&mut self, source_index: usize, artifact: D::Artifact) {
+        self.push_with_features(source_index, artifact, ProposalFeatures::default());
+    }
+
+    pub fn push_with_features(
+        &mut self,
+        source_index: usize,
+        artifact: D::Artifact,
+        proposal_features: ProposalFeatures,
+    ) {
         if self.remaining == 0 {
             self.overflowed = true;
         } else {
@@ -462,6 +508,7 @@ impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
             self.output.push(Candidate {
                 source_index,
                 artifact,
+                proposal_features,
             });
         }
     }
