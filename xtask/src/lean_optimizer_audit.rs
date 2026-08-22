@@ -21,7 +21,7 @@ use crate::harness::{
     require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v5";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v6";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -389,7 +389,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         training_artifacts,
         heldout_artifacts,
         primary_proof_node_limit: PRIMARY_PROOF_NODE_LIMIT,
-        primary_selection: "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; development opportunity corpus, not confirmation sampling",
+        primary_selection: "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; held-out names are absent from September and held-out statement fingerprints are disjoint from selected training; development opportunity corpus, not confirmation sampling",
         september_catalog_sha256,
         december_catalog_sha256,
         selected_artifacts,
@@ -452,6 +452,14 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
         &training_library_candidates,
         arguments.training_artifacts,
     )?;
+    let training_statements = training
+        .iter()
+        .map(|seed| seed.example.statement_hash)
+        .collect::<HashSet<_>>();
+    let heldout_candidates = heldout_candidates
+        .into_iter()
+        .filter(|seed| !training_statements.contains(&seed.example.statement_hash))
+        .collect::<Vec<_>>();
     let heldout = select_verified_improvements(
         &worker,
         &heldout_candidates,
@@ -532,7 +540,8 @@ fn selection_pools<'a>(
     );
     let heldout = deterministic_prefix(
         december.iter().filter(|artifact| {
-            !earlier_families.contains(&artifact.semantic_group)
+            !earlier_names.contains(&artifact.declaration)
+                && !earlier_families.contains(&artifact.semantic_group)
                 && is_human_facing(&artifact.declaration)
                 && december_statement_counts
                     .get(&artifact.statement_hash)
@@ -976,5 +985,33 @@ mod tests {
         assert!(is_human_facing(&LeanName::from_dotted(
             "Test.proof_by_cases"
         )));
+    }
+
+    #[test]
+    fn heldout_pool_never_relabels_an_earlier_name_after_family_drift() {
+        let earlier_seed = example("Test.same", 1, 1);
+        let earlier_peer = example("Test.samePeer", 1, 1);
+        let drifted_seed = example("Test.same", 1, 9);
+        let drifted_peer = example("Test.samePeer", 1, 9);
+        let new_seed = example("Test.new", 2, 2);
+        let new_peer = example("Test.newPeer", 2, 2);
+        let arguments = Arguments {
+            lake: PathBuf::new(),
+            december_root: PathBuf::new(),
+            september_catalog: PathBuf::new(),
+            december_catalog: PathBuf::new(),
+            work: PathBuf::new(),
+            output: PathBuf::new(),
+            training_artifacts: 1,
+            heldout_artifacts: 1,
+            verification_requests: 1,
+        };
+
+        let september = [earlier_seed, earlier_peer];
+        let december = [drifted_seed, drifted_peer, new_seed, new_peer];
+        let (_, _, heldout) = selection_pools(&september, &december, &arguments);
+
+        assert_eq!(heldout.len(), 1);
+        assert_eq!(heldout[0].statement_hash, 2);
     }
 }
