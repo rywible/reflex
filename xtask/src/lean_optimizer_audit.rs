@@ -576,16 +576,7 @@ fn fetch_library(
     }
     candidates.sort_unstable_by(|left, right| left.declaration.cmp(&right.declaration));
     candidates.dedup_by(|left, right| left.declaration == right.declaration);
-    let fetched = fetch_primary(worker, &candidates, candidates.len())?
-        .into_iter()
-        .filter(|candidate| {
-            seeds.iter().any(|seed| {
-                candidate.example.statement_hash == seed.example.statement_hash
-                    && candidate.theorem.level_params == seed.theorem.level_params
-                    && candidate.theorem.proposition == seed.theorem.proposition
-            })
-        })
-        .collect::<Vec<_>>();
+    let fetched = fetch_primary(worker, &candidates, candidates.len())?;
     if seeds.iter().any(|seed| {
         !fetched
             .iter()

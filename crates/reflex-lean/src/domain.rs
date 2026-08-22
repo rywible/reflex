@@ -897,14 +897,26 @@ impl LeanOperators {
         source: &LeanArtifact,
         output: &mut ApplicationWriter<'_, LeanApplication>,
     ) {
-        let Some(substitutions) = self.substitutions_by_proposition.get(&source.proposition) else {
-            return;
-        };
-        for substitution in substitutions {
+        if let Some(substitutions) = self.substitutions_by_proposition.get(&source.proposition) {
+            for substitution in substitutions {
+                if output.is_full() {
+                    return;
+                }
+                if substitution.proof_term != source.proof_term {
+                    output.push(LeanApplication {
+                        source_index,
+                        candidate: candidate_with_proof(source, substitution.proof_term.clone()),
+                    });
+                }
+            }
+        }
+        for substitution in &self.all_proofs {
             if output.is_full() {
                 return;
             }
-            if substitution.proof_term != source.proof_term {
+            if substitution.proposition != source.proposition
+                && substitution.proof_term != source.proof_term
+            {
                 output.push(LeanApplication {
                     source_index,
                     candidate: candidate_with_proof(source, substitution.proof_term.clone()),
