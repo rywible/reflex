@@ -107,7 +107,6 @@ struct StructuralSummary {
 struct ShapeSummary<C> {
     node_count: f32,
     depth: f32,
-    leaf_fraction: f32,
     constructor_frequencies: Vec<f32>,
     root_constructor: Option<C>,
 }
@@ -1364,7 +1363,6 @@ fn shape_summary<D: DomainDefinition>(
     let mut depths = Vec::with_capacity(node_count);
     let mut constructor_counts = vec![0.0_f32; domain.structure().schema().constructors.len()];
     let mut children = Vec::new();
-    let mut leaves = 0.0_f32;
     for node in 0..node_count {
         let constructor = view.node_constructor(node).ok_or(())?;
         let constructor_index = domain
@@ -1378,9 +1376,6 @@ fn shape_summary<D: DomainDefinition>(
         if !view.write_children(node, &mut children) || children.iter().any(|child| *child >= node)
         {
             return Err(());
-        }
-        if children.is_empty() {
-            leaves += 1.0;
         }
         let depth = children
             .iter()
@@ -1400,11 +1395,6 @@ fn shape_summary<D: DomainDefinition>(
     Ok(ShapeSummary {
         node_count: node_count_f32,
         depth: depths.last().copied().map_or(0.0, bounded_u32_f32),
-        leaf_fraction: if node_count == 0 {
-            0.0
-        } else {
-            leaves / node_count_f32
-        },
         constructor_frequencies: constructor_counts,
         root_constructor: node_count
             .checked_sub(1)
@@ -1425,28 +1415,23 @@ fn structural_opportunity_features<C: Copy + Eq>(
     };
     let mut values = [0.0; crate::learning::FEATURE_COUNT];
     values[0] = 1.0;
-    values[1] = parent.node_count.ln_1p() / NODE_SCALE;
-    values[2] = candidate.node_count.ln_1p() / NODE_SCALE;
+    values[1] = (parent.node_count.ln_1p() / NODE_SCALE).min(1.0);
+    values[2] = (candidate.node_count.ln_1p() / NODE_SCALE).min(1.0);
     values[3] = signed_log_ratio(parent.node_count, candidate.node_count, NODE_SCALE);
-    values[4] = parent.depth.ln_1p() / DEPTH_SCALE;
-    values[5] = candidate.depth.ln_1p() / DEPTH_SCALE;
-    values[6] = signed_log_ratio(parent.depth, candidate.depth, DEPTH_SCALE);
-    values[7] = parent.leaf_fraction;
-    values[8] = candidate.leaf_fraction;
-    values[9] = parent.leaf_fraction - candidate.leaf_fraction;
-    values[10] = parent
+    values[4] = (candidate.depth.ln_1p() / DEPTH_SCALE).min(1.0);
+    values[5] = signed_log_ratio(parent.depth, candidate.depth, DEPTH_SCALE);
+    values[6] = parent
         .constructor_frequencies
         .iter()
         .zip(&candidate.constructor_frequencies)
         .map(|(parent, candidate)| (parent - candidate).abs())
         .sum::<f32>()
         / 2.0;
-    values[11] = f32::from(
+    values[7] = f32::from(
         parent.root_constructor.is_some() && parent.root_constructor == candidate.root_constructor,
     );
     let digest = Sha256::digest(operator_symbol.as_bytes());
-    let bucket = 12 + usize::from(digest[0] % 4);
-    values[bucket] = if digest[1] & 1 == 0 { 1.0 } else { -1.0 };
+    values[8 + usize::from(digest[0] % 8)] = 1.0;
     Features(values)
 }
 
