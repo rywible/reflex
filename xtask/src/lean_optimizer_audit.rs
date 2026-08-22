@@ -181,6 +181,11 @@ struct FeatureDevelopmentReport {
     claim_operator_feature_groups: usize,
     mixed_verdict_claim_operator_feature_groups: usize,
     accepted_examples_in_mixed_groups: usize,
+    accepted_refuted_collision_groups: usize,
+    accepted_in_accepted_refuted_groups: usize,
+    accepted_refuted_collision_fraction_ppm: u64,
+    collision_examples_in_bootstrap_top_k: [usize; 7],
+    collision_accepted_in_bootstrap_top_k: [usize; 7],
     accepted_examples: usize,
     proposal_informed_examples: usize,
     replay_claims: usize,
@@ -403,7 +408,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v5";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v6";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -455,6 +460,14 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         mixed_verdict_claim_operator_feature_groups: comparison
             .mixed_verdict_claim_operator_feature_groups,
         accepted_examples_in_mixed_groups: comparison.accepted_examples_in_mixed_groups,
+        accepted_refuted_collision_groups: comparison.accepted_refuted_collision_groups,
+        accepted_in_accepted_refuted_groups: comparison.accepted_in_accepted_refuted_groups,
+        accepted_refuted_collision_fraction_ppm: fraction_ppm(
+            comparison.accepted_in_accepted_refuted_groups,
+            comparison.accepted_examples,
+        )?,
+        collision_examples_in_bootstrap_top_k: comparison.collision_examples_in_bootstrap_top_k,
+        collision_accepted_in_bootstrap_top_k: comparison.collision_accepted_in_bootstrap_top_k,
         accepted_examples: comparison.accepted_examples,
         proposal_informed_examples: comparison.proposal_informed_examples,
         replay_claims: comparison.replay_claims,
@@ -491,13 +504,27 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         host,
         content_sha256: String::new(),
     };
-    report.content_sha256 = hash_json(&report)?;
+    write_feature_report(&output, &mut report)
+}
+
+fn write_feature_report(
+    output: &Path,
+    report: &mut FeatureDevelopmentReport,
+) -> Result<(), AnyError> {
+    report.content_sha256 = hash_json(report)?;
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
-    println!("{}", serde_json::to_string(&report)?);
+    std::fs::write(output, serde_json::to_vec_pretty(report)?)?;
+    println!("{}", serde_json::to_string(report)?);
     Ok(())
+}
+
+fn fraction_ppm(numerator: usize, denominator: usize) -> Result<u64, AnyError> {
+    Ok(u64::try_from(numerator)?
+        .saturating_mul(1_000_000)
+        .checked_div(u64::try_from(denominator)?)
+        .unwrap_or(0))
 }
 
 pub fn development_child(arguments: &[String]) -> Result<(), AnyError> {
