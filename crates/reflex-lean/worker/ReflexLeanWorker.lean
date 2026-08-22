@@ -417,6 +417,12 @@ partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allN
       let fingerprints := (allNames.extract offset (min allNames.size (offset + limit))).filterMap fun name =>
         match env.find? name with
         | some info =>
+          let (statementNodes, statementDepth, valueNodes, valueDepth) :=
+            match info with
+            | .thmInfo theoremInfo =>
+              (expressionNodes theoremInfo.type, expressionDepth theoremInfo.type,
+                expressionNodes theoremInfo.value, expressionDepth theoremInfo.value)
+            | _ => (0, 0, 0, 0)
           let dependencies := Id.run do
             let mut found : NameSet := {}
             for dependency in info.type.getUsedConstants do
@@ -428,10 +434,10 @@ partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allN
             name := WireName.ofLean name
             moduleName := WireName.ofLean (declarationModule env name)
             statementHash := hash info.type
-            statementNodes := expressionNodes info.type
-            statementDepth := expressionDepth info.type
-            valueNodes := info.value?.map expressionNodes |>.getD 0
-            valueDepth := info.value?.map expressionDepth |>.getD 0
+            statementNodes
+            statementDepth
+            valueNodes
+            valueDepth
             dependencies := dependencies.map WireName.ofLean
             kind := declarationKind info
             locallyEligible := locallyEligible name info
