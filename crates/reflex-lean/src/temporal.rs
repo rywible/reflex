@@ -507,7 +507,17 @@ pub struct TasteModel {
     screen: LinearModel,
     ranker: LinearModel,
     retrieval: Vec<RetrievalCell>,
+    strategies: [RankingStrategy; POTENTIAL_HEADS],
     examples: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RankingStrategy {
+    Learned,
+    DependencyLight,
+    HistoricalReuse,
+    Uniform,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -525,6 +535,21 @@ struct RetrievalCell {
 impl TasteModel {
     #[must_use]
     pub fn train(examples: &[TemporalExample], treatment: Treatment) -> Self {
+        let all = examples.iter().collect::<Vec<_>>();
+        if treatment != Treatment::Full {
+            return Self::fit(&all, treatment);
+        }
+        let (selection, replay): (Vec<_>, Vec<_>) = examples
+            .iter()
+            .partition(|example| example.semantic_group[0].is_multiple_of(5));
+        let provisional = Self::fit(&replay, treatment);
+        let strategies = provisional.choose_strategies(&selection, 256.min(selection.len()));
+        let mut model = Self::fit(&all, treatment);
+        model.strategies = strategies;
+        model
+    }
+
+    fn fit(examples: &[&TemporalExample], treatment: Treatment) -> Self {
         let mut model = Self {
             screen: LinearModel::new(SCREEN_FEATURES),
             ranker: LinearModel::new(TASTE_FEATURES),
@@ -535,6 +560,7 @@ impl TasteModel {
                 };
                 256
             ],
+            strategies: [RankingStrategy::Learned; POTENTIAL_HEADS],
             examples: 0,
         };
         if matches!(treatment, Treatment::Bootstrap | Treatment::NoModel) {
@@ -571,6 +597,38 @@ impl TasteModel {
         model
     }
 
+    fn choose_strategies(
+        &self,
+        selection: &[&TemporalExample],
+        limit: usize,
+    ) -> [RankingStrategy; POTENTIAL_HEADS] {
+        let owned = selection
+            .iter()
+            .map(|example| (*example).clone())
+            .collect::<Vec<_>>();
+        std::array::from_fn(|index| {
+            let head = PotentialHead::ALL[index];
+            let mut best = RankingStrategy::Learned;
+            let mut best_value = target_mean(
+                &owned,
+                &self.rank_learned_for_head(&owned, limit, head),
+                index,
+            );
+            for strategy in [
+                RankingStrategy::DependencyLight,
+                RankingStrategy::HistoricalReuse,
+                RankingStrategy::Uniform,
+            ] {
+                let value = target_mean(&owned, &baseline_rank(&owned, limit, strategy), index);
+                if improves(head, value, best_value) {
+                    best = strategy;
+                    best_value = value;
+                }
+            }
+            best
+        })
+    }
+
     #[must_use]
     pub fn forecast(&self, features: &[f32]) -> [PotentialForecast; POTENTIAL_HEADS] {
         let screen = self.screen.predict(&features[..SCREEN_FEATURES]);
@@ -600,6 +658,18 @@ impl TasteModel {
 
     #[must_use]
     pub fn rank_for_head(
+        &self,
+        examples: &[TemporalExample],
+        limit: usize,
+        priority: PotentialHead,
+    ) -> Vec<usize> {
+        match self.strategies[priority.index()] {
+            RankingStrategy::Learned => self.rank_learned_for_head(examples, limit, priority),
+            strategy => baseline_rank(examples, limit, strategy),
+        }
+    }
+
+    fn rank_learned_for_head(
         &self,
         examples: &[TemporalExample],
         limit: usize,
@@ -689,6 +759,54 @@ impl TasteModel {
             self.encode()
                 .expect("serializing finite taste state cannot fail"),
         ))
+    }
+}
+
+fn baseline_rank(
+    examples: &[TemporalExample],
+    limit: usize,
+    strategy: RankingStrategy,
+) -> Vec<usize> {
+    let mut ranked = (0..examples.len()).collect::<Vec<_>>();
+    match strategy {
+        RankingStrategy::Learned => unreachable!("learned ranking requires model forecasts"),
+        RankingStrategy::DependencyLight => ranked.sort_unstable_by(|left, right| {
+            examples[*left].features[1]
+                .total_cmp(&examples[*right].features[1])
+                .then_with(|| left.cmp(right))
+        }),
+        RankingStrategy::HistoricalReuse => ranked.sort_unstable_by(|left, right| {
+            examples[*right].features[2]
+                .total_cmp(&examples[*left].features[2])
+                .then_with(|| left.cmp(right))
+        }),
+        RankingStrategy::Uniform => {
+            ranked.sort_unstable_by_key(|index| examples[*index].semantic_group);
+        }
+    }
+    ranked.truncate(limit);
+    ranked
+}
+
+fn target_mean(examples: &[TemporalExample], selected: &[usize], head: usize) -> f32 {
+    if selected.is_empty() {
+        return 0.0;
+    }
+    let total = selected
+        .iter()
+        .map(|index| examples[*index].targets[head])
+        .sum::<f32>();
+    total / f32::from(u16::try_from(selected.len()).unwrap_or(u16::MAX))
+}
+
+fn improves(head: PotentialHead, challenger: f32, champion: f32) -> bool {
+    if matches!(
+        head,
+        PotentialHead::VerificationCost | PotentialHead::DeadEnd
+    ) {
+        challenger < champion
+    } else {
+        challenger > champion
     }
 }
 
