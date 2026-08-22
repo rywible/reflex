@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Instant;
 
 use cpu_time::ProcessTime;
@@ -12,14 +13,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    AnyError, HostEnvironment, duration_ns, environment, hash_json, require_absent, require_clean,
-    require_release,
+    AnyError, HostEnvironment, duration_ns, environment, hash_json, parse_flag_values,
+    require_absent, require_clean, require_release,
 };
 
 const SCHEMA: &str = "reflex-lean-temporal-audit-freeze-v1";
 const CUTOFF: &str = "2025-01-01T00:00:00Z";
 const CANDIDATES_PER_HEAD: usize = 256;
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
+const AUDIT_BOUNDARY: &str = "2026-07-01T00:00:00Z";
+const BOUNDARY_EVIDENCE_URL: &str = "https://api.github.com/repos/leanprover-community/mathlib4/commits?sha=master&until=2026-06-30T23%3A59%3A59Z&per_page=1";
 
 struct FreezeArguments {
     june_catalog: PathBuf,
@@ -32,11 +35,6 @@ struct LockArguments {
     manifest: PathBuf,
     output: PathBuf,
     mathlib_commit: String,
-    mathlib_commit_timestamp: String,
-    boundary_successor_commit: String,
-    boundary_successor_timestamp: String,
-    boundary_successor_first_parent: String,
-    boundary_evidence_url: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -62,10 +60,8 @@ struct AuditLock {
     audit_boundary: &'static str,
     mathlib_commit: String,
     mathlib_commit_timestamp: String,
-    boundary_successor_commit: String,
-    boundary_successor_timestamp: String,
-    boundary_successor_first_parent: String,
-    boundary_evidence_url: String,
+    boundary_evidence_url: &'static str,
+    boundary_evidence_sha256: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -115,6 +111,27 @@ struct PairSummary {
     examples: usize,
     later_new_declarations: usize,
     relationship_candidates: usize,
+}
+
+struct BoundaryEvidence {
+    commit_timestamp: String,
+    response_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct GithubCommit {
+    sha: String,
+    commit: GithubCommitBody,
+}
+
+#[derive(Deserialize)]
+struct GithubCommitBody {
+    committer: GithubCommitter,
+}
+
+#[derive(Deserialize)]
+struct GithubCommitter {
+    date: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -179,7 +196,7 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
     let audit_artifacts = december
         .forecast_artifacts()
         .into_iter()
-        .filter(|candidate| !seen.contains(&candidate.semantic_group))
+        .filter(|artifact| !seen.contains(&artifact.semantic_group))
         .collect::<Vec<_>>();
     if audit_artifacts.len() < CANDIDATES_PER_HEAD {
         return Err("pre-cutoff semantic-family exclusion leaves too few audit artifacts".into());
@@ -259,10 +276,8 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         return Err("Lean Temporal Audit freeze manifest schema differs".into());
     }
     validate_commit(&arguments.mathlib_commit)?;
-    validate_commit(&arguments.boundary_successor_commit)?;
-    validate_commit(&arguments.boundary_successor_first_parent)?;
     validate_commit(&arguments.lean_commit)?;
-    validate_audit_boundary(&arguments)?;
+    let boundary = fetch_audit_boundary(&arguments.mathlib_commit)?;
     if arguments.lean_toolchain.trim().is_empty()
         || arguments.lean_toolchain_alias.trim().is_empty()
         || arguments.lean_version.trim().is_empty()
@@ -278,11 +293,9 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         audit_artifact_set_sha256: identity.audit_artifact_set_sha256,
         audit_boundary: "strictly before 2026-07-01T00:00:00Z",
         mathlib_commit: arguments.mathlib_commit,
-        mathlib_commit_timestamp: arguments.mathlib_commit_timestamp,
-        boundary_successor_commit: arguments.boundary_successor_commit,
-        boundary_successor_timestamp: arguments.boundary_successor_timestamp,
-        boundary_successor_first_parent: arguments.boundary_successor_first_parent,
-        boundary_evidence_url: arguments.boundary_evidence_url,
+        mathlib_commit_timestamp: boundary.commit_timestamp,
+        boundary_evidence_url: BOUNDARY_EVIDENCE_URL,
+        boundary_evidence_sha256: boundary.response_sha256,
         lean_toolchain: arguments.lean_toolchain,
         lean_toolchain_alias: arguments.lean_toolchain_alias,
         lean_version: arguments.lean_version,
@@ -350,7 +363,7 @@ fn freeze_treatment(
     name: &'static str,
     treatment: Treatment,
     experience: &[TemporalExample],
-    candidates: &[TemporalExample],
+    artifacts: &[TemporalExample],
 ) -> Result<FrozenRanking, AnyError> {
     let training_cpu = ProcessTime::now();
     let training_started = Instant::now();
@@ -364,11 +377,11 @@ fn freeze_treatment(
         let ranking_cpu = ProcessTime::now();
         let ranking_started = Instant::now();
         let indexes = if treatment == Treatment::NoModel {
-            baseline_indexes(candidates, "uniform")
+            baseline_indexes(artifacts, "uniform")
         } else {
-            model.rank_for_head(candidates, CANDIDATES_PER_HEAD, head)
+            model.rank_for_head(artifacts, CANDIDATES_PER_HEAD, head)
         };
-        let frozen = freeze_candidates(candidates, &indexes);
+        let frozen = freeze_artifacts(artifacts, &indexes);
         ranking_wall_ns[index] = duration_ns(ranking_started.elapsed());
         ranking_cpu_ns[index] = duration_ns(ranking_cpu.elapsed());
         frozen
@@ -391,11 +404,11 @@ fn freeze_treatment(
     })
 }
 
-fn freeze_baseline(name: &'static str, candidates: &[TemporalExample]) -> FrozenRanking {
+fn freeze_baseline(name: &'static str, artifacts: &[TemporalExample]) -> FrozenRanking {
     let ranking_cpu = ProcessTime::now();
     let ranking_started = Instant::now();
-    let indexes = baseline_indexes(candidates, name);
-    let frozen = freeze_candidates(candidates, &indexes);
+    let indexes = baseline_indexes(artifacts, name);
+    let frozen = freeze_artifacts(artifacts, &indexes);
     FrozenRanking {
         treatment: name,
         model_sha256: None,
@@ -429,7 +442,7 @@ fn baseline_indexes(examples: &[TemporalExample], name: &str) -> Vec<usize> {
     ranked
 }
 
-fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<FrozenArtifact> {
+fn freeze_artifacts(examples: &[TemporalExample], indexes: &[usize]) -> Vec<FrozenArtifact> {
     indexes
         .iter()
         .map(|index| {
@@ -443,15 +456,15 @@ fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<Fro
         .collect()
 }
 
-fn audit_artifact_set_hash(candidates: &[TemporalExample]) -> String {
+fn audit_artifact_set_hash(artifacts: &[TemporalExample]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"reflex-lean-audit-artifacts-v1\0");
-    for candidate in candidates {
-        digest.update(candidate.declaration.to_string().as_bytes());
+    for artifact in artifacts {
+        digest.update(artifact.declaration.to_string().as_bytes());
         digest.update([0]);
-        digest.update(candidate.module.to_string().as_bytes());
+        digest.update(artifact.module.to_string().as_bytes());
         digest.update([0]);
-        digest.update(candidate.semantic_group);
+        digest.update(artifact.semantic_group);
     }
     hex(&digest.finalize())
 }
@@ -467,23 +480,16 @@ fn pair_summary(pair: &TemporalPair) -> PairSummary {
 }
 
 fn parse_freeze(arguments: &[String]) -> Result<FreezeArguments, AnyError> {
-    let mut values = std::collections::HashMap::<&str, &str>::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let flag = arguments[index].as_str();
-        let value = arguments
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        match flag {
-            "--june-catalog" | "--september-catalog" | "--december-catalog" | "--output" => {
-                if values.insert(flag, value).is_some() {
-                    return Err(format!("duplicate argument {flag}").into());
-                }
-            }
-            _ => return Err(format!("unknown lean-temporal-audit-freeze argument {flag}").into()),
-        }
-        index += 2;
-    }
+    let values = parse_flag_values(
+        arguments,
+        &[
+            "--june-catalog",
+            "--september-catalog",
+            "--december-catalog",
+            "--output",
+        ],
+        "lean-temporal-audit-freeze",
+    )?;
     let path = |flag| -> Result<PathBuf, AnyError> {
         values
             .get(flag)
@@ -499,34 +505,19 @@ fn parse_freeze(arguments: &[String]) -> Result<FreezeArguments, AnyError> {
 }
 
 fn parse_lock(arguments: &[String]) -> Result<LockArguments, AnyError> {
-    let mut values = std::collections::HashMap::<&str, &str>::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let flag = arguments[index].as_str();
-        let value = arguments
-            .get(index + 1)
-            .ok_or_else(|| format!("{flag} requires a value"))?;
-        match flag {
-            "--manifest"
-            | "--output"
-            | "--mathlib-commit"
-            | "--mathlib-commit-timestamp"
-            | "--boundary-successor-commit"
-            | "--boundary-successor-timestamp"
-            | "--boundary-successor-first-parent"
-            | "--boundary-evidence-url"
-            | "--lean-toolchain"
-            | "--lean-toolchain-alias"
-            | "--lean-version"
-            | "--lean-commit" => {
-                if values.insert(flag, value).is_some() {
-                    return Err(format!("duplicate argument {flag}").into());
-                }
-            }
-            _ => return Err(format!("unknown lean-temporal-audit-lock argument {flag}").into()),
-        }
-        index += 2;
-    }
+    let values = parse_flag_values(
+        arguments,
+        &[
+            "--manifest",
+            "--output",
+            "--mathlib-commit",
+            "--lean-toolchain",
+            "--lean-toolchain-alias",
+            "--lean-version",
+            "--lean-commit",
+        ],
+        "lean-temporal-audit-lock",
+    )?;
     let value = |flag| -> Result<String, AnyError> {
         values
             .get(flag)
@@ -537,11 +528,6 @@ fn parse_lock(arguments: &[String]) -> Result<LockArguments, AnyError> {
         manifest: PathBuf::from(value("--manifest")?),
         output: PathBuf::from(value("--output")?),
         mathlib_commit: value("--mathlib-commit")?,
-        mathlib_commit_timestamp: value("--mathlib-commit-timestamp")?,
-        boundary_successor_commit: value("--boundary-successor-commit")?,
-        boundary_successor_timestamp: value("--boundary-successor-timestamp")?,
-        boundary_successor_first_parent: value("--boundary-successor-first-parent")?,
-        boundary_evidence_url: value("--boundary-evidence-url")?,
         lean_toolchain: value("--lean-toolchain")?,
         lean_toolchain_alias: value("--lean-toolchain-alias")?,
         lean_version: value("--lean-version")?,
@@ -561,40 +547,48 @@ fn validate_commit(commit: &str) -> Result<(), AnyError> {
     }
 }
 
-fn validate_audit_boundary(arguments: &LockArguments) -> Result<(), AnyError> {
-    const BOUNDARY: &str = "2026-07-01T00:00:00Z";
-    for timestamp in [
-        &arguments.mathlib_commit_timestamp,
-        &arguments.boundary_successor_timestamp,
-    ] {
-        if timestamp.len() != BOUNDARY.len()
-            || timestamp.as_bytes().get(4) != Some(&b'-')
-            || timestamp.as_bytes().get(7) != Some(&b'-')
-            || timestamp.as_bytes().get(10) != Some(&b'T')
-            || timestamp.as_bytes().get(13) != Some(&b':')
-            || timestamp.as_bytes().get(16) != Some(&b':')
-            || timestamp.as_bytes().get(19) != Some(&b'Z')
-            || timestamp
-                .bytes()
-                .enumerate()
-                .filter(|(index, _)| ![4, 7, 10, 13, 16, 19].contains(index))
-                .any(|(_, byte)| !byte.is_ascii_digit())
-        {
-            return Err(
-                "Lean Temporal Audit boundary timestamps must use YYYY-MM-DDTHH:MM:SSZ".into(),
-            );
-        }
+fn fetch_audit_boundary(expected_commit: &str) -> Result<BoundaryEvidence, AnyError> {
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "X-GitHub-Api-Version: 2022-11-28",
+            BOUNDARY_EVIDENCE_URL,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "GitHub boundary evidence request failed with {}",
+            output.status
+        )
+        .into());
     }
-    if arguments.mathlib_commit_timestamp.as_str() >= BOUNDARY
-        || arguments.boundary_successor_timestamp.as_str() < BOUNDARY
-        || arguments.boundary_successor_first_parent != arguments.mathlib_commit
-        || !arguments
-            .boundary_evidence_url
-            .starts_with("https://github.com/leanprover-community/mathlib4/")
-    {
-        return Err("Lean Temporal Audit pin does not bracket the registered boundary on mathlib's first-parent history".into());
+    parse_audit_boundary(expected_commit, &output.stdout)
+}
+
+fn parse_audit_boundary(
+    expected_commit: &str,
+    response: &[u8],
+) -> Result<BoundaryEvidence, AnyError> {
+    let commits: Vec<GithubCommit> = serde_json::from_slice(response)?;
+    let [commit] = commits.as_slice() else {
+        return Err("GitHub boundary query must return exactly one latest commit".into());
+    };
+    if commit.sha != expected_commit || commit.commit.committer.date.as_str() >= AUDIT_BOUNDARY {
+        return Err(
+            "GitHub's latest pre-boundary mathlib commit differs from the requested pin".into(),
+        );
     }
-    Ok(())
+    Ok(BoundaryEvidence {
+        commit_timestamp: commit.commit.committer.date.clone(),
+        response_sha256: hex(&Sha256::digest(response)),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -608,24 +602,6 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn boundary_arguments() -> LockArguments {
-        LockArguments {
-            manifest: PathBuf::from("manifest.json"),
-            output: PathBuf::from("lock.json"),
-            mathlib_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            mathlib_commit_timestamp: "2026-06-30T23:59:59Z".into(),
-            boundary_successor_commit: "89abcdef0123456789abcdef0123456789abcdef".into(),
-            boundary_successor_timestamp: "2026-07-01T00:00:00Z".into(),
-            boundary_successor_first_parent: "0123456789abcdef0123456789abcdef01234567".into(),
-            boundary_evidence_url:
-                "https://github.com/leanprover-community/mathlib4/commits/master/".into(),
-            lean_toolchain: "leanprover/lean4:v4.example".into(),
-            lean_toolchain_alias: "example".into(),
-            lean_version: "4.example".into(),
-            lean_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
-        }
-    }
 
     #[test]
     fn audit_pins_require_exact_lowercase_commits() {
@@ -645,16 +621,17 @@ mod tests {
     }
 
     #[test]
-    fn audit_boundary_requires_adjacent_first_parent_revisions_around_cutoff() {
-        let valid = boundary_arguments();
-        assert!(validate_audit_boundary(&valid).is_ok());
+    fn audit_boundary_is_parsed_from_primary_github_metadata() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let response = format!(
+            r#"[{{"sha":"{commit}","commit":{{"committer":{{"date":"2026-06-30T23:59:59Z"}}}}}}]"#
+        );
+        let evidence = parse_audit_boundary(commit, response.as_bytes())
+            .expect("matching primary evidence is accepted");
+        assert_eq!(evidence.commit_timestamp, "2026-06-30T23:59:59Z");
+        assert!(parse_audit_boundary("bad", response.as_bytes()).is_err());
 
-        let mut late = boundary_arguments();
-        late.mathlib_commit_timestamp = "2026-07-01T00:00:00Z".into();
-        assert!(validate_audit_boundary(&late).is_err());
-
-        let mut detached = boundary_arguments();
-        detached.boundary_successor_first_parent = detached.boundary_successor_commit.clone();
-        assert!(validate_audit_boundary(&detached).is_err());
+        let late = response.replace("2026-06-30T23:59:59Z", AUDIT_BOUNDARY);
+        assert!(parse_audit_boundary(commit, late.as_bytes()).is_err());
     }
 }

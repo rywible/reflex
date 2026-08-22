@@ -230,16 +230,15 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
     let mut kernel_verification_wall_ns = 0_u64;
     let mut kernel_verification_cpu_upper_bound_ns = 0_u64;
     for candidate in candidate_order {
-        let (certificate, usage) =
-            certify_relationship(&june_worker, &september_worker, candidate)?;
-        if let Some(usage) = usage {
+        let result = certify_relationship(&june_worker, &september_worker, candidate)?;
+        if let Some(usage) = result.usage {
             kernel_verification_calls = kernel_verification_calls.saturating_add(1);
             kernel_verification_wall_ns =
                 kernel_verification_wall_ns.saturating_add(duration_ns(usage.elapsed));
             kernel_verification_cpu_upper_bound_ns = kernel_verification_cpu_upper_bound_ns
                 .saturating_add(duration_ns(usage.cpu_upper_bound));
         }
-        if let Some(certificate) = certificate {
+        if let Some(certificate) = result.certificate {
             certificates.push(certificate);
         }
     }

@@ -111,6 +111,12 @@ pub struct CertifiedRelationship {
     pub proof_nodes_removed: usize,
 }
 
+pub struct RelationshipCertification {
+    pub certificate: Option<CertifiedRelationship>,
+    pub rejection: Option<VerificationResult>,
+    pub usage: Option<crate::worker::WorkerUsage>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsolidatedRelationship {
     pub kind: RelationshipKind,
@@ -436,18 +442,16 @@ pub fn certify_relationship(
     earlier: &LeanWorker,
     later: &LeanWorker,
     candidate: &RelationshipCandidate,
-) -> Result<
-    (
-        Option<CertifiedRelationship>,
-        Option<crate::worker::WorkerUsage>,
-    ),
-    WorkerError,
-> {
+) -> Result<RelationshipCertification, WorkerError> {
     let source = earlier.fetch(std::slice::from_ref(&candidate.earlier))?;
     let target = later.fetch(std::slice::from_ref(&candidate.later))?;
     let (Some(source), Some(target)) = (source.into_iter().next(), target.into_iter().next())
     else {
-        return Ok((None, None));
+        return Ok(RelationshipCertification {
+            certificate: None,
+            rejection: None,
+            usage: None,
+        });
     };
     let direct_derivation = target.dependencies.contains(&source.name);
     let replacement = matches!(
@@ -464,7 +468,11 @@ pub fn certify_relationship(
         }
     } else {
         if !direct_derivation {
-            return Ok((None, None));
+            return Ok(RelationshipCertification {
+                certificate: None,
+                rejection: None,
+                usage: None,
+            });
         }
         VerificationItem {
             level_params: target.level_params.clone(),
@@ -477,7 +485,11 @@ pub fn certify_relationship(
     let (mut results, usage) = later.verify(&[item])?;
     let verification = results.pop().expect("one verification item has one result");
     if !verification.accepted {
-        return Ok((None, Some(usage)));
+        return Ok(RelationshipCertification {
+            certificate: None,
+            rejection: Some(verification),
+            usage: Some(usage),
+        });
     }
     let kind = if replacement {
         if source.proposition == target.proposition {
@@ -500,16 +512,17 @@ pub fn certify_relationship(
     } else {
         0
     };
-    Ok((
-        Some(CertifiedRelationship {
+    Ok(RelationshipCertification {
+        certificate: Some(CertifiedRelationship {
             kind,
             earlier: source,
             later: target,
             verification,
             proof_nodes_removed,
         }),
-        Some(usage),
-    ))
+        rejection: None,
+        usage: Some(usage),
+    })
 }
 
 #[must_use]

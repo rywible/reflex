@@ -80,6 +80,28 @@ pub(super) fn require_absent(path: &Path, artifact: &str) -> Result<(), AnyError
     }
 }
 
+pub(super) fn parse_flag_values<'a>(
+    arguments: &'a [String],
+    allowed: &[&str],
+    command: &str,
+) -> Result<BTreeMap<&'a str, &'a str>, AnyError> {
+    let mut values = BTreeMap::new();
+    let mut chunks = arguments.chunks_exact(2);
+    for pair in &mut chunks {
+        let flag = pair[0].as_str();
+        if !allowed.contains(&flag) {
+            return Err(format!("unknown {command} argument {flag}").into());
+        }
+        if values.insert(flag, pair[1].as_str()).is_some() {
+            return Err(format!("duplicate argument {flag}").into());
+        }
+    }
+    if let [flag] = chunks.remainder() {
+        return Err(format!("{flag} requires a value").into());
+    }
+    Ok(values)
+}
+
 pub(super) fn peak_process_resident_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -118,6 +140,7 @@ pub(super) fn capture_child_bounded(
     evidence_prefix: &Path,
     timeout: Duration,
     resident_bytes: u64,
+    environment: &[(OsString, OsString)],
 ) -> Result<ChildCapture, AnyError> {
     capture_child_with_limits(
         executable,
@@ -125,7 +148,7 @@ pub(super) fn capture_child_bounded(
         evidence_prefix,
         Some(timeout),
         Some(resident_bytes),
-        &[],
+        environment,
     )
 }
 
@@ -409,6 +432,7 @@ mod tests {
             &prefix,
             Duration::from_millis(20),
             u64::MAX,
+            &[],
         )
         .expect("bounded child supervision succeeds");
         assert!(capture.timed_out);
