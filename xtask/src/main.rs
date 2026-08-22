@@ -22,6 +22,7 @@ mod harness;
 mod lean;
 mod lean_audit;
 mod lean_audit_confirm;
+mod lean_optimizer_audit;
 mod lean_taste;
 mod performance;
 mod scaling;
@@ -204,6 +205,10 @@ fn run() -> Result<(), AnyError> {
         Some("lean-taste-development") => {
             let arguments = arguments.collect::<Vec<_>>();
             lean_taste::run(&arguments)
+        }
+        Some("lean-public-optimizer-development") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_optimizer_audit::development(&arguments)
         }
         Some("lean-temporal-audit-freeze") => {
             let arguments = arguments.collect::<Vec<_>>();
