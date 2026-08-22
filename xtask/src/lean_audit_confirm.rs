@@ -34,6 +34,7 @@ const RESIDENT_LIMIT: u64 = 48 * 1024 * 1024 * 1024;
 const SUPERVISOR_CAPABILITY: &str = "reflex-lean-temporal-audit-supervisor-v1";
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
 const IN_PROCESS_LANES: usize = 6;
+const V1_EXECUTION_ENABLED: bool = false;
 
 struct Arguments {
     manifest: PathBuf,
@@ -467,6 +468,7 @@ struct FailedExecutionFinalReport {
 }
 
 pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
+    require_v1_active()?;
     require_release("lean-temporal-audit-confirm")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -524,6 +526,7 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn confirm_child(arguments: &[String]) -> Result<(), AnyError> {
+    require_v1_active()?;
     if std::env::var("REFLEX_LEAN_AUDIT_SUPERVISOR_CAPABILITY").as_deref()
         != Ok(SUPERVISOR_CAPABILITY)
     {
@@ -534,6 +537,7 @@ pub fn confirm_child(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
+    require_v1_active()?;
     require_release("lean-temporal-audit-finalize")?;
     let arguments = parse_finalize(arguments)?;
     require_absent(&arguments.output, "Lean Temporal Audit final report")?;
@@ -609,6 +613,14 @@ pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
         report.status, report.content_sha256
     );
     Ok(())
+}
+
+fn require_v1_active() -> Result<(), AnyError> {
+    if V1_EXECUTION_ENABLED {
+        Ok(())
+    } else {
+        Err("Lean Temporal Audit v1 was superseded before exposure; use the reviewed v2 public-optimizer harness".into())
+    }
 }
 
 fn finalize_failed_execution(

@@ -23,6 +23,7 @@ const ARTIFACTS_PER_HEAD: usize = 256;
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
 const AUDIT_BOUNDARY: &str = "2026-07-01T00:00:00Z";
 const BOUNDARY_EVIDENCE_URL: &str = "https://api.github.com/repos/leanprover-community/mathlib4/commits?sha=master&until=2026-06-30T23%3A59%3A59Z&per_page=1";
+const V1_EXECUTION_ENABLED: bool = false;
 
 struct FreezeArguments {
     june_catalog: PathBuf,
@@ -175,6 +176,7 @@ struct FreezeManifest {
 }
 
 pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
+    require_v1_active()?;
     require_release("lean-temporal-audit-freeze")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -267,6 +269,7 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
+    require_v1_active()?;
     require_release("lean-temporal-audit-lock")?;
     let host = environment()?;
     require_clean(&host, "reflex-lean-temporal-audit-lock-v1")?;
@@ -317,6 +320,14 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         lock.content_sha256, lock.mathlib_commit, lock.freeze_manifest_file_sha256
     );
     Ok(())
+}
+
+fn require_v1_active() -> Result<(), AnyError> {
+    if V1_EXECUTION_ENABLED {
+        Ok(())
+    } else {
+        Err("Lean Temporal Audit v1 was superseded before exposure; use the reviewed v2 public-optimizer harness".into())
+    }
 }
 
 fn frozen_protocol() -> Protocol {
