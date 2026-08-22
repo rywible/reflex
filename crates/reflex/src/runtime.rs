@@ -118,7 +118,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 3;
+const RUNTIME_REVISION: u64 = 4;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1396,9 +1396,9 @@ fn order_by_learned_potential<D: DomainDefinition>(
     candidates: &mut Vec<ProposedCandidate<D>>,
 ) {
     if model.is_none() {
-        let (mut derived, mut ordinary): (Vec<_>, Vec<_>) = std::mem::take(candidates)
-            .into_iter()
-            .partition(|candidate| candidate.protected_derived);
+        let (origin_exploration, remaining) =
+            partition_origin_exploration(frontier, std::mem::take(candidates), limit);
+        let (mut derived, mut ordinary) = partition_derived_exploration(remaining);
         let compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
             goals.compare_parents(frontier, left, right).then_with(|| {
                 left.operator_symbol
@@ -1412,6 +1412,11 @@ fn order_by_learned_potential<D: DomainDefinition>(
         };
         sort_prefix_by(&mut derived, limit, compare);
         sort_prefix_by(&mut ordinary, limit, compare);
+        candidates.extend(origin_exploration);
+        if candidates.len() >= limit {
+            candidates.truncate(limit);
+            return;
+        }
         let mut derived = derived.into_iter();
         let mut ordinary = ordinary.into_iter();
         loop {
@@ -1426,13 +1431,13 @@ fn order_by_learned_potential<D: DomainDefinition>(
         return;
     }
     let model = model.expect("the learned ordering branch requires a Model Revision");
-    let mut derived_exploration = Vec::new();
+    let (origin_exploration, remaining) =
+        partition_origin_exploration(frontier, std::mem::take(candidates), limit);
+    let (derived_exploration, ordinary) = partition_derived_exploration(remaining);
     let mut ranked = Vec::new();
     let mut exploration = Vec::new();
-    for (index, candidate) in std::mem::take(candidates).into_iter().enumerate() {
-        if candidate.protected_derived {
-            derived_exploration.push(candidate);
-        } else if index.is_multiple_of(8) {
+    for (index, candidate) in ordinary.into_iter().enumerate() {
+        if index.is_multiple_of(8) {
             exploration.push(candidate);
         } else {
             ranked.push(candidate);
@@ -1461,6 +1466,11 @@ fn order_by_learned_potential<D: DomainDefinition>(
                 })
         };
     sort_prefix_by(&mut ranked, limit, compare);
+    candidates.extend(origin_exploration);
+    if candidates.len() >= limit {
+        candidates.truncate(limit);
+        return;
+    }
     let mut ranked = ranked.into_iter().map(|(candidate, _)| candidate);
     let mut exploration = exploration.into_iter();
     let mut derived_exploration = derived_exploration.into_iter();
@@ -1476,6 +1486,72 @@ fn order_by_learned_potential<D: DomainDefinition>(
         }
     }
     candidates.truncate(limit);
+}
+
+fn partition_derived_exploration<D: DomainDefinition>(
+    candidates: Vec<ProposedCandidate<D>>,
+) -> (Vec<ProposedCandidate<D>>, Vec<ProposedCandidate<D>>) {
+    candidates
+        .into_iter()
+        .partition(|candidate| candidate.protected_derived)
+}
+
+fn partition_origin_exploration<D: DomainDefinition>(
+    frontier: &[(VerifiedArtifact<D>, usize)],
+    candidates: Vec<ProposedCandidate<D>>,
+    limit: usize,
+) -> (Vec<ProposedCandidate<D>>, Vec<ProposedCandidate<D>>) {
+    let origins = candidates
+        .iter()
+        .filter_map(|candidate| {
+            frontier
+                .get(candidate.candidate.source_index)
+                .map(|(_, origin)| *origin)
+        })
+        .collect::<BTreeSet<_>>();
+    let protected = protected_origin_keys(origins, limit);
+    let mut selected: HashMap<usize, (usize, bool)> = HashMap::with_capacity(protected.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(origin) = frontier
+            .get(candidate.candidate.source_index)
+            .map(|(_, origin)| *origin)
+        else {
+            continue;
+        };
+        if !protected.contains(&origin) {
+            continue;
+        }
+        selected
+            .entry(origin)
+            .and_modify(|(selected_index, selected_is_derived)| {
+                if candidate.protected_derived && !*selected_is_derived {
+                    *selected_index = index;
+                    *selected_is_derived = true;
+                }
+            })
+            .or_insert((index, candidate.protected_derived));
+    }
+    let selected = selected
+        .into_values()
+        .map(|(index, _)| index)
+        .collect::<HashSet<_>>();
+    let mut exploration = Vec::with_capacity(protected.len());
+    let mut ordinary = Vec::with_capacity(candidates.len().saturating_sub(protected.len()));
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if selected.contains(&index) {
+            exploration.push(candidate);
+        } else {
+            ordinary.push(candidate);
+        }
+    }
+    (exploration, ordinary)
+}
+
+fn protected_origin_keys(origins: BTreeSet<usize>, limit: usize) -> HashSet<usize> {
+    if origins.len() <= 1 || origins.len() > limit {
+        return HashSet::new();
+    }
+    origins.into_iter().collect()
 }
 
 fn sort_prefix_by<T>(
@@ -3189,7 +3265,9 @@ fn test_fault_point(_: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::sort_prefix_by;
+    use std::collections::{BTreeSet, HashSet};
+
+    use super::{protected_origin_keys, sort_prefix_by};
 
     #[test]
     fn bounded_selection_matches_the_complete_total_order_prefix() {
@@ -3206,5 +3284,16 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn protected_claim_exploration_is_complete_or_defers_to_preference() {
+        let origins = BTreeSet::from([0, 1, 2, 3]);
+        assert_eq!(
+            protected_origin_keys(origins.clone(), 8),
+            HashSet::from([0, 1, 2, 3])
+        );
+        assert!(protected_origin_keys(origins, 2).is_empty());
+        assert!(protected_origin_keys(BTreeSet::from([0]), 8).is_empty());
     }
 }
