@@ -74,6 +74,7 @@ pub struct ExperienceAttemptInspection {
     pub allocation_queue: CandidateAllocationQueueInspection,
     pub verification_requests: u32,
     pub epoch: u64,
+    pub feature_bits: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,10 +140,6 @@ pub struct CandidateFeatureComparison {
     pub claim_operator_feature_groups: usize,
     pub mixed_verdict_claim_operator_feature_groups: usize,
     pub accepted_examples_in_mixed_groups: usize,
-    pub accepted_refuted_collision_groups: usize,
-    pub accepted_in_accepted_refuted_groups: usize,
-    pub collision_examples_in_bootstrap_top_k: [usize; 7],
-    pub collision_accepted_in_bootstrap_top_k: [usize; 7],
     pub accepted_examples: usize,
     pub proposal_informed_examples: usize,
     pub replay_claims: usize,

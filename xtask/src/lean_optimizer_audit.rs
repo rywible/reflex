@@ -30,7 +30,7 @@ use crate::harness::{
     require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v9";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v10";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -187,8 +187,9 @@ struct FeatureDevelopmentReport {
     accepted_refuted_collision_groups: usize,
     accepted_in_accepted_refuted_groups: usize,
     accepted_refuted_collision_fraction_ppm: u64,
-    collision_examples_in_bootstrap_top_k: [usize; 7],
-    collision_accepted_in_bootstrap_top_k: [usize; 7],
+    collision_examples_in_operational_top_k: [usize; 7],
+    collision_accepted_in_operational_top_k: [usize; 7],
+    collision_groups: Vec<CollisionGroupTrace>,
     accepted_examples: usize,
     proposal_informed_examples: usize,
     replay_claims: usize,
@@ -226,18 +227,38 @@ struct FeatureDevelopmentReport {
 #[derive(Serialize)]
 struct DonorAudit {
     proof_substitution_attempts: usize,
+    accepted_proof_substitutions: usize,
     reconstructed_attempts: usize,
     ambiguous_attempts: usize,
     unmatched_attempts: usize,
+    accepted_refuted_collision_groups: usize,
+    accepted_in_accepted_refuted_groups: usize,
+    accepted_refuted_collision_fraction_ppm: u64,
+    collision_examples_in_operational_top_k: [usize; 7],
+    collision_accepted_in_operational_top_k: [usize; 7],
+    collision_groups: Vec<CollisionGroupTrace>,
     traces: Vec<DonorTrace>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DonorTrace {
     candidate_key: String,
+    claim_digest: String,
+    epoch: u64,
     verdict: &'static str,
-    proof_term_sha256: String,
+    operational_policy_rank: u32,
+    strict_improvement: bool,
+    feature_bits: Vec<u32>,
+    proof_term_sha256: Option<String>,
     donor_declarations: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CollisionGroupTrace {
+    claim_digest: String,
+    operator: &'static str,
+    feature_bits: Vec<u32>,
+    members: Vec<DonorTrace>,
 }
 
 #[derive(Serialize)]
@@ -275,7 +296,7 @@ struct Report {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
-    phase_zero_donor_audit: DonorAudit,
+    phase_zero_information_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -298,7 +319,7 @@ struct ReportInputs {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
-    phase_zero_donor_audit: DonorAudit,
+    phase_zero_information_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -430,7 +451,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v6";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v7";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -472,6 +493,7 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         },
     )?;
     let comparison = compare_candidate_features(&domain, &request, &bundle)?;
+    let collisions = substitution_information_audit(&bundle, None)?;
     let duration_ns = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
     let mut report = FeatureDevelopmentReport {
         schema: SCHEMA,
@@ -482,14 +504,12 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         mixed_verdict_claim_operator_feature_groups: comparison
             .mixed_verdict_claim_operator_feature_groups,
         accepted_examples_in_mixed_groups: comparison.accepted_examples_in_mixed_groups,
-        accepted_refuted_collision_groups: comparison.accepted_refuted_collision_groups,
-        accepted_in_accepted_refuted_groups: comparison.accepted_in_accepted_refuted_groups,
-        accepted_refuted_collision_fraction_ppm: fraction_ppm(
-            comparison.accepted_in_accepted_refuted_groups,
-            comparison.accepted_examples,
-        )?,
-        collision_examples_in_bootstrap_top_k: comparison.collision_examples_in_bootstrap_top_k,
-        collision_accepted_in_bootstrap_top_k: comparison.collision_accepted_in_bootstrap_top_k,
+        accepted_refuted_collision_groups: collisions.accepted_refuted_collision_groups,
+        accepted_in_accepted_refuted_groups: collisions.accepted_in_accepted_refuted_groups,
+        accepted_refuted_collision_fraction_ppm: collisions.accepted_refuted_collision_fraction_ppm,
+        collision_examples_in_operational_top_k: collisions.collision_examples_in_operational_top_k,
+        collision_accepted_in_operational_top_k: collisions.collision_accepted_in_operational_top_k,
+        collision_groups: collisions.collision_groups,
         accepted_examples: comparison.accepted_examples,
         proposal_informed_examples: comparison.proposal_informed_examples,
         replay_claims: comparison.replay_claims,
@@ -620,7 +640,7 @@ fn run_treatments(
         )
         .into());
     }
-    let phase_zero_donor_audit = donor_audit_for_training(
+    let phase_zero_information_audit = information_audit_for_training(
         &prepared.config,
         &prepared.training_corpus,
         &training_bundle,
@@ -681,7 +701,7 @@ fn run_treatments(
         selected_artifacts: prepared.selected_artifacts,
         training_usage,
         training_learning,
-        phase_zero_donor_audit,
+        phase_zero_information_audit,
         full,
         no_model,
         no_derived,
@@ -746,7 +766,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
-        phase_zero_donor_audit,
+        phase_zero_information_audit,
         full,
         no_model,
         no_derived,
@@ -787,7 +807,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
-        phase_zero_donor_audit,
+        phase_zero_information_audit,
         full,
         no_model,
         no_derived,
@@ -1344,17 +1364,18 @@ fn bundle_candidate_fate_count(bundle: &Path) -> Result<usize, AnyError> {
     )
 }
 
-fn reconstruct_substitution_donors(
+fn substitution_information_audit(
     bundle: &Path,
-    domain: &LeanDomain,
-    library: &[LeanArtifact],
+    donor_context: Option<(&LeanDomain, &[LeanArtifact])>,
 ) -> Result<DonorAudit, AnyError> {
     let mut donors_by_proof = HashMap::<[u8; 32], Vec<String>>::new();
-    for artifact in library {
-        donors_by_proof
-            .entry(proof_term_digest(&artifact.proof_term)?)
-            .or_default()
-            .push(artifact.declaration.name.to_string());
+    if let Some((_, library)) = donor_context {
+        for artifact in library {
+            donors_by_proof
+                .entry(proof_term_digest(&artifact.proof_term)?)
+                .or_default()
+                .push(artifact.declaration.name.to_string());
+        }
     }
     for declarations in donors_by_proof.values_mut() {
         declarations.sort_unstable();
@@ -1364,6 +1385,27 @@ fn reconstruct_substitution_donors(
     let decoded = CanonicalBundle::decode(&bytes, RUNTIME_RESIDENT_BYTES)?;
     let experience = inspect_experience_segment(decoded.segment(SegmentKind::Experience))
         .map_err(|_| "Lean Bundle has malformed Experience framing")?;
+    let mut verified_fates = HashMap::new();
+    for fate in &experience.candidate_fates {
+        let CandidateFateOutcomeInspection::Verified {
+            strict_improvement, ..
+        } = fate.outcome
+        else {
+            continue;
+        };
+        let rank = fate
+            .policy_rank
+            .ok_or("Verified Candidate Fate has no operational policy rank")?;
+        if verified_fates
+            .insert(
+                (fate.candidate_key, fate.claim_digest, fate.epoch),
+                (rank, strict_improvement),
+            )
+            .is_some()
+        {
+            return Err("Lean Candidate Fate identity is not unique".into());
+        }
+    }
     let mut scratch = <LeanStructure as StructuralProtocol<LeanDomain>>::Scratch::default();
     let mut traces = Vec::new();
     for attempt in experience
@@ -1371,60 +1413,145 @@ fn reconstruct_substitution_donors(
         .iter()
         .filter(|attempt| attempt.operator_symbol == b"lean-proof-substitution")
     {
-        let candidate = domain
-            .structure()
-            .decode_canonical(&attempt.canonical_candidate, &mut scratch)
-            .map_err(|_| "Lean Candidate Experience has malformed canonical structure")?;
-        let proof_digest = proof_term_digest(&candidate.proof_term)?;
+        let (operational_policy_rank, strict_improvement) = verified_fates
+            .get(&(attempt.candidate_key, attempt.claim_digest, attempt.epoch))
+            .copied()
+            .ok_or("Lean proof-substitution attempt has no matching Verified Candidate Fate")?;
+        let donor = if let Some((domain, _)) = donor_context {
+            let candidate = domain
+                .structure()
+                .decode_canonical(&attempt.canonical_candidate, &mut scratch)
+                .map_err(|_| "Lean Candidate Experience has malformed canonical structure")?;
+            let proof_digest = proof_term_digest(&candidate.proof_term)?;
+            Some((
+                proof_digest,
+                donors_by_proof
+                    .get(&proof_digest)
+                    .cloned()
+                    .unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
         traces.push(DonorTrace {
             candidate_key: hex(&attempt.candidate_key),
+            claim_digest: hex(&attempt.claim_digest),
+            epoch: attempt.epoch,
             verdict: match attempt.verdict {
                 ExperienceVerdictInspection::Accepted => "accepted",
                 ExperienceVerdictInspection::Refuted => "refuted",
                 ExperienceVerdictInspection::Unknown => "unknown",
             },
-            proof_term_sha256: hex(&proof_digest),
-            donor_declarations: donors_by_proof
-                .get(&proof_digest)
-                .cloned()
-                .unwrap_or_default(),
+            operational_policy_rank,
+            strict_improvement,
+            feature_bits: attempt.feature_bits.clone(),
+            proof_term_sha256: donor.as_ref().map(|(digest, _)| hex(digest)),
+            donor_declarations: donor.map_or_else(Vec::new, |(_, declarations)| declarations),
         });
     }
-    Ok(summarize_donor_traces(traces))
+    summarize_substitution_information(traces)
 }
 
-fn summarize_donor_traces(traces: Vec<DonorTrace>) -> DonorAudit {
+fn summarize_substitution_information(traces: Vec<DonorTrace>) -> Result<DonorAudit, AnyError> {
+    const OPERATIONAL_BUDGETS: [u32; 7] = [1, 4, 8, 16, 32, 64, 128];
+
+    let accepted_proof_substitutions = traces
+        .iter()
+        .filter(|trace| trace.verdict == "accepted")
+        .count();
+    let collision_groups = accepted_refuted_collision_groups(&traces);
+    let accepted_in_accepted_refuted_groups = collision_groups
+        .iter()
+        .flat_map(|group| &group.members)
+        .filter(|member| member.verdict == "accepted")
+        .count();
+    let (collision_examples_in_operational_top_k, collision_accepted_in_operational_top_k) =
+        operational_collision_occupancy(&collision_groups, OPERATIONAL_BUDGETS);
     let reconstructed_attempts = traces
         .iter()
-        .filter(|trace| !trace.donor_declarations.is_empty())
+        .filter(|trace| trace.proof_term_sha256.is_some() && !trace.donor_declarations.is_empty())
         .count();
     let ambiguous_attempts = traces
         .iter()
         .filter(|trace| trace.donor_declarations.len() > 1)
         .count();
-    DonorAudit {
+    let accepted_refuted_collision_fraction_ppm = fraction_ppm(
+        accepted_in_accepted_refuted_groups,
+        accepted_proof_substitutions,
+    )?;
+    Ok(DonorAudit {
         proof_substitution_attempts: traces.len(),
+        accepted_proof_substitutions,
         reconstructed_attempts,
         ambiguous_attempts,
         unmatched_attempts: traces.len().saturating_sub(reconstructed_attempts),
+        accepted_refuted_collision_groups: collision_groups.len(),
+        accepted_in_accepted_refuted_groups,
+        accepted_refuted_collision_fraction_ppm,
+        collision_examples_in_operational_top_k,
+        collision_accepted_in_operational_top_k,
+        collision_groups,
         traces,
+    })
+}
+
+fn accepted_refuted_collision_groups(traces: &[DonorTrace]) -> Vec<CollisionGroupTrace> {
+    let mut grouped = BTreeMap::<(String, Vec<u32>), (u8, Vec<DonorTrace>)>::new();
+    for trace in traces {
+        let verdict = match trace.verdict {
+            "accepted" => 1,
+            "refuted" => 2,
+            _ => 4,
+        };
+        let group = grouped
+            .entry((trace.claim_digest.clone(), trace.feature_bits.clone()))
+            .or_default();
+        group.0 |= verdict;
+        group.1.push(trace.clone());
     }
+    grouped
+        .into_iter()
+        .filter(|(_, (verdicts, _))| *verdicts & 1 != 0 && *verdicts & 2 != 0)
+        .map(|((claim_digest, feature_bits), (_, mut members))| {
+            members.sort_unstable_by_key(|member| member.operational_policy_rank);
+            CollisionGroupTrace {
+                claim_digest,
+                operator: "lean-proof-substitution",
+                feature_bits,
+                members,
+            }
+        })
+        .collect()
+}
+
+fn operational_collision_occupancy(
+    groups: &[CollisionGroupTrace],
+    budgets: [u32; 7],
+) -> ([usize; 7], [usize; 7]) {
+    let mut examples = [0; 7];
+    let mut accepted = [0; 7];
+    for member in groups.iter().flat_map(|group| &group.members) {
+        for (index, budget) in budgets.into_iter().enumerate() {
+            if member.operational_policy_rank < budget {
+                examples[index] += 1;
+                accepted[index] += usize::from(member.verdict == "accepted");
+            }
+        }
+    }
+    (examples, accepted)
 }
 
 fn proof_term_digest(proof: &LeanExpr) -> Result<[u8; 32], AnyError> {
     Ok(Sha256::digest(serde_json::to_vec(proof)?).into())
 }
 
-fn donor_audit_for_training(
+fn information_audit_for_training(
     config: &LeanWorkerConfig,
     corpus: &LeanCorpus,
     bundle: &Path,
 ) -> Result<DonorAudit, AnyError> {
-    reconstruct_substitution_donors(
-        bundle,
-        &LeanDomain::new(config.clone(), corpus.clone())?,
-        corpus.operator_library(),
-    )
+    let domain = LeanDomain::new(config.clone(), corpus.clone())?;
+    substitution_information_audit(bundle, Some((&domain, corpus.operator_library())))
 }
 
 fn candidate_verification_curve(
@@ -1818,23 +1945,73 @@ mod tests {
     }
 
     #[test]
-    fn donor_summary_distinguishes_exact_ambiguous_and_unmatched_reconstruction() {
-        let trace = |marker: &str, donor_declarations: Vec<String>| DonorTrace {
-            candidate_key: marker.into(),
-            verdict: "accepted",
-            proof_term_sha256: marker.into(),
-            donor_declarations,
+    fn collision_groups_are_claim_relative_and_use_operational_policy_rank() {
+        let trace = |marker: &str, claim: &str, verdict, rank, feature_bits, donor_declarations| {
+            DonorTrace {
+                candidate_key: marker.into(),
+                claim_digest: claim.into(),
+                epoch: 1,
+                verdict,
+                operational_policy_rank: rank,
+                strict_improvement: marker == "accepted",
+                feature_bits,
+                proof_term_sha256: Some(marker.into()),
+                donor_declarations,
+            }
         };
-        let summary = summarize_donor_traces(vec![
-            trace("exact", vec!["A".into()]),
-            trace("ambiguous", vec!["B".into(), "C".into()]),
-            trace("unmatched", Vec::new()),
-        ]);
+        let traces = vec![
+            trace(
+                "accepted",
+                "claim-a",
+                "accepted",
+                0,
+                vec![1],
+                vec!["A".into()],
+            ),
+            trace(
+                "refuted",
+                "claim-a",
+                "refuted",
+                2,
+                vec![1],
+                vec!["B".into()],
+            ),
+            trace("unknown", "claim-a", "unknown", 1, vec![1], Vec::new()),
+            trace(
+                "distinct",
+                "claim-a",
+                "accepted",
+                3,
+                vec![2],
+                vec!["C".into()],
+            ),
+            trace(
+                "other-claim",
+                "claim-b",
+                "refuted",
+                0,
+                vec![1],
+                vec!["D".into()],
+            ),
+        ];
 
-        assert_eq!(summary.proof_substitution_attempts, 3);
-        assert_eq!(summary.reconstructed_attempts, 2);
-        assert_eq!(summary.ambiguous_attempts, 1);
-        assert_eq!(summary.unmatched_attempts, 1);
+        let groups = accepted_refuted_collision_groups(&traces);
+        let occupancy = operational_collision_occupancy(&groups, [1, 2, 4, 8, 16, 32, 64]);
+        let summary = summarize_substitution_information(traces).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].claim_digest, "claim-a");
+        assert_eq!(groups[0].members.len(), 3);
+        assert_eq!(groups[0].members[0].donor_declarations, ["A"]);
+        assert_eq!(occupancy.0, [1, 2, 3, 3, 3, 3, 3]);
+        assert_eq!(occupancy.1, [1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(summary.accepted_proof_substitutions, 2);
+        assert_eq!(summary.accepted_in_accepted_refuted_groups, 1);
+        assert_eq!(summary.accepted_refuted_collision_fraction_ppm, 500_000);
+        assert_eq!(
+            summary.collision_examples_in_operational_top_k,
+            [1, 3, 3, 3, 3, 3, 3]
+        );
     }
 
     #[test]

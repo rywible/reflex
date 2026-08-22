@@ -132,10 +132,6 @@ struct CandidateFeatureDiagnostics {
     groups: usize,
     mixed_verdict_groups: usize,
     accepted_in_mixed_groups: usize,
-    accepted_refuted_collision_groups: usize,
-    accepted_in_accepted_refuted_collision_groups: usize,
-    collision_examples_in_bootstrap_top_k: [usize; 7],
-    collision_accepted_in_bootstrap_top_k: [usize; 7],
     accepted_examples: usize,
     proposal_informed_examples: usize,
 }
@@ -296,6 +292,7 @@ fn experience_attempt_inspections(
                 allocation_queue: inspect_allocation_queue(entry.allocation_queue),
                 verification_requests: entry.verification_requests,
                 epoch: entry.epoch,
+                feature_bits: entry.features.0.into_iter().map(f32::to_bits).collect(),
             },
         )
         .collect()
@@ -455,11 +452,6 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         claim_operator_feature_groups: diagnostics.groups,
         mixed_verdict_claim_operator_feature_groups: diagnostics.mixed_verdict_groups,
         accepted_examples_in_mixed_groups: diagnostics.accepted_in_mixed_groups,
-        accepted_refuted_collision_groups: diagnostics.accepted_refuted_collision_groups,
-        accepted_in_accepted_refuted_groups: diagnostics
-            .accepted_in_accepted_refuted_collision_groups,
-        collision_examples_in_bootstrap_top_k: diagnostics.collision_examples_in_bootstrap_top_k,
-        collision_accepted_in_bootstrap_top_k: diagnostics.collision_accepted_in_bootstrap_top_k,
         accepted_examples: diagnostics.accepted_examples,
         proposal_informed_examples: diagnostics.proposal_informed_examples,
         replay_claims: comparison.replay_claims,
@@ -497,8 +489,6 @@ fn candidate_feature_diagnostics(
     attempts: &[AttemptObservation],
     entries: &[ExperienceEntry],
 ) -> CandidateFeatureDiagnostics {
-    const RANKING_BUDGETS: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
-
     assert_eq!(
         attempts.len(),
         entries.len(),
@@ -525,30 +515,6 @@ fn candidate_feature_diagnostics(
         group.0 |= verdict;
         group.1 += accepted;
     }
-    let accepted_refuted_collision_keys = outcomes
-        .iter()
-        .filter(|(_, (verdicts, _))| *verdicts & 1 != 0 && *verdicts & 2 != 0)
-        .map(|(key, _)| key)
-        .collect::<HashSet<_>>();
-    let mut collision_examples_in_bootstrap_top_k = [0; 7];
-    let mut collision_accepted_in_bootstrap_top_k = [0; 7];
-    for (attempt, entry) in attempts.iter().zip(entries) {
-        let key = (
-            attempt.claim,
-            entry.operator_symbol.clone(),
-            attempt.features.0.map(f32::to_bits),
-        );
-        if !accepted_refuted_collision_keys.contains(&key) {
-            continue;
-        }
-        for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
-            if attempt.bootstrap_rank < budget {
-                collision_examples_in_bootstrap_top_k[index] += 1;
-                collision_accepted_in_bootstrap_top_k[index] +=
-                    usize::from(attempt.verdict == crate::learning::VerdictTarget::Accepted);
-            }
-        }
-    }
     CandidateFeatureDiagnostics {
         groups: outcomes.len(),
         mixed_verdict_groups: outcomes
@@ -560,14 +526,6 @@ fn candidate_feature_diagnostics(
             .filter(|(verdicts, _)| verdicts.count_ones() > 1)
             .map(|(_, accepted)| *accepted)
             .sum(),
-        accepted_refuted_collision_groups: accepted_refuted_collision_keys.len(),
-        accepted_in_accepted_refuted_collision_groups: outcomes
-            .iter()
-            .filter(|(key, _)| accepted_refuted_collision_keys.contains(key))
-            .map(|(_, (_, accepted))| *accepted)
-            .sum(),
-        collision_examples_in_bootstrap_top_k,
-        collision_accepted_in_bootstrap_top_k,
         accepted_examples,
         proposal_informed_examples: entries
             .iter()
@@ -3850,75 +3808,6 @@ mod tests {
     };
     use crate::ProposalFeatures;
     use crate::learning::{FEATURE_COUNT, Features};
-
-    #[cfg(feature = "internal-experiments")]
-    use crate::learning::{AttemptObservation, VerdictTarget};
-
-    #[cfg(feature = "internal-experiments")]
-    use crate::policy::AllocationQueue;
-
-    #[cfg(feature = "internal-experiments")]
-    use crate::runtime::experience::{ExperienceEntry, ExperienceVerdict};
-
-    #[cfg(feature = "internal-experiments")]
-    use super::candidate_feature_diagnostics;
-
-    #[cfg(feature = "internal-experiments")]
-    #[test]
-    fn feature_collision_diagnostics_report_bootstrap_top_k_occupancy() {
-        let features = |marker: f32| {
-            let mut values = [0.0; FEATURE_COUNT];
-            values[0] = marker;
-            Features(values)
-        };
-        let attempt = |marker: u8, verdict, rank, features| AttemptObservation {
-            id: [marker; 32],
-            artifact: [marker; 32],
-            claim: [1; 32],
-            parent: [1; 32],
-            features,
-            verdict,
-            verification_cost: 1.0,
-            allocation_queue: AllocationQueue::Bootstrap,
-            bootstrap_rank: rank,
-        };
-        let entry = |marker: u8, features| ExperienceEntry {
-            attempt_id: [marker; 32],
-            candidate_key: crate::ArtifactKey([marker; 32]),
-            claim_digest: [1; 32],
-            origin_key: crate::ArtifactKey([1; 32]),
-            parent_key: crate::ArtifactKey([1; 32]),
-            canonical_candidate: vec![marker],
-            verdict: ExperienceVerdict::Accepted,
-            allocation_queue: AllocationQueue::Bootstrap,
-            operator_symbol: b"operator".to_vec(),
-            proposal_features: ProposalFeatures::default(),
-            features,
-            verification_requests: 1,
-            epoch: 0,
-        };
-        let collision = features(1.0);
-        let distinct = features(2.0);
-        let attempts = vec![
-            attempt(1, VerdictTarget::Accepted, 0, collision),
-            attempt(2, VerdictTarget::Accepted, 1, distinct),
-            attempt(3, VerdictTarget::Refuted, 2, collision),
-        ];
-        let entries = vec![entry(1, collision), entry(2, distinct), entry(3, collision)];
-
-        let diagnostics = candidate_feature_diagnostics(&attempts, &entries);
-
-        assert_eq!(diagnostics.accepted_refuted_collision_groups, 1);
-        assert_eq!(diagnostics.accepted_in_accepted_refuted_collision_groups, 1);
-        assert_eq!(
-            diagnostics.collision_examples_in_bootstrap_top_k,
-            [1, 1, 2, 2, 2, 2, 2]
-        );
-        assert_eq!(
-            diagnostics.collision_accepted_in_bootstrap_top_k,
-            [1, 1, 1, 1, 1, 1, 1]
-        );
-    }
 
     #[test]
     fn proposal_features_occupy_a_disjoint_model_feature_channel() {
