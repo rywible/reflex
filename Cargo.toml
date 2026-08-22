@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/reflex", "crates/reflex-bitvec", "crates/reflex-bundle", "xtask"]
+members = ["crates/reflex", "crates/reflex-bitvec", "crates/reflex-bundle", "crates/reflex-lean", "xtask"]
 resolver = "3"
 
 [workspace.package]

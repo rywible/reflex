@@ -259,6 +259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reflex-lean"
+version = "0.1.0"
+dependencies = [
+ "reflex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +375,7 @@ dependencies = [
  "reflex",
  "reflex-bitvec",
  "reflex-bundle",
+ "reflex-lean",
  "serde",
  "serde_json",
  "sha2",

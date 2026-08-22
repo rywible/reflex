@@ -11,6 +11,7 @@ cpu-time = "1.0"
 reflex = { path = "../crates/reflex" }
 reflex-bitvec = { path = "../crates/reflex-bitvec" }
 reflex-bundle = { path = "../crates/reflex-bundle" }
+reflex-lean = { path = "../crates/reflex-lean" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.11", default-features = false }

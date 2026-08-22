@@ -81,8 +81,14 @@ pub struct ConstructorDescriptor<S, C> {
     symbol: SymbolId,
     result_sort: S,
     child_sorts: Vec<S>,
-    immediate_count: usize,
+    immediate_arity: ImmediateArity,
     child_binding_depths: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ImmediateArity {
+    Exact(usize),
+    Variable,
 }
 
 impl<S, C> ConstructorDescriptor<S, C> {
@@ -107,7 +113,32 @@ impl<S, C> ConstructorDescriptor<S, C> {
             symbol,
             result_sort,
             child_sorts,
-            immediate_count,
+            immediate_arity: ImmediateArity::Exact(immediate_count),
+            child_binding_depths,
+        }
+    }
+
+    /// Creates a constructor whose canonical immediate payload has variable length.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `child_sorts` and `child_binding_depths` do not describe the
+    /// same number of child positions.
+    #[must_use]
+    pub fn new_variable_immediates(
+        constructor: C,
+        symbol: SymbolId,
+        result_sort: S,
+        child_sorts: Vec<S>,
+        child_binding_depths: Vec<u32>,
+    ) -> Self {
+        assert_eq!(child_sorts.len(), child_binding_depths.len());
+        Self {
+            constructor,
+            symbol,
+            result_sort,
+            child_sorts,
+            immediate_arity: ImmediateArity::Variable,
             child_binding_depths,
         }
     }
@@ -128,8 +159,8 @@ impl<S, C> ConstructorDescriptor<S, C> {
         &self.child_sorts
     }
 
-    pub fn immediate_count(&self) -> usize {
-        self.immediate_count
+    pub fn immediate_arity(&self) -> ImmediateArity {
+        self.immediate_arity
     }
 
     pub fn child_binding_depths(&self) -> &[u32] {

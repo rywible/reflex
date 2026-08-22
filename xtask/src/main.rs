@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 mod build;
 mod causal;
 mod harness;
+mod lean;
 mod performance;
 mod scaling;
 
@@ -181,8 +182,20 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             scaling::run_child(&arguments)
         }
+        Some("lean-development") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean::run_development(&arguments)
+        }
+        Some("lean-catalog") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean::build_catalog(&arguments)
+        }
+        Some("lean-catalog-check") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean::check_catalog(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development> [arguments]"
                 .into(),
         ),
     }

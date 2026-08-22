@@ -1,0 +1,15 @@
+[package]
+name = "reflex-lean"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reflex = { path = "../reflex" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["unbounded_depth"] }
+sha2 = { version = "0.11", default-features = false }
+
+[lints]
+workspace = true
