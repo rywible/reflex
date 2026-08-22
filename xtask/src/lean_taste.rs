@@ -631,8 +631,8 @@ const fn head_index(head: PotentialHead) -> usize {
         PotentialHead::Descendants => 1,
         PotentialHead::Reuse => 2,
         PotentialHead::Compression => 3,
-        PotentialHead::MigrationSurvival => 4,
-        PotentialHead::VerificationCost => 5,
+        PotentialHead::DeclarationSurvival => 4,
+        PotentialHead::DependencyCost => 5,
         PotentialHead::DeadEnd => 6,
     }
 }

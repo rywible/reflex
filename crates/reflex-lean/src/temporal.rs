@@ -27,8 +27,8 @@ pub enum PotentialHead {
     Descendants,
     Reuse,
     Compression,
-    MigrationSurvival,
-    VerificationCost,
+    DeclarationSurvival,
+    DependencyCost,
     DeadEnd,
 }
 
@@ -38,8 +38,8 @@ impl PotentialHead {
         Self::Descendants,
         Self::Reuse,
         Self::Compression,
-        Self::MigrationSurvival,
-        Self::VerificationCost,
+        Self::DeclarationSurvival,
+        Self::DependencyCost,
         Self::DeadEnd,
     ];
 
@@ -49,8 +49,8 @@ impl PotentialHead {
             Self::Descendants => 1,
             Self::Reuse => 2,
             Self::Compression => 3,
-            Self::MigrationSurvival => 4,
-            Self::VerificationCost => 5,
+            Self::DeclarationSurvival => 4,
+            Self::DependencyCost => 5,
             Self::DeadEnd => 6,
         }
     }
@@ -597,7 +597,7 @@ impl TasteModel {
                 let mut targets = example.targets;
                 if treatment == Treatment::ImmediateOnly {
                     for (index, target) in targets.iter_mut().enumerate().skip(1) {
-                        if index != PotentialHead::VerificationCost.index() {
+                        if index != PotentialHead::DependencyCost.index() {
                             *target = 0.0;
                         }
                     }
@@ -656,7 +656,7 @@ impl TasteModel {
         // Dependency count is both a stable structural prior and the strongest
         // pre-cutoff cost specialist. Keep it as the production safety floor;
         // learned taste remains responsible for the less local outcomes.
-        strategies[PotentialHead::VerificationCost.index()] = RankingStrategy::DependencyLight;
+        strategies[PotentialHead::DependencyCost.index()] = RankingStrategy::DependencyLight;
         strategies
     }
 
@@ -858,10 +858,7 @@ fn target_mean(examples: &[TemporalExample], selected: &[usize], head: usize) ->
 }
 
 fn improves(head: PotentialHead, challenger: f32, champion: f32) -> bool {
-    if matches!(
-        head,
-        PotentialHead::VerificationCost | PotentialHead::DeadEnd
-    ) {
+    if matches!(head, PotentialHead::DependencyCost | PotentialHead::DeadEnd) {
         challenger < champion
     } else {
         challenger > champion
@@ -932,10 +929,7 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 fn directional_value(head: PotentialHead, estimate: f32) -> f32 {
-    if matches!(
-        head,
-        PotentialHead::VerificationCost | PotentialHead::DeadEnd
-    ) {
+    if matches!(head, PotentialHead::DependencyCost | PotentialHead::DeadEnd) {
         -estimate
     } else {
         estimate
@@ -943,10 +937,7 @@ fn directional_value(head: PotentialHead, estimate: f32) -> f32 {
 }
 
 fn conservative_value(head: PotentialHead, forecast: PotentialForecast) -> f32 {
-    if matches!(
-        head,
-        PotentialHead::VerificationCost | PotentialHead::DeadEnd
-    ) {
+    if matches!(head, PotentialHead::DependencyCost | PotentialHead::DeadEnd) {
         -(forecast.estimate + forecast.uncertainty)
     } else {
         forecast.estimate - forecast.uncertainty
