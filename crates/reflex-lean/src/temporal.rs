@@ -632,7 +632,7 @@ impl TasteModel {
             .iter()
             .map(|example| (*example).clone())
             .collect::<Vec<_>>();
-        std::array::from_fn(|index| {
+        let mut strategies = std::array::from_fn(|index| {
             let head = PotentialHead::ALL[index];
             let mut best = RankingStrategy::Learned;
             let mut best_value = target_mean(
@@ -652,11 +652,17 @@ impl TasteModel {
                 }
             }
             best
-        })
+        });
+        // Dependency count is both a stable structural prior and the strongest
+        // pre-cutoff cost specialist. Keep it as the production safety floor;
+        // learned taste remains responsible for the less local outcomes.
+        strategies[PotentialHead::VerificationCost.index()] = RankingStrategy::DependencyLight;
+        strategies
     }
 
     #[must_use]
     pub fn forecast(&self, features: &[f32]) -> [PotentialForecast; POTENTIAL_HEADS] {
+        assert_eq!(features.len(), TASTE_FEATURES, "taste features differ");
         let screen = self.screen.predict(&features[..SCREEN_FEATURES]);
         let ranker = self.ranker.predict(features);
         let cell = &self.retrieval[retrieval_bucket(features)];
@@ -757,6 +763,11 @@ impl TasteModel {
         serde_json::to_vec(self)
     }
 
+    #[must_use]
+    pub fn strategy_names(&self) -> [&'static str; POTENTIAL_HEADS] {
+        self.strategies.map(RankingStrategy::name)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let model: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if model.screen.z.len() != SCREEN_FEATURES
@@ -768,11 +779,16 @@ impl TasteModel {
                 .screen
                 .z
                 .iter()
-                .chain(&model.screen.n)
                 .chain(&model.ranker.z)
-                .chain(&model.ranker.n)
                 .flatten()
                 .any(|value| !value.is_finite())
+            || model
+                .screen
+                .n
+                .iter()
+                .chain(&model.ranker.n)
+                .flatten()
+                .any(|value| !value.is_finite() || *value < 0.0)
             || model.retrieval.iter().any(|cell| {
                 cell.targets
                     .iter()
@@ -790,6 +806,17 @@ impl TasteModel {
             self.encode()
                 .expect("serializing finite taste state cannot fail"),
         ))
+    }
+}
+
+impl RankingStrategy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Learned => "learned",
+            Self::DependencyLight => "dependency-light",
+            Self::HistoricalReuse => "historical-reuse",
+            Self::Uniform => "uniform",
+        }
     }
 }
 
@@ -1149,6 +1176,18 @@ mod tests {
         let model = TasteModel::train(&examples, Treatment::Full);
         let mut value = serde_json::to_value(model).unwrap();
         value["retrieval"][0]["targets"][0] = serde_json::json!(2.0);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(TasteModel::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decoding_rejects_negative_ftrl_support() {
+        let examples = (0..8)
+            .map(|index| example(index, index >= 4))
+            .collect::<Vec<_>>();
+        let model = TasteModel::train(&examples, Treatment::Full);
+        let mut value = serde_json::to_value(model).unwrap();
+        value["ranker"]["n"][0][0] = serde_json::json!(-1.0);
         let bytes = serde_json::to_vec(&value).unwrap();
         assert!(TasteModel::decode(&bytes).is_err());
     }

@@ -67,6 +67,7 @@ struct RankedResult {
     ranking_wall_ns: u64,
     model_bytes: usize,
     model_sha256: String,
+    strategies: [&'static str; POTENTIAL_HEADS],
     mean_targets: [f32; POTENTIAL_HEADS],
 }
 
@@ -74,6 +75,8 @@ struct RankedResult {
 struct BaselineResult {
     baseline: &'static str,
     selected: usize,
+    ranking_wall_ns: u64,
+    ranking_cpu_ns: u64,
     mean_targets: [f32; POTENTIAL_HEADS],
 }
 
@@ -357,6 +360,11 @@ fn evaluate_treatment(
     }
     let ranking_wall_ns = duration_ns(rank_started.elapsed());
     let encoded = model.encode()?;
+    let strategies = if treatment == Treatment::NoModel {
+        ["uniform"; POTENTIAL_HEADS]
+    } else {
+        model.strategy_names()
+    };
     Ok(RankedResult {
         treatment: treatment_name(treatment).into(),
         selected: selected_union.len(),
@@ -365,6 +373,7 @@ fn evaluate_treatment(
         ranking_wall_ns,
         model_bytes: encoded.len(),
         model_sha256: model.content_sha256(),
+        strategies,
         mean_targets,
     })
 }
@@ -393,21 +402,26 @@ const fn treatment_name(treatment: Treatment) -> &'static str {
 }
 
 fn evaluate_baselines(examples: &[TemporalExample], limit: usize) -> Vec<BaselineResult> {
-    let uniform = uniform(examples, limit);
-    let dependency_light = rank_by(examples, limit, |example| -example.features[1]);
-    let historical_reuse = rank_by(examples, limit, |example| example.features[2]);
-    [
-        ("uniform", uniform),
-        ("dependency-light", dependency_light),
-        ("historical-reuse", historical_reuse),
-    ]
-    .into_iter()
-    .map(|(baseline, selected)| BaselineResult {
-        baseline,
-        selected: selected.len(),
-        mean_targets: means(examples, &selected),
-    })
-    .collect()
+    ["uniform", "dependency-light", "historical-reuse"]
+        .into_iter()
+        .map(|baseline| {
+            let cpu = ProcessTime::now();
+            let started = Instant::now();
+            let selected = match baseline {
+                "uniform" => uniform(examples, limit),
+                "dependency-light" => rank_by(examples, limit, |example| -example.features[1]),
+                "historical-reuse" => rank_by(examples, limit, |example| example.features[2]),
+                _ => unreachable!("baseline list is exhaustive"),
+            };
+            BaselineResult {
+                baseline,
+                selected: selected.len(),
+                ranking_wall_ns: duration_ns(started.elapsed()),
+                ranking_cpu_ns: duration_ns(cpu.elapsed()),
+                mean_targets: means(examples, &selected),
+            }
+        })
+        .collect()
 }
 
 fn uniform(examples: &[TemporalExample], limit: usize) -> Vec<usize> {
