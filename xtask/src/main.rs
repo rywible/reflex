@@ -20,6 +20,7 @@ mod build;
 mod causal;
 mod harness;
 mod lean;
+mod lean_audit;
 mod lean_taste;
 mod performance;
 mod scaling;
@@ -203,8 +204,16 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean_taste::run(&arguments)
         }
+        Some("lean-temporal-audit-freeze") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_audit::freeze(&arguments)
+        }
+        Some("lean-temporal-audit-lock") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_audit::lock(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock> [arguments]"
                 .into(),
         ),
     }
