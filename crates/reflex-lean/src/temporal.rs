@@ -540,15 +540,26 @@ impl TasteModel {
 
     #[must_use]
     pub fn rank(&self, examples: &[TemporalExample], limit: usize) -> Vec<usize> {
+        self.rank_for_head(examples, limit, PotentialHead::Anticipation)
+    }
+
+    #[must_use]
+    pub fn rank_for_head(
+        &self,
+        examples: &[TemporalExample],
+        limit: usize,
+        priority: PotentialHead,
+    ) -> Vec<usize> {
         if limit == 0 {
             return Vec::new();
         }
+        let priority_index = priority.index();
         let mut screened = examples
             .iter()
             .enumerate()
             .map(|(index, example)| {
                 let forecast = self.screen.predict(&example.features[..SCREEN_FEATURES]);
-                (index, economic_key(forecast, [0.0; POTENTIAL_HEADS]))
+                (index, directional_value(priority, forecast[priority_index]))
             })
             .collect::<Vec<_>>();
         let screen_limit = limit.saturating_mul(4).max(limit).min(screened.len());
@@ -559,30 +570,35 @@ impl TasteModel {
             .into_iter()
             .map(|(index, _)| {
                 let forecast = self.forecast(&examples[index].features);
-                let estimates = forecast.map(|head| head.estimate);
-                let uncertainty = forecast.map(|head| head.uncertainty);
-                (index, economic_key(estimates, uncertainty), uncertainty[0])
+                (
+                    index,
+                    conservative_value(priority, forecast[priority_index]),
+                    forecast,
+                )
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|left, right| {
             right
                 .1
                 .total_cmp(&left.1)
+                .then_with(|| compare_forecast_profiles(&left.2, &right.2, priority))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let exploration = limit.div_ceil(8).min(ranked.len());
+        let exploration = limit.div_ceil(8).min(examples.len());
         let mut selected = ranked
             .iter()
             .take(limit.saturating_sub(exploration))
             .map(|entry| entry.0)
             .collect::<Vec<_>>();
-        let mut uncertain = ranked
+        let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+        let mut protected = examples
             .iter()
-            .skip(limit.saturating_sub(exploration))
-            .copied()
+            .enumerate()
+            .filter(|(index, _)| !selected_set.contains(index))
+            .map(|(index, example)| (index, example.semantic_group))
             .collect::<Vec<_>>();
-        uncertain.sort_unstable_by(|left, right| right.2.total_cmp(&left.2));
-        selected.extend(uncertain.into_iter().take(exploration).map(|entry| entry.0));
+        protected.sort_unstable_by_key(|entry| entry.1);
+        selected.extend(protected.into_iter().take(exploration).map(|entry| entry.0));
         selected
     }
 
@@ -684,11 +700,46 @@ fn sigmoid(value: f32) -> f32 {
     }
 }
 
-fn economic_key(estimates: [f32; POTENTIAL_HEADS], uncertainty: [f32; POTENTIAL_HEADS]) -> f32 {
-    let positive = estimates[0] + estimates[1] + estimates[2] + estimates[3] + estimates[4];
-    let cost = estimates[5] + estimates[6];
-    let confidence_penalty = uncertainty.iter().sum::<f32>() / 7.0;
-    positive - cost - confidence_penalty
+fn directional_value(head: PotentialHead, estimate: f32) -> f32 {
+    if matches!(
+        head,
+        PotentialHead::VerificationCost | PotentialHead::DeadEnd
+    ) {
+        -estimate
+    } else {
+        estimate
+    }
+}
+
+fn conservative_value(head: PotentialHead, forecast: PotentialForecast) -> f32 {
+    if matches!(
+        head,
+        PotentialHead::VerificationCost | PotentialHead::DeadEnd
+    ) {
+        -(forecast.estimate + forecast.uncertainty)
+    } else {
+        forecast.estimate - forecast.uncertainty
+    }
+}
+
+fn compare_forecast_profiles(
+    left: &[PotentialForecast; POTENTIAL_HEADS],
+    right: &[PotentialForecast; POTENTIAL_HEADS],
+    priority: PotentialHead,
+) -> std::cmp::Ordering {
+    for head in std::iter::once(priority).chain(
+        PotentialHead::ALL
+            .into_iter()
+            .filter(|head| *head != priority),
+    ) {
+        let index = head.index();
+        let ordering = conservative_value(head, right[index])
+            .total_cmp(&conservative_value(head, left[index]));
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn select_prefix<T>(

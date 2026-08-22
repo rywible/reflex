@@ -186,10 +186,12 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
     .collect::<Result<Vec<_>, AnyError>>()?;
     let baselines = evaluate_baselines(&selection_examples, ranking_limit);
     let virtual_best_mean_targets = std::array::from_fn(|head| {
-        baselines
-            .iter()
-            .map(|baseline| baseline.mean_targets[head])
-            .fold(0.0_f32, f32::max)
+        let values = baselines.iter().map(|baseline| baseline.mean_targets[head]);
+        if head >= 5 {
+            values.fold(1.0_f32, f32::min)
+        } else {
+            values.fold(0.0_f32, f32::max)
+        }
     });
 
     let june_worker = LeanWorker::start(&june_config)?;
@@ -285,22 +287,29 @@ fn evaluate_treatment(
     let training_wall_ns = duration_ns(started.elapsed());
     let training_cpu_ns = duration_ns(cpu.elapsed());
     let rank_started = Instant::now();
-    let selected = if treatment == Treatment::NoModel {
-        uniform(selection, limit)
-    } else {
-        model.rank(selection, limit)
-    };
+    let mut selected_union = HashSet::new();
+    let mut mean_targets = [0.0; POTENTIAL_HEADS];
+    for head in PotentialHead::ALL {
+        let selected = if treatment == Treatment::NoModel {
+            uniform(selection, limit)
+        } else {
+            model.rank_for_head(selection, limit, head)
+        };
+        selected_union.extend(selected.iter().copied());
+        let index = head_index(head);
+        mean_targets[index] = means(selection, &selected)[index];
+    }
     let ranking_wall_ns = duration_ns(rank_started.elapsed());
     let encoded = model.encode()?;
     Ok(RankedResult {
         treatment: format!("{treatment:?}").to_ascii_lowercase(),
-        selected: selected.len(),
+        selected: selected_union.len(),
         training_wall_ns,
         training_cpu_ns,
         ranking_wall_ns,
         model_bytes: encoded.len(),
         model_sha256: model.content_sha256(),
-        mean_targets: means(selection, &selected),
+        mean_targets,
     })
 }
 
@@ -494,6 +503,18 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+const fn head_index(head: PotentialHead) -> usize {
+    match head {
+        PotentialHead::Anticipation => 0,
+        PotentialHead::Descendants => 1,
+        PotentialHead::Reuse => 2,
+        PotentialHead::Compression => 3,
+        PotentialHead::MigrationSurvival => 4,
+        PotentialHead::VerificationCost => 5,
+        PotentialHead::DeadEnd => 6,
+    }
 }
 
 #[allow(dead_code)]
