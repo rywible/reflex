@@ -25,6 +25,11 @@ pub struct CandidateFeatureComparison {
     pub model_bytes: usize,
     pub baseline_reproduces_champion: bool,
     pub structural_promotes_over_baseline: bool,
+    pub ranking_budgets: [usize; 7],
+    pub baseline_accepted_at_k: [usize; 7],
+    pub structural_accepted_at_k: [usize; 7],
+    pub evaluated_at_k: [usize; 7],
+    pub selection_accepted: usize,
 }
 
 /// Replays canonical Candidate structure from a retained Domain Bundle without

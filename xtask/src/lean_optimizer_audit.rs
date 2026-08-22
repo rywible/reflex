@@ -149,6 +149,11 @@ struct FeatureDevelopmentReport {
     model_bytes: usize,
     baseline_reproduces_champion: bool,
     structural_promotes_over_baseline: bool,
+    ranking_budgets: [usize; 7],
+    baseline_accepted_at_k: [usize; 7],
+    structural_accepted_at_k: [usize; 7],
+    evaluated_at_k: [usize; 7],
+    selection_accepted: usize,
     host: HostEnvironment,
     content_sha256: String,
 }
@@ -326,7 +331,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v3";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v4";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -388,6 +393,11 @@ pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
         model_bytes: comparison.model_bytes,
         baseline_reproduces_champion: comparison.baseline_reproduces_champion,
         structural_promotes_over_baseline: comparison.structural_promotes_over_baseline,
+        ranking_budgets: comparison.ranking_budgets,
+        baseline_accepted_at_k: comparison.baseline_accepted_at_k,
+        structural_accepted_at_k: comparison.structural_accepted_at_k,
+        evaluated_at_k: comparison.evaluated_at_k,
+        selection_accepted: comparison.selection_accepted,
         host,
         content_sha256: String::new(),
     };

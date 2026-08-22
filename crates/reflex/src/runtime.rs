@@ -20,7 +20,7 @@ use crate::instrumentation::{Phase, Recorder};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
-    LearningState, PotentialForecast, derive_targets,
+    LearningState, PotentialForecast, compare_forecasts, derive_targets,
 };
 use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
 use crate::resource::{ResidentReservation, ResourceEnvelopeGuard};
@@ -248,6 +248,11 @@ pub(crate) fn compare_candidate_features<D: DomainDefinition>(
         model_bytes: comparison.model_bytes,
         baseline_reproduces_champion: comparison.baseline_reproduces_champion,
         structural_promotes_over_baseline: comparison.structural_promotes,
+        ranking_budgets: comparison.ranking_budgets,
+        baseline_accepted_at_k: comparison.baseline_accepted_at_k,
+        structural_accepted_at_k: comparison.structural_accepted_at_k,
+        evaluated_at_k: comparison.evaluated_at_k,
+        selection_accepted: comparison.selection_accepted,
     })
 }
 
@@ -1743,34 +1748,6 @@ fn sort_prefix_by<T>(
         prefix.sort_unstable_by(compare);
         values.truncate(limit);
     }
-}
-
-fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Ordering {
-    for head in [0, 1, 2, 3, 4] {
-        let left_value = left.0[head].estimate
-            - left.0[head].uncertainty
-            - left.0[head].calibration_error * 0.25;
-        let right_value = right.0[head].estimate
-            - right.0[head].uncertainty
-            - right.0[head].calibration_error * 0.25;
-        let ordering = right_value.total_cmp(&left_value);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    for head in [6, 5] {
-        let left_value = left.0[head].estimate
-            + left.0[head].uncertainty
-            + left.0[head].calibration_error * 0.25;
-        let right_value = right.0[head].estimate
-            + right.0[head].uncertainty
-            + right.0[head].calibration_error * 0.25;
-        let ordering = left_value.total_cmp(&right_value);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
 }
 
 fn claim_digest<D: DomainDefinition>(

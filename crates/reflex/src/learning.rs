@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
@@ -119,6 +120,11 @@ pub(crate) struct PairedModelComparison {
     pub(crate) model_bytes: usize,
     pub(crate) baseline_reproduces_champion: bool,
     pub(crate) structural_promotes: bool,
+    pub(crate) ranking_budgets: [usize; 7],
+    pub(crate) baseline_accepted_at_k: [usize; 7],
+    pub(crate) structural_accepted_at_k: [usize; 7],
+    pub(crate) evaluated_at_k: [usize; 7],
+    pub(crate) selection_accepted: usize,
 }
 
 impl LearningState {
@@ -248,6 +254,14 @@ impl LearningState {
         let (structural_model, structural_training_cpu) = train(&structural_replay);
         let baseline_loss = losses(&baseline_model, &baseline_selection);
         let structural_loss = losses(&structural_model, &structural_selection);
+        let baseline_ranking = accepted_ranking(&baseline_model, baseline_attempts, &self.roles);
+        let structural_ranking =
+            accepted_ranking(&structural_model, structural_attempts, &self.roles);
+        if baseline_ranking.evaluated_at_k != structural_ranking.evaluated_at_k
+            || baseline_ranking.total_accepted != structural_ranking.total_accepted
+        {
+            return Err(());
+        }
         let replay_claims = baseline_replay
             .iter()
             .map(|example| example.corpus_key)
@@ -274,6 +288,11 @@ impl LearningState {
                 .is_some_and(|champion| champion.encode() == baseline_model.encode()),
             structural_promotes: promotion_from_losses(baseline_loss, structural_loss)
                 == PromotionDecision::Promote,
+            ranking_budgets: RANKING_BUDGETS,
+            baseline_accepted_at_k: baseline_ranking.accepted_at_k,
+            structural_accepted_at_k: structural_ranking.accepted_at_k,
+            evaluated_at_k: baseline_ranking.evaluated_at_k,
+            selection_accepted: baseline_ranking.total_accepted,
         })
     }
 
@@ -496,6 +515,93 @@ impl LearningState {
         }
         digest.finalize().into()
     }
+}
+
+#[cfg(feature = "internal-experiments")]
+const RANKING_BUDGETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+#[cfg(feature = "internal-experiments")]
+struct AcceptedRanking {
+    accepted_at_k: [usize; 7],
+    evaluated_at_k: [usize; 7],
+    total_accepted: usize,
+}
+
+#[cfg(feature = "internal-experiments")]
+fn accepted_ranking(
+    model: &FtrlModel,
+    attempts: &[AttemptObservation],
+    roles: &BTreeMap<[u8; 32], CorpusRole>,
+) -> AcceptedRanking {
+    let mut groups = BTreeMap::<[u8; 32], Vec<(&AttemptObservation, PotentialForecast)>>::new();
+    for attempt in attempts.iter().filter(|attempt| {
+        matches!(
+            roles.get(&attempt.claim),
+            Some(CorpusRole::Selection { .. })
+        )
+    }) {
+        groups
+            .entry(attempt.claim)
+            .or_default()
+            .push((attempt, model.forecast(attempt.features)));
+    }
+    let mut accepted_at_k = [0_usize; 7];
+    let mut evaluated_at_k = [0_usize; 7];
+    let mut total_accepted = 0_usize;
+    for attempts in groups.values_mut() {
+        attempts.sort_unstable_by(|(left, left_forecast), (right, right_forecast)| {
+            compare_forecasts(*left_forecast, *right_forecast).then_with(|| left.id.cmp(&right.id))
+        });
+        total_accepted = total_accepted.saturating_add(
+            attempts
+                .iter()
+                .filter(|(attempt, _)| attempt.verdict == VerdictTarget::Accepted)
+                .count(),
+        );
+        for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
+            let count = attempts.len().min(budget);
+            evaluated_at_k[index] = evaluated_at_k[index].saturating_add(count);
+            accepted_at_k[index] = accepted_at_k[index].saturating_add(
+                attempts[..count]
+                    .iter()
+                    .filter(|(attempt, _)| attempt.verdict == VerdictTarget::Accepted)
+                    .count(),
+            );
+        }
+    }
+    AcceptedRanking {
+        accepted_at_k,
+        evaluated_at_k,
+        total_accepted,
+    }
+}
+
+pub(crate) fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Ordering {
+    for head in [0, 1, 2, 3, 4] {
+        let left_value = left.0[head].estimate
+            - left.0[head].uncertainty
+            - left.0[head].calibration_error * 0.25;
+        let right_value = right.0[head].estimate
+            - right.0[head].uncertainty
+            - right.0[head].calibration_error * 0.25;
+        let ordering = right_value.total_cmp(&left_value);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    for head in [6, 5] {
+        let left_value = left.0[head].estimate
+            + left.0[head].uncertainty
+            + left.0[head].calibration_error * 0.25;
+        let right_value = right.0[head].estimate
+            + right.0[head].uncertainty
+            + right.0[head].calibration_error * 0.25;
+        let ordering = left_value.total_cmp(&right_value);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 impl FtrlModel {
