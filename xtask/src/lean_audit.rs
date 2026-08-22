@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use cpu_time::ProcessTime;
-use reflex_lean::ast::LeanName;
 use reflex_lean::catalog::LeanCatalog;
 use reflex_lean::temporal::{
     POTENTIAL_HEADS, PotentialHead, TasteModel, TemporalExample, TemporalPair, TemporalSnapshot,
@@ -90,6 +89,7 @@ struct Protocol {
     critique_items: usize,
     stopping_rule: &'static str,
     promotion_rule: &'static str,
+    causal_ablation_rule: &'static str,
     time_to_utility_rule: &'static str,
     no_regression_rule: &'static str,
     recovery_rule: &'static str,
@@ -109,8 +109,8 @@ struct PairSummary {
 
 #[derive(Clone, Serialize)]
 struct FrozenCandidate {
-    declaration: LeanName,
-    module: LeanName,
+    declaration: String,
+    module: String,
     semantic_family: String,
 }
 
@@ -121,8 +121,8 @@ struct FrozenRanking {
     model_bytes: usize,
     training_wall_ns: u64,
     training_cpu_ns: u64,
-    ranking_wall_ns: u64,
-    ranking_cpu_ns: u64,
+    ranking_wall_ns: [u64; POTENTIAL_HEADS],
+    ranking_cpu_ns: [u64; POTENTIAL_HEADS],
     strategies: [&'static str; POTENTIAL_HEADS],
     heads: [Vec<FrozenCandidate>; POTENTIAL_HEADS],
 }
@@ -221,7 +221,14 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&arguments.output, serde_json::to_vec_pretty(&manifest)?)?;
-    println!("{}", serde_json::to_string(&manifest)?);
+    println!(
+        "protocol_sha256={} content_sha256={} candidate_set_sha256={} candidates={} durable_bytes={}",
+        manifest.protocol_sha256,
+        manifest.content_sha256,
+        manifest.candidate_set_sha256,
+        manifest.candidate_examples,
+        std::fs::metadata(&arguments.output)?.len()
+    );
     Ok(())
 }
 
@@ -266,7 +273,10 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&arguments.output, serde_json::to_vec_pretty(&lock)?)?;
-    println!("{}", serde_json::to_string(&lock)?);
+    println!(
+        "content_sha256={} audit_mathlib_commit={} freeze_manifest_file_sha256={}",
+        lock.content_sha256, lock.mathlib_commit, lock.freeze_manifest_file_sha256
+    );
     Ok(())
 }
 
@@ -311,7 +321,8 @@ fn frozen_protocol() -> Protocol {
         critique_items: 32,
         stopping_rule: "carry the final anytime value forward after all 256 frozen candidates for a head are exhausted; never burn CPU to fill a checkpoint",
         promotion_rule: "Full weakly improves every head versus the virtual-best baseline and strictly improves at least one",
-        time_to_utility_rule: "geometric-mean CPU time-to-matched baseline utility at least 10x with simultaneous 99% lower bound above 3x",
+        causal_ablation_rule: "Full weakly improves every head and strictly improves at least one head versus each registered learned-system ablation",
+        time_to_utility_rule: "for each head use the lower of Full and virtual-best final directional utility over 16 kernel-replayed candidates as the common target; CPU includes frozen training, ranking, fetch, and kernel replay; require geometric-mean baseline/Full time at least 10x with simultaneous 99% lower bound above 3x",
         no_regression_rule: "zero regression in kernel migration, protected elegance measurements, recovery, or resource limits",
         recovery_rule: "cold reconstruction reproduces every mechanical decision and kernel certificate hash",
         audit_snapshot_rule: "latest mathlib commit with commit timestamp strictly before 2026-07-01T00:00:00Z; exact commit and Lean pin locked before checkout",
@@ -331,18 +342,22 @@ fn freeze_treatment(
     let model = TasteModel::train(experience, treatment);
     let training_wall_ns = duration_ns(training_started.elapsed());
     let training_cpu_ns = duration_ns(training_cpu.elapsed());
-    let ranking_cpu = ProcessTime::now();
-    let ranking_started = Instant::now();
-    let heads = PotentialHead::ALL.map(|head| {
+    let mut ranking_wall_ns = [0; POTENTIAL_HEADS];
+    let mut ranking_cpu_ns = [0; POTENTIAL_HEADS];
+    let heads = std::array::from_fn(|index| {
+        let head = PotentialHead::ALL[index];
+        let ranking_cpu = ProcessTime::now();
+        let ranking_started = Instant::now();
         let indexes = if treatment == Treatment::NoModel {
             baseline_indexes(candidates, "uniform")
         } else {
             model.rank_for_head(candidates, CANDIDATES_PER_HEAD, head)
         };
-        freeze_candidates(candidates, &indexes)
+        let frozen = freeze_candidates(candidates, &indexes);
+        ranking_wall_ns[index] = duration_ns(ranking_started.elapsed());
+        ranking_cpu_ns[index] = duration_ns(ranking_cpu.elapsed());
+        frozen
     });
-    let ranking_wall_ns = duration_ns(ranking_started.elapsed());
-    let ranking_cpu_ns = duration_ns(ranking_cpu.elapsed());
     let encoded = model.encode()?;
     Ok(FrozenRanking {
         treatment: name,
@@ -372,8 +387,8 @@ fn freeze_baseline(name: &'static str, candidates: &[TemporalExample]) -> Frozen
         model_bytes: 0,
         training_wall_ns: 0,
         training_cpu_ns: 0,
-        ranking_wall_ns: duration_ns(ranking_started.elapsed()),
-        ranking_cpu_ns: duration_ns(ranking_cpu.elapsed()),
+        ranking_wall_ns: [duration_ns(ranking_started.elapsed()); POTENTIAL_HEADS],
+        ranking_cpu_ns: [duration_ns(ranking_cpu.elapsed()); POTENTIAL_HEADS],
         strategies: [name; POTENTIAL_HEADS],
         heads: std::array::from_fn(|_| frozen.clone()),
     }
@@ -405,8 +420,8 @@ fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<Fro
         .map(|index| {
             let example = &examples[*index];
             FrozenCandidate {
-                declaration: example.declaration.clone(),
-                module: example.module.clone(),
+                declaration: example.declaration.to_string(),
+                module: example.module.to_string(),
                 semantic_family: hex(&example.semantic_group),
             }
         })

@@ -1,0 +1,1451 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::Instant;
+
+use reflex_lean::ast::LeanName;
+use reflex_lean::catalog::LeanCatalog;
+use reflex_lean::temporal::{
+    POTENTIAL_HEADS, RelationshipKind, TemporalPair, TemporalSnapshot, certify_relationship,
+    consolidate_certificates, migrate_theorems,
+};
+use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig};
+use reflex_lean::{LeanSnapshotPin, temporal::RelationshipCandidate};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::harness::{
+    AnyError, HostEnvironment, duration_ns, environment, hash_file, hash_json,
+    peak_process_resident_bytes, require_absent, require_clean, require_release,
+};
+
+const SCHEMA: &str = "reflex-lean-temporal-audit-result-v1";
+const FREEZE_SCHEMA: &str = "reflex-lean-temporal-audit-freeze-v1";
+const LOCK_SCHEMA: &str = "reflex-lean-temporal-audit-lock-v1";
+const REPLAY_PER_HEAD: usize = 16;
+const RELATIONSHIP_LIMIT: usize = 64;
+
+struct Arguments {
+    manifest: PathBuf,
+    lock: PathBuf,
+    lake: PathBuf,
+    december_root: PathBuf,
+    december_catalog: PathBuf,
+    audit_root: PathBuf,
+    audit_catalog: PathBuf,
+    output: PathBuf,
+    critique_packet: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+struct Candidate {
+    declaration: String,
+    module: String,
+    semantic_family: String,
+}
+
+#[derive(Deserialize)]
+struct Ranking {
+    treatment: String,
+    training_cpu_ns: u64,
+    #[serde(rename = "ranking_cpu_ns")]
+    selection_cpu_ns: [u64; POTENTIAL_HEADS],
+    heads: [Vec<Candidate>; POTENTIAL_HEADS],
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    schema: String,
+    protocol_sha256: String,
+    catalog_sha256: [String; 3],
+    candidate_set_sha256: String,
+    rankings: Vec<Ranking>,
+    content_sha256: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct Lock {
+    schema: String,
+    status: String,
+    freeze_manifest_file_sha256: String,
+    freeze_manifest_content_sha256: String,
+    protocol_sha256: String,
+    candidate_set_sha256: String,
+    audit_boundary: String,
+    mathlib_commit: String,
+    lean_toolchain: String,
+    lean_toolchain_alias: String,
+    lean_version: String,
+    lean_commit: String,
+    checkout_access: String,
+    host: LockedHostEnvironment,
+    content_sha256: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct LockedHostEnvironment {
+    git_revision: String,
+    git_dirty: bool,
+    rustc: String,
+    cargo: String,
+    build_profile: String,
+    rustflags: String,
+    target_features: String,
+    target_arch: String,
+    target_os: String,
+    cpu_description: String,
+    available_parallelism: usize,
+}
+
+#[derive(Serialize)]
+struct HeadOutcome {
+    head: &'static str,
+    selected: usize,
+    missing: usize,
+    raw_mean: f64,
+    directional_utility: f64,
+}
+
+#[derive(Serialize)]
+struct TreatmentOutcome {
+    treatment: String,
+    heads: Vec<HeadOutcome>,
+}
+
+#[derive(Serialize)]
+struct ParetoOutcome {
+    head: &'static str,
+    full: f64,
+    virtual_best_baseline: f64,
+    difference: f64,
+    simultaneous_lower_bound_99: f64,
+    baseline: String,
+}
+
+#[derive(Serialize)]
+struct AblationOutcome {
+    treatment: String,
+    full_wins: usize,
+    ties: usize,
+    full_losses: usize,
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct TimeToUtilityOutcome {
+    head: &'static str,
+    common_target: f64,
+    full_cpu_ns: Option<u64>,
+    virtual_best_baseline_cpu_ns: Option<u64>,
+    baseline: String,
+    speedup: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct TimeGate {
+    heads: Vec<TimeToUtilityOutcome>,
+    geometric_mean_speedup: Option<f64>,
+    point_gate_passed: bool,
+    interval_gate_evaluated: bool,
+    simultaneous_lower_bound_99: Option<f64>,
+    passed: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ReplayRecord {
+    treatment: String,
+    head: &'static str,
+    rank: usize,
+    declaration: String,
+    module: String,
+    semantic_family: String,
+    accepted: bool,
+    diagnostic: String,
+    kernel_evidence_sha256: String,
+    cumulative_cpu_upper_bound_ns: u64,
+    proof_nodes: usize,
+    proof_depth: usize,
+    encoded_bytes: usize,
+    dependencies: usize,
+    axioms: usize,
+}
+
+#[derive(Serialize)]
+struct ReplaySummary {
+    attempted: usize,
+    accepted: usize,
+    rejected: usize,
+    cold_recovery_attempted: usize,
+    cold_recovery_decisions_matched: usize,
+    cold_recovery_evidence_matched: usize,
+    records: Vec<ReplayRecord>,
+}
+
+#[derive(Serialize)]
+struct RelationshipSummary {
+    attempted: usize,
+    certified: usize,
+    rejected_or_unavailable: usize,
+    exact: usize,
+    definitional: usize,
+    specialization: usize,
+    derivation: usize,
+    family_collapse: usize,
+    corpus_compression: usize,
+    proof_nodes_removed: usize,
+}
+
+struct RelationshipEvaluation {
+    summary: RelationshipSummary,
+    critique: HashMap<String, Vec<CritiqueRelationship>>,
+    kernel_calls: usize,
+    kernel_cpu_upper_bound_ns: u64,
+}
+
+#[derive(Serialize)]
+struct Economics {
+    wall_ns: u64,
+    controller_cpu_ns: u64,
+    controller_peak_resident_bytes: u64,
+    combined_resident_upper_bound_bytes: u64,
+    catalog_durable_bytes: [u64; 2],
+    result_durable_bytes: usize,
+    kernel_calls: usize,
+    kernel_cpu_upper_bound_ns: u64,
+    verifier_lifetime_cpu_upper_bound_ns: u64,
+}
+
+#[derive(Serialize)]
+struct AnytimeCheckpoint {
+    cpu_seconds: u64,
+    candidates_exhausted: bool,
+    outcome_reference: &'static str,
+}
+
+#[derive(Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the sealed report retains independent scientific gates rather than collapsing state"
+)]
+struct Report {
+    schema: &'static str,
+    status: &'static str,
+    mechanical_results_sealed: bool,
+    mechanical_gate_passed: bool,
+    confirmed: bool,
+    protocol_sha256: String,
+    freeze_manifest_file_sha256: String,
+    freeze_manifest_content_sha256: String,
+    audit_lock_content_sha256: String,
+    execution_receipt_file_sha256: String,
+    candidate_set_sha256: String,
+    december_catalog_sha256: String,
+    audit_catalog_sha256: String,
+    audit_mathlib_commit: String,
+    audit_lean_commit: String,
+    audit_examples: usize,
+    audit_new_declarations: usize,
+    outcomes: Vec<TreatmentOutcome>,
+    pareto: Vec<ParetoOutcome>,
+    pareto_dominates: bool,
+    causal_ablations: Vec<AblationOutcome>,
+    causal_ablations_passed: bool,
+    anytime: Vec<AnytimeCheckpoint>,
+    time_to_utility: TimeGate,
+    replay: ReplaySummary,
+    relationships: RelationshipSummary,
+    economics: Economics,
+    host: HostEnvironment,
+    protocol_deviations: Vec<String>,
+    content_sha256: String,
+}
+
+#[derive(Serialize)]
+struct CritiqueItem {
+    blinded_id: String,
+    declaration: String,
+    module: String,
+    semantic_family: String,
+    proof_nodes: usize,
+    proof_depth: usize,
+    dependencies: usize,
+    target_profile: [f32; POTENTIAL_HEADS],
+    certified_future_relationships: Vec<CritiqueRelationship>,
+}
+
+#[derive(Clone, Serialize)]
+struct CritiqueRelationship {
+    kind: RelationshipKind,
+    later_declaration: String,
+    proof_nodes_removed: usize,
+}
+
+#[derive(Serialize)]
+struct CritiquePacket {
+    schema: &'static str,
+    status: &'static str,
+    mechanical_report_file_sha256: String,
+    instructions: &'static str,
+    items: Vec<CritiqueItem>,
+    content_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ExecutionReceipt<'a> {
+    schema: &'static str,
+    status: &'static str,
+    protocol_sha256: &'a str,
+    freeze_manifest_file_sha256: &'a str,
+    audit_lock_content_sha256: &'a str,
+    git_revision: &'a str,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the one-shot audit controller keeps exposure, sealing, replay, and resource gates visibly ordered"
+)]
+pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
+    require_release("lean-temporal-audit-confirm")?;
+    let run_started = Instant::now();
+    let run_cpu = cpu_time::ProcessTime::now();
+    let host = environment()?;
+    require_clean(&host, SCHEMA)?;
+    let arguments = parse(arguments)?;
+    for (path, description) in [
+        (&arguments.audit_catalog, "Lean Temporal Audit catalog"),
+        (&arguments.output, "Lean Temporal Audit result"),
+        (
+            &arguments.critique_packet,
+            "blinded mathematical critique packet",
+        ),
+    ] {
+        require_absent(path, description)?;
+    }
+    let manifest_bytes = std::fs::read(&arguments.manifest)?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+    let lock: Lock = serde_json::from_slice(&std::fs::read(&arguments.lock)?)?;
+    validate_inputs(&arguments, &manifest, &lock)?;
+    let receipt_path = arguments.output.with_extension("started.json");
+    require_absent(&receipt_path, "Lean Temporal Audit execution receipt")?;
+    let receipt = ExecutionReceipt {
+        schema: "reflex-lean-temporal-audit-execution-v1",
+        status: "audit exposure started; this receipt is never replaced",
+        protocol_sha256: &manifest.protocol_sha256,
+        freeze_manifest_file_sha256: &lock.freeze_manifest_file_sha256,
+        audit_lock_content_sha256: &lock.content_sha256,
+        git_revision: &host.git_revision,
+    };
+    if let Some(parent) = receipt_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let receipt_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)?;
+    serde_json::to_writer_pretty(receipt_file, &receipt)?;
+    let execution_receipt_file_sha256 = hash_file(&receipt_path)?;
+
+    let december_catalog = LeanCatalog::load(&arguments.december_catalog)?;
+    if december_catalog.content_sha256() != manifest.catalog_sha256[2] {
+        return Err("December catalog differs from the frozen manifest".into());
+    }
+    let audit_config = LeanWorkerConfig::for_snapshot(
+        &arguments.lake,
+        &arguments.audit_root,
+        LeanSnapshotPin::new(
+            lock.mathlib_commit.clone(),
+            lock.lean_toolchain.clone(),
+            lock.lean_toolchain_alias.clone(),
+            lock.lean_version.clone(),
+            lock.lean_commit.clone(),
+        ),
+    );
+    let primary_workers_started = Instant::now();
+    let audit_worker = LeanWorker::start(&audit_config)?;
+    let audit_catalog = LeanCatalog::build(&audit_worker, 4096)?;
+    audit_catalog.save_new(&arguments.audit_catalog)?;
+    let december = TemporalSnapshot::from_catalog(&december_catalog);
+    let audit = TemporalSnapshot::from_catalog(&audit_catalog);
+    let pair = TemporalPair::derive(&december, &audit)?;
+    let targets = pair
+        .examples
+        .iter()
+        .map(|example| (example.declaration.to_string(), example.targets))
+        .collect::<HashMap<_, _>>();
+    let outcomes = evaluate(&manifest.rankings, &targets);
+    let pareto = pareto_outcomes(&outcomes, &manifest.rankings, &targets)?;
+    let pareto_dominates = pareto.iter().all(|outcome| outcome.difference >= 0.0)
+        && pareto.iter().any(|outcome| outcome.difference > 0.0)
+        && pareto
+            .iter()
+            .all(|outcome| outcome.simultaneous_lower_bound_99 >= 0.0);
+    let causal_ablations = ablation_outcomes(&outcomes)?;
+    let causal_ablations_passed = causal_ablations.iter().all(|outcome| outcome.passed);
+
+    let verifier_resident = 2 * reflex_lean::worker::DEFAULT_WORKER_RESIDENT_BYTES;
+    if peak_process_resident_bytes().saturating_add(verifier_resident) > 48 * 1024 * 1024 * 1024 {
+        return Err("Lean Temporal Audit cannot start the second verifier inside 48 GiB".into());
+    }
+    let december_worker = LeanWorker::start(&LeanWorkerConfig::pinned(
+        &arguments.lake,
+        &arguments.december_root,
+    ))?;
+    let (records, sources, kernel_calls, kernel_cpu_upper_bound_ns) =
+        replay_rankings(&manifest.rankings, &december_worker, &audit_worker)?;
+    let time_to_utility = time_gate(&records, &targets);
+    let relationship_evaluation = certify_selected_relationships(
+        &manifest.rankings,
+        &pair.relationship_candidates,
+        &december_worker,
+        &audit_worker,
+    )?;
+    drop(december_worker);
+    drop(audit_worker);
+    let primary_workers_wall_ns = duration_ns(primary_workers_started.elapsed());
+
+    let recovery_started = Instant::now();
+    let recovered = LeanWorker::start(&audit_config)?;
+    let (recovery, recovery_usage) = migrate_theorems(&sources, &recovered)?;
+    let expected = records
+        .iter()
+        .map(|record| (record.declaration.as_str(), record.accepted))
+        .collect::<HashMap<_, _>>();
+    let recovered_names = recovery
+        .migrated
+        .iter()
+        .map(|theorem| theorem.name.to_string())
+        .collect::<HashSet<_>>();
+    let cold_recovery_decisions_matched = sources
+        .iter()
+        .filter(|source| {
+            let name = source.name.to_string();
+            recovered_names.contains(&name) == expected.get(name.as_str()).copied().unwrap_or(false)
+        })
+        .count();
+    let mut recovered_evidence = HashMap::new();
+    for theorem in &recovery.migrated {
+        recovered_evidence.insert(
+            theorem.name.to_string(),
+            migration_evidence_hash(&theorem.name.to_string(), Some(theorem), "")?,
+        );
+    }
+    for failure in &recovery.failures {
+        recovered_evidence.insert(
+            failure.declaration.to_string(),
+            migration_evidence_hash(&failure.declaration.to_string(), None, &failure.diagnostic)?,
+        );
+    }
+    let expected_evidence = records
+        .iter()
+        .map(|record| {
+            (
+                record.declaration.as_str(),
+                record.kernel_evidence_sha256.as_str(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let cold_recovery_evidence_matched = sources
+        .iter()
+        .filter(|source| {
+            let name = source.name.to_string();
+            recovered_evidence.get(&name).map(String::as_str)
+                == expected_evidence.get(name.as_str()).copied()
+        })
+        .count();
+    drop(recovered);
+    let recovery_worker_wall_ns = duration_ns(recovery_started.elapsed());
+
+    let replay = ReplaySummary {
+        attempted: records.len(),
+        accepted: records.iter().filter(|record| record.accepted).count(),
+        rejected: records.iter().filter(|record| !record.accepted).count(),
+        cold_recovery_attempted: sources.len(),
+        cold_recovery_decisions_matched,
+        cold_recovery_evidence_matched,
+        records,
+    };
+    let controller_peak = peak_process_resident_bytes();
+    let combined_resident_upper_bound_bytes = controller_peak.saturating_add(verifier_resident);
+    let no_regression = replay.rejected == 0
+        && replay.cold_recovery_attempted == replay.cold_recovery_decisions_matched
+        && replay.cold_recovery_attempted == replay.cold_recovery_evidence_matched
+        && combined_resident_upper_bound_bytes <= 48 * 1024 * 1024 * 1024;
+    let mechanical_gate_passed =
+        pareto_dominates && causal_ablations_passed && time_to_utility.passed && no_regression;
+    let critique_items = build_critique_items(
+        &manifest.rankings,
+        &sources,
+        &targets,
+        &relationship_evaluation.critique,
+    )?;
+    let mut report = Report {
+        schema: SCHEMA,
+        status: "mechanical-results-sealed; mathematical-critique-pending",
+        mechanical_results_sealed: true,
+        mechanical_gate_passed,
+        confirmed: false,
+        protocol_sha256: manifest.protocol_sha256,
+        freeze_manifest_file_sha256: lock.freeze_manifest_file_sha256,
+        freeze_manifest_content_sha256: manifest.content_sha256,
+        audit_lock_content_sha256: lock.content_sha256,
+        execution_receipt_file_sha256,
+        candidate_set_sha256: manifest.candidate_set_sha256,
+        december_catalog_sha256: december_catalog.content_sha256().into(),
+        audit_catalog_sha256: audit_catalog.content_sha256().into(),
+        audit_mathlib_commit: lock.mathlib_commit,
+        audit_lean_commit: lock.lean_commit,
+        audit_examples: pair.examples.len(),
+        audit_new_declarations: pair.later_new_declarations,
+        outcomes,
+        pareto,
+        pareto_dominates,
+        causal_ablations,
+        causal_ablations_passed,
+        anytime: [3_600, 14_400, 57_600, 230_400]
+            .into_iter()
+            .map(|cpu_seconds| AnytimeCheckpoint {
+                cpu_seconds,
+                candidates_exhausted: true,
+                outcome_reference: "final frozen-candidate outcomes",
+            })
+            .collect(),
+        time_to_utility,
+        replay,
+        relationships: relationship_evaluation.summary,
+        economics: Economics {
+            wall_ns: duration_ns(run_started.elapsed()),
+            controller_cpu_ns: duration_ns(run_cpu.elapsed()),
+            controller_peak_resident_bytes: controller_peak,
+            combined_resident_upper_bound_bytes,
+            catalog_durable_bytes: [
+                std::fs::metadata(&arguments.december_catalog)?.len(),
+                std::fs::metadata(&arguments.audit_catalog)?.len(),
+            ],
+            result_durable_bytes: 0,
+            kernel_calls: kernel_calls + relationship_evaluation.kernel_calls + 1,
+            kernel_cpu_upper_bound_ns: kernel_cpu_upper_bound_ns
+                .saturating_add(relationship_evaluation.kernel_cpu_upper_bound_ns)
+                .saturating_add(duration_ns(recovery_usage.cpu_upper_bound)),
+            verifier_lifetime_cpu_upper_bound_ns: primary_workers_wall_ns
+                .saturating_mul(2)
+                .saturating_add(recovery_worker_wall_ns),
+        },
+        host,
+        protocol_deviations: Vec::new(),
+        content_sha256: String::new(),
+    };
+    let encoded = finalize_report(&mut report)?;
+    if let Some(parent) = arguments.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&arguments.output, encoded)?;
+    let report_file_sha256 = hash_file(&arguments.output)?;
+    write_critique_packet(
+        &arguments.critique_packet,
+        &report_file_sha256,
+        critique_items,
+    )?;
+    println!(
+        "mechanical_gate_passed={} pareto_dominates={} report_sha256={} audit_catalog_sha256={}",
+        report.mechanical_gate_passed,
+        report.pareto_dominates,
+        report_file_sha256,
+        report.audit_catalog_sha256
+    );
+    Ok(())
+}
+
+fn validate_inputs(
+    arguments: &Arguments,
+    manifest: &Manifest,
+    lock: &Lock,
+) -> Result<(), AnyError> {
+    if manifest.schema != FREEZE_SCHEMA || lock.schema != LOCK_SCHEMA {
+        return Err("Lean Temporal Audit manifest or lock schema differs".into());
+    }
+    if hash_file(&arguments.manifest)? != lock.freeze_manifest_file_sha256
+        || manifest.content_sha256 != lock.freeze_manifest_content_sha256
+        || manifest.protocol_sha256 != lock.protocol_sha256
+        || manifest.candidate_set_sha256 != lock.candidate_set_sha256
+    {
+        return Err("Lean Temporal Audit manifest does not match its committed lock".into());
+    }
+    if lock.content_sha256.is_empty() {
+        return Err("Lean Temporal Audit lock has no content identity".into());
+    }
+    let mut unhashed_lock = lock.clone();
+    let expected_lock_hash = std::mem::take(&mut unhashed_lock.content_sha256);
+    if hash_json(&unhashed_lock)? != expected_lock_hash {
+        return Err("Lean Temporal Audit lock content identity differs".into());
+    }
+    Ok(())
+}
+
+fn evaluate(
+    rankings: &[Ranking],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> Vec<TreatmentOutcome> {
+    rankings
+        .iter()
+        .map(|ranking| TreatmentOutcome {
+            treatment: ranking.treatment.clone(),
+            heads: ranking
+                .heads
+                .iter()
+                .enumerate()
+                .map(|(head, candidates)| {
+                    let values = candidates
+                        .iter()
+                        .map(|candidate| {
+                            targets.get(&candidate.declaration).map_or_else(
+                                || if head >= 5 { 1.0 } else { 0.0 },
+                                |targets| f64::from(targets[head]),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let raw_mean = mean(&values);
+                    HeadOutcome {
+                        head: head_name(head),
+                        selected: candidates
+                            .iter()
+                            .filter(|candidate| targets.contains_key(&candidate.declaration))
+                            .count(),
+                        missing: candidates
+                            .iter()
+                            .filter(|candidate| !targets.contains_key(&candidate.declaration))
+                            .count(),
+                        raw_mean,
+                        directional_utility: directional(head, raw_mean),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn ablation_outcomes(outcomes: &[TreatmentOutcome]) -> Result<Vec<AblationOutcome>, AnyError> {
+    let full = outcomes
+        .iter()
+        .find(|outcome| outcome.treatment == "full")
+        .ok_or("frozen rankings omit Full")?;
+    Ok(outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.treatment.as_str(),
+                "bootstrap" | "no-model" | "no-consolidation" | "immediate-only"
+            )
+        })
+        .map(|ablation| {
+            let mut full_wins = 0;
+            let mut ties = 0;
+            let mut full_losses = 0;
+            for (full, ablated) in full.heads.iter().zip(&ablation.heads) {
+                match full
+                    .directional_utility
+                    .total_cmp(&ablated.directional_utility)
+                {
+                    std::cmp::Ordering::Greater => full_wins += 1,
+                    std::cmp::Ordering::Equal => ties += 1,
+                    std::cmp::Ordering::Less => full_losses += 1,
+                }
+            }
+            AblationOutcome {
+                treatment: ablation.treatment.clone(),
+                full_wins,
+                ties,
+                full_losses,
+                passed: full_losses == 0 && full_wins != 0,
+            }
+        })
+        .collect())
+}
+
+fn pareto_outcomes(
+    outcomes: &[TreatmentOutcome],
+    rankings: &[Ranking],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> Result<Vec<ParetoOutcome>, AnyError> {
+    let full = outcomes
+        .iter()
+        .find(|outcome| outcome.treatment == "full")
+        .ok_or("frozen rankings omit Full")?;
+    let baselines = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.treatment.as_str(),
+                "uniform" | "dependency-light" | "historical-reuse"
+            )
+        })
+        .collect::<Vec<_>>();
+    let full_ranking = rankings
+        .iter()
+        .find(|ranking| ranking.treatment == "full")
+        .ok_or("frozen rankings omit Full candidates")?;
+    let baseline_rankings = ["uniform", "dependency-light", "historical-reuse"].map(|name| {
+        rankings
+            .iter()
+            .find(|ranking| ranking.treatment == name)
+            .expect("three frozen baseline rankings exist")
+    });
+    let mut lower_bounds = std::array::from_fn::<_, POTENTIAL_HEADS, _>(|_| [0.0; 3]);
+    for (head, head_bounds) in lower_bounds.iter_mut().enumerate() {
+        for (baseline, ranking) in baseline_rankings.iter().enumerate() {
+            head_bounds[baseline] = clustered_difference_lower_bound(
+                &full_ranking.heads[head],
+                &ranking.heads[head],
+                head,
+                targets,
+            );
+        }
+    }
+    Ok((0..POTENTIAL_HEADS)
+        .map(|head| {
+            let best = baselines
+                .iter()
+                .max_by(|left, right| {
+                    left.heads[head]
+                        .directional_utility
+                        .total_cmp(&right.heads[head].directional_utility)
+                })
+                .expect("three frozen baselines exist");
+            ParetoOutcome {
+                head: head_name(head),
+                full: full.heads[head].directional_utility,
+                virtual_best_baseline: best.heads[head].directional_utility,
+                difference: full.heads[head].directional_utility
+                    - best.heads[head].directional_utility,
+                simultaneous_lower_bound_99: lower_bounds[head]
+                    .into_iter()
+                    .fold(f64::INFINITY, f64::min),
+                baseline: best.treatment.clone(),
+            }
+        })
+        .collect())
+}
+
+fn clustered_difference_lower_bound(
+    full: &[Candidate],
+    baseline: &[Candidate],
+    head: usize,
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> f64 {
+    let mut families = BTreeMap::<(String, String), (Vec<f64>, Vec<f64>)>::new();
+    for candidate in full {
+        let utility = targets
+            .get(&candidate.declaration)
+            .map_or(0.0, |targets| directional(head, f64::from(targets[head])));
+        families
+            .entry((candidate.module.clone(), candidate.semantic_family.clone()))
+            .or_default()
+            .0
+            .push(utility);
+    }
+    for candidate in baseline {
+        let utility = targets
+            .get(&candidate.declaration)
+            .map_or(0.0, |targets| directional(head, f64::from(targets[head])));
+        families
+            .entry((candidate.module.clone(), candidate.semantic_family.clone()))
+            .or_default()
+            .1
+            .push(utility);
+    }
+    let mut modules = BTreeMap::<String, Vec<(String, f64)>>::new();
+    for ((module, family), (full, baseline)) in families {
+        modules
+            .entry(module)
+            .or_default()
+            .push((family, mean_or_zero(&full) - mean_or_zero(&baseline)));
+    }
+    let modules = modules.into_values().collect::<Vec<_>>();
+    if modules.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let mut samples = Vec::with_capacity(10_000);
+    for replicate in 0..10_000_u64 {
+        let mut state =
+            splitmix64(replicate ^ u64::try_from(head).unwrap_or(u64::MAX) ^ 0x7061_7265_746f_3939);
+        let mut total = 0.0;
+        for _ in 0..modules.len() {
+            state = splitmix64(state);
+            let module_count = u64::try_from(modules.len()).unwrap_or(u64::MAX);
+            let module = &modules[usize::try_from(state % module_count).unwrap_or(0)];
+            let mut module_total = 0.0;
+            for _ in 0..module.len() {
+                state = splitmix64(state);
+                let family_count = u64::try_from(module.len()).unwrap_or(u64::MAX);
+                module_total += module[usize::try_from(state % family_count).unwrap_or(0)].1;
+            }
+            total += module_total / f64::from(u32::try_from(module.len()).unwrap_or(u32::MAX));
+        }
+        samples.push(total / f64::from(u32::try_from(modules.len()).unwrap_or(u32::MAX)));
+    }
+    samples.sort_unstable_by(f64::total_cmp);
+    // Bonferroni alpha = 0.01 / (7 heads * 3 baselines). Ten
+    // thousand deterministic resamples put the lower rank at index four.
+    samples[4]
+}
+
+fn time_gate(
+    records: &[ReplayRecord],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+) -> TimeGate {
+    let heads = time_heads(records, targets, None);
+    let geometric_mean_speedup = geometric_mean(
+        &heads
+            .iter()
+            .filter_map(|outcome| outcome.speedup)
+            .collect::<Vec<_>>(),
+        POTENTIAL_HEADS,
+    );
+    let point_gate_passed = geometric_mean_speedup.is_some_and(|speedup| speedup >= 10.0);
+    let mut interval_gate_evaluated = false;
+    let mut simultaneous_lower_bound_99 = None;
+    if point_gate_passed {
+        interval_gate_evaluated = true;
+        let modules =
+            std::array::from_fn::<_, POTENTIAL_HEADS, _>(|head| bootstrap_modules(records, head));
+        let mut speedups = Vec::with_capacity(10_000);
+        for replicate in 0..10_000_u64 {
+            let weights = std::array::from_fn(|head| {
+                bootstrap_weights(
+                    &modules[head],
+                    replicate ^ u64::try_from(head).unwrap_or(u64::MAX),
+                )
+            });
+            let sample = time_heads(records, targets, Some(&weights));
+            let values = sample
+                .iter()
+                .filter_map(|outcome| outcome.speedup)
+                .collect::<Vec<_>>();
+            speedups.push(geometric_mean(&values, POTENTIAL_HEADS).unwrap_or(0.0));
+        }
+        speedups.sort_unstable_by(f64::total_cmp);
+        simultaneous_lower_bound_99 = speedups.get(99).copied();
+    }
+    let passed = point_gate_passed && simultaneous_lower_bound_99.is_some_and(|lower| lower > 3.0);
+    TimeGate {
+        heads,
+        geometric_mean_speedup,
+        point_gate_passed,
+        interval_gate_evaluated,
+        simultaneous_lower_bound_99,
+        passed,
+    }
+}
+
+fn time_heads(
+    records: &[ReplayRecord],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+    weights: Option<&[HashMap<String, u32>; POTENTIAL_HEADS]>,
+) -> Vec<TimeToUtilityOutcome> {
+    (0..POTENTIAL_HEADS)
+        .map(|head| {
+            let full = replay_sequence(records, "full", head);
+            let head_weights = weights.map(|weights| &weights[head]);
+            let full_final = final_utility(&full, head, targets, head_weights);
+            let baselines = ["uniform", "dependency-light", "historical-reuse"].map(|name| {
+                let sequence = replay_sequence(records, name, head);
+                let utility = final_utility(&sequence, head, targets, head_weights);
+                (name, sequence, utility)
+            });
+            let best = baselines
+                .iter()
+                .max_by(|left, right| left.2.total_cmp(&right.2).then_with(|| right.0.cmp(left.0)))
+                .expect("three frozen baselines exist");
+            let common_target = full_final.min(best.2);
+            let full_cpu_ns = time_to_target(&full, head, targets, head_weights, common_target);
+            let baseline = best.0.to_owned();
+            let virtual_best_baseline_cpu_ns =
+                time_to_target(&best.1, head, targets, head_weights, common_target);
+            let speedup = virtual_best_baseline_cpu_ns
+                .zip(full_cpu_ns)
+                .filter(|(_, full)| *full != 0)
+                .map(|(baseline, full)| {
+                    std::time::Duration::from_nanos(baseline).as_secs_f64()
+                        / std::time::Duration::from_nanos(full).as_secs_f64()
+                });
+            TimeToUtilityOutcome {
+                head: head_name(head),
+                common_target,
+                full_cpu_ns,
+                virtual_best_baseline_cpu_ns,
+                baseline,
+                speedup,
+            }
+        })
+        .collect()
+}
+
+fn replay_sequence<'a>(
+    records: &'a [ReplayRecord],
+    treatment: &str,
+    head: usize,
+) -> Vec<&'a ReplayRecord> {
+    let mut sequence = records
+        .iter()
+        .filter(|record| record.treatment == treatment && record.head == head_name(head))
+        .collect::<Vec<_>>();
+    sequence.sort_unstable_by_key(|record| record.rank);
+    sequence
+}
+
+fn final_utility(
+    sequence: &[&ReplayRecord],
+    head: usize,
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+    weights: Option<&HashMap<String, u32>>,
+) -> f64 {
+    weighted_utility(sequence, head, targets, weights).unwrap_or(0.0)
+}
+
+fn time_to_target(
+    sequence: &[&ReplayRecord],
+    head: usize,
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+    weights: Option<&HashMap<String, u32>>,
+    target: f64,
+) -> Option<u64> {
+    for end in 1..=sequence.len() {
+        let prefix = &sequence[..end];
+        if weighted_utility(prefix, head, targets, weights).is_some_and(|value| value >= target) {
+            return Some(prefix[end - 1].cumulative_cpu_upper_bound_ns);
+        }
+    }
+    None
+}
+
+fn weighted_utility(
+    sequence: &[&ReplayRecord],
+    head: usize,
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+    weights: Option<&HashMap<String, u32>>,
+) -> Option<f64> {
+    let mut units = BTreeMap::<String, (f64, u64)>::new();
+    for record in sequence {
+        let value = if record.accepted {
+            targets
+                .get(&record.declaration)
+                .map_or(0.0, |targets| directional(head, f64::from(targets[head])))
+        } else {
+            0.0
+        };
+        let entry = units
+            .entry(statistical_unit(&record.module, &record.semantic_family))
+            .or_default();
+        entry.0 += value;
+        entry.1 = entry.1.saturating_add(1);
+    }
+    let mut total = 0.0;
+    let mut count = 0_u64;
+    if let Some(weights) = weights {
+        for (unit, weight) in weights {
+            let value = units.get(unit).map_or(0.0, |(unit_total, unit_count)| {
+                unit_total / f64::from(u32::try_from(*unit_count).unwrap_or(u32::MAX))
+            });
+            total += value * f64::from(*weight);
+            count = count.saturating_add(u64::from(*weight));
+        }
+    } else {
+        for (unit_total, unit_count) in units.into_values() {
+            let value = unit_total / f64::from(u32::try_from(unit_count).unwrap_or(u32::MAX));
+            total += value;
+            count = count.saturating_add(1);
+        }
+    }
+    (count != 0).then_some(total / f64::from(u32::try_from(count).unwrap_or(u32::MAX)))
+}
+
+fn geometric_mean(values: &[f64], required: usize) -> Option<f64> {
+    if values.len() != required
+        || values
+            .iter()
+            .any(|value| *value <= 0.0 || !value.is_finite())
+    {
+        return None;
+    }
+    Some(
+        (values.iter().map(|value| value.ln()).sum::<f64>()
+            / f64::from(u32::try_from(required).unwrap_or(u32::MAX)))
+        .exp(),
+    )
+}
+
+fn bootstrap_modules(records: &[ReplayRecord], head: usize) -> Vec<Vec<String>> {
+    let mut modules = BTreeMap::<String, HashSet<String>>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.head == head_name(head))
+    {
+        modules
+            .entry(record.module.clone())
+            .or_default()
+            .insert(statistical_unit(&record.module, &record.semantic_family));
+    }
+    modules
+        .into_values()
+        .map(|families| {
+            let mut families = families.into_iter().collect::<Vec<_>>();
+            families.sort_unstable();
+            families
+        })
+        .collect()
+}
+
+fn statistical_unit(module: &str, family: &str) -> String {
+    format!("{module}\0{family}")
+}
+
+fn mean_or_zero(values: &[f64]) -> f64 {
+    if values.is_empty() { 0.0 } else { mean(values) }
+}
+
+fn bootstrap_weights(modules: &[Vec<String>], replicate: u64) -> HashMap<String, u32> {
+    let mut state = splitmix64(replicate ^ 0x6c65_616e_6175_6469);
+    let mut weights = HashMap::new();
+    for _ in 0..modules.len() {
+        state = splitmix64(state);
+        let module_count = u64::try_from(modules.len()).unwrap_or(u64::MAX);
+        let module = &modules[usize::try_from(state % module_count).unwrap_or(0)];
+        for _ in 0..module.len() {
+            state = splitmix64(state);
+            let family_count = u64::try_from(module.len()).unwrap_or(u64::MAX);
+            let family = &module[usize::try_from(state % family_count).unwrap_or(0)];
+            *weights.entry(family.clone()).or_default() += 1;
+        }
+    }
+    weights
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn replay_rankings(
+    rankings: &[Ranking],
+    december: &LeanWorker,
+    audit: &LeanWorker,
+) -> Result<(Vec<ReplayRecord>, Vec<IndexedTheorem>, usize, u64), AnyError> {
+    let mut records = Vec::new();
+    let mut unique_sources = BTreeMap::<String, IndexedTheorem>::new();
+    let mut calls = 0_usize;
+    let mut cpu = 0_u64;
+    for ranking in rankings {
+        for (head, candidates) in ranking.heads.iter().enumerate() {
+            let mut cumulative = ranking
+                .training_cpu_ns
+                .saturating_add(ranking.selection_cpu_ns[head]);
+            for (rank, candidate) in candidates.iter().take(REPLAY_PER_HEAD).enumerate() {
+                let fetch_started = Instant::now();
+                let name = LeanName::from_dotted(&candidate.declaration);
+                let mut fetched = december.fetch(&[name])?;
+                cumulative = cumulative.saturating_add(duration_ns(fetch_started.elapsed()));
+                let Some(source) = fetched.pop() else {
+                    records.push(ReplayRecord {
+                        treatment: ranking.treatment.clone(),
+                        head: head_name(head),
+                        rank,
+                        declaration: candidate.declaration.clone(),
+                        module: candidate.module.clone(),
+                        semantic_family: candidate.semantic_family.clone(),
+                        accepted: false,
+                        diagnostic: "source theorem unavailable".into(),
+                        kernel_evidence_sha256: String::new(),
+                        cumulative_cpu_upper_bound_ns: cumulative,
+                        proof_nodes: 0,
+                        proof_depth: 0,
+                        encoded_bytes: 0,
+                        dependencies: 0,
+                        axioms: 0,
+                    });
+                    continue;
+                };
+                unique_sources
+                    .entry(candidate.declaration.clone())
+                    .or_insert_with(|| source.clone());
+                let (migration, usage) = migrate_theorems(std::slice::from_ref(&source), audit)?;
+                calls = calls.saturating_add(1);
+                let used = duration_ns(usage.cpu_upper_bound);
+                cpu = cpu.saturating_add(used);
+                cumulative = cumulative.saturating_add(used);
+                let accepted = !migration.migrated.is_empty();
+                let diagnostic = migration
+                    .failures
+                    .first()
+                    .map_or_else(String::new, |failure| failure.diagnostic.clone());
+                let kernel_evidence_sha256 = migration_evidence_hash(
+                    &candidate.declaration,
+                    migration.migrated.first(),
+                    &diagnostic,
+                )?;
+                records.push(ReplayRecord {
+                    treatment: ranking.treatment.clone(),
+                    head: head_name(head),
+                    rank,
+                    declaration: candidate.declaration.clone(),
+                    module: candidate.module.clone(),
+                    semantic_family: candidate.semantic_family.clone(),
+                    accepted,
+                    diagnostic,
+                    kernel_evidence_sha256,
+                    cumulative_cpu_upper_bound_ns: cumulative,
+                    proof_nodes: source.proof_term.node_count(),
+                    proof_depth: source.proof_term.depth(),
+                    encoded_bytes: serde_json::to_vec(&source)?.len(),
+                    dependencies: source.dependencies.len(),
+                    axioms: source.axioms.len(),
+                });
+            }
+        }
+    }
+    Ok((records, unique_sources.into_values().collect(), calls, cpu))
+}
+
+fn migration_evidence_hash(
+    declaration: &str,
+    migrated: Option<&IndexedTheorem>,
+    diagnostic: &str,
+) -> Result<String, AnyError> {
+    let mut digest = Sha256::new();
+    digest.update(b"reflex-lean-migration-evidence-v1\0");
+    digest.update(declaration.as_bytes());
+    digest.update([0]);
+    if let Some(theorem) = migrated {
+        digest.update([1]);
+        digest.update(serde_json::to_vec(theorem)?);
+    } else {
+        digest.update([0]);
+        digest.update(diagnostic.as_bytes());
+    }
+    Ok(hex(&digest.finalize()))
+}
+
+fn certify_selected_relationships(
+    rankings: &[Ranking],
+    candidates: &[RelationshipCandidate],
+    december: &LeanWorker,
+    audit: &LeanWorker,
+) -> Result<RelationshipEvaluation, AnyError> {
+    let selected = rankings
+        .iter()
+        .find(|ranking| ranking.treatment == "full")
+        .into_iter()
+        .flat_map(|ranking| ranking.heads.iter())
+        .flat_map(|head| head.iter())
+        .map(|candidate| candidate.declaration.as_str())
+        .collect::<HashSet<_>>();
+    let sample = candidates
+        .iter()
+        .filter(|candidate| selected.contains(candidate.earlier.to_string().as_str()))
+        .take(RELATIONSHIP_LIMIT)
+        .collect::<Vec<_>>();
+    let mut certified = Vec::new();
+    let mut calls = 0_usize;
+    let mut cpu = 0_u64;
+    for candidate in &sample {
+        let (certificate, usage) = certify_relationship(december, audit, candidate)?;
+        if let Some(usage) = usage {
+            calls = calls.saturating_add(1);
+            cpu = cpu.saturating_add(duration_ns(usage.cpu_upper_bound));
+        }
+        if let Some(certificate) = certificate {
+            certified.push(certificate);
+        }
+    }
+    let consolidated = consolidate_certificates(&certified);
+    let count = |kind| {
+        certified
+            .iter()
+            .filter(|certificate| certificate.kind == kind)
+            .count()
+    };
+    let consolidated_count = |kind| {
+        consolidated
+            .iter()
+            .filter(|relationship| relationship.kind == kind)
+            .count()
+    };
+    let mut critique_relationships = HashMap::<String, Vec<CritiqueRelationship>>::new();
+    for certificate in &certified {
+        critique_relationships
+            .entry(certificate.earlier.name.to_string())
+            .or_default()
+            .push(CritiqueRelationship {
+                kind: certificate.kind,
+                later_declaration: certificate.later.name.to_string(),
+                proof_nodes_removed: certificate.proof_nodes_removed,
+            });
+    }
+    Ok(RelationshipEvaluation {
+        summary: RelationshipSummary {
+            attempted: sample.len(),
+            certified: certified.len(),
+            rejected_or_unavailable: sample.len().saturating_sub(certified.len()),
+            exact: count(RelationshipKind::Exact),
+            definitional: count(RelationshipKind::Definitional),
+            specialization: count(RelationshipKind::Specialization),
+            derivation: count(RelationshipKind::Derivation),
+            family_collapse: consolidated_count(RelationshipKind::FamilyCollapse),
+            corpus_compression: consolidated_count(RelationshipKind::CorpusCompression),
+            proof_nodes_removed: certified
+                .iter()
+                .map(|certificate| certificate.proof_nodes_removed)
+                .sum(),
+        },
+        critique: critique_relationships,
+        kernel_calls: calls,
+        kernel_cpu_upper_bound_ns: cpu,
+    })
+}
+
+fn build_critique_items(
+    rankings: &[Ranking],
+    sources: &[IndexedTheorem],
+    targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
+    relationships: &HashMap<String, Vec<CritiqueRelationship>>,
+) -> Result<Vec<CritiqueItem>, AnyError> {
+    let source = sources
+        .iter()
+        .map(|theorem| (theorem.name.to_string(), theorem))
+        .collect::<HashMap<_, _>>();
+    let full = rankings
+        .iter()
+        .find(|ranking| ranking.treatment == "full")
+        .ok_or("frozen rankings omit Full")?;
+    let mut candidates = full
+        .heads
+        .iter()
+        .flat_map(|head| head.iter())
+        .filter(|candidate| source.contains_key(&candidate.declaration))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|candidate| {
+        let mut digest = Sha256::new();
+        digest.update(b"reflex-lean-blinded-critique-v1\0");
+        digest.update(candidate.semantic_family.as_bytes());
+        digest.finalize()
+    });
+    candidates.dedup_by_key(|candidate| candidate.declaration.as_str());
+    if candidates.len() < 32 {
+        return Err(format!(
+            "blinded mathematical critique requires 32 replayed Full artifacts, found {}",
+            candidates.len()
+        )
+        .into());
+    }
+    let mut items = Vec::with_capacity(32);
+    for candidate in candidates.into_iter().take(32) {
+        let theorem = source
+            .get(&candidate.declaration)
+            .expect("critique candidates were filtered to replayed sources");
+        let target_profile = targets
+            .get(&candidate.declaration)
+            .copied()
+            .ok_or("critique artifact is absent from the audit target set")?;
+        let mut digest = Sha256::new();
+        digest.update(b"reflex-lean-blinded-item-v1\0");
+        digest.update(candidate.declaration.as_bytes());
+        let blinded_id = hex(&digest.finalize());
+        items.push(CritiqueItem {
+            blinded_id,
+            declaration: candidate.declaration.clone(),
+            module: candidate.module.clone(),
+            semantic_family: candidate.semantic_family.clone(),
+            proof_nodes: theorem.proof_term.node_count(),
+            proof_depth: theorem.proof_term.depth(),
+            dependencies: theorem.dependencies.len(),
+            target_profile,
+            certified_future_relationships: relationships
+                .get(&candidate.declaration)
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    Ok(items)
+}
+
+fn write_critique_packet(
+    path: &PathBuf,
+    report_sha256: &str,
+    items: Vec<CritiqueItem>,
+) -> Result<(), AnyError> {
+    let mut packet = CritiquePacket {
+        schema: "reflex-lean-blinded-mathematical-critique-v1",
+        status: "mechanical-results-sealed; critique-pending",
+        mechanical_report_file_sha256: report_sha256.into(),
+        instructions: "Inspect mathematical generality, lemma collapse, proof elegance, and likely human value without treatment labels; do not alter the sealed mechanical decision.",
+        items,
+        content_sha256: String::new(),
+    };
+    packet.content_sha256 = hash_json(&packet)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&packet)?)?;
+    Ok(())
+}
+
+fn finalize_report(report: &mut Report) -> Result<Vec<u8>, AnyError> {
+    for _ in 0..8 {
+        report.content_sha256.clear();
+        report.content_sha256 = hash_json(report)?;
+        let encoded = serde_json::to_vec_pretty(report)?;
+        if report.economics.result_durable_bytes == encoded.len() {
+            return Ok(encoded);
+        }
+        report.economics.result_durable_bytes = encoded.len();
+    }
+    Err("Lean Temporal Audit durable-byte accounting did not converge".into())
+}
+
+fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
+    let mut values = HashMap::<&str, &str>::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--manifest" | "--lock" | "--lake" | "--december-root" | "--december-catalog"
+            | "--audit-root" | "--audit-catalog" | "--output" | "--critique-packet" => {
+                if values.insert(flag, value).is_some() {
+                    return Err(format!("duplicate argument {flag}").into());
+                }
+            }
+            _ => return Err(format!("unknown lean-temporal-audit-confirm argument {flag}").into()),
+        }
+        index += 2;
+    }
+    let path = |flag| -> Result<PathBuf, AnyError> {
+        values
+            .get(flag)
+            .map(|value| PathBuf::from(*value))
+            .ok_or_else(|| format!("lean-temporal-audit-confirm requires {flag}").into())
+    };
+    Ok(Arguments {
+        manifest: path("--manifest")?,
+        lock: path("--lock")?,
+        lake: path("--lake")?,
+        december_root: path("--december-root")?,
+        december_catalog: path("--december-catalog")?,
+        audit_root: path("--audit-root")?,
+        audit_catalog: path("--audit-catalog")?,
+        output: path("--output")?,
+        critique_packet: path("--critique-packet")?,
+    })
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.iter().sum::<f64>() / f64::from(u32::try_from(values.len()).unwrap_or(u32::MAX))
+}
+
+fn directional(head: usize, value: f64) -> f64 {
+    if head >= 5 { 1.0 - value } else { value }
+}
+
+const fn head_name(head: usize) -> &'static str {
+    match head {
+        0 => "anticipation",
+        1 => "descendants",
+        2 => "reuse",
+        3 => "compression",
+        4 => "declaration-survival",
+        5 => "dependency-cost",
+        6 => "dead-end",
+        _ => panic!("Potential head index differs"),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut output, byte| {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+        output
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(name: &str, module: &str, family: &str) -> Candidate {
+        Candidate {
+            declaration: name.into(),
+            module: module.into(),
+            semantic_family: family.into(),
+        }
+    }
+
+    #[test]
+    fn module_nested_bootstrap_is_deterministic_and_directional() {
+        let full = vec![candidate("A", "M1", "f1"), candidate("B", "M2", "f2")];
+        let baseline = vec![candidate("C", "M1", "f3"), candidate("D", "M2", "f4")];
+        let targets = [
+            ("A".into(), [1.0; POTENTIAL_HEADS]),
+            ("B".into(), [1.0; POTENTIAL_HEADS]),
+            ("C".into(), [0.0; POTENTIAL_HEADS]),
+            ("D".into(), [0.0; POTENTIAL_HEADS]),
+        ]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        let first = clustered_difference_lower_bound(&full, &baseline, 0, &targets);
+        let second = clustered_difference_lower_bound(&full, &baseline, 0, &targets);
+        assert!(first >= 0.0);
+        assert!((first - second).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn splitmix_stream_changes_with_replicate() {
+        assert_ne!(splitmix64(1), splitmix64(2));
+        assert_eq!(splitmix64(1), splitmix64(1));
+    }
+
+    #[test]
+    fn time_gate_includes_preparation_cpu_and_bootstraps_nested_families() {
+        let mut records = Vec::new();
+        let mut targets = HashMap::new();
+        for head in 0..POTENTIAL_HEADS {
+            for (treatment, cpu) in [
+                ("full", 100_u64),
+                ("uniform", 1_000),
+                ("dependency-light", 1_000),
+                ("historical-reuse", 1_000),
+            ] {
+                let declaration = format!("{treatment}.{head}");
+                targets.insert(declaration.clone(), [1.0; POTENTIAL_HEADS]);
+                records.push(ReplayRecord {
+                    treatment: treatment.into(),
+                    head: head_name(head),
+                    rank: 0,
+                    declaration,
+                    module: format!("M{head}"),
+                    semantic_family: format!("family-{head}"),
+                    accepted: true,
+                    diagnostic: String::new(),
+                    kernel_evidence_sha256: format!("evidence-{treatment}-{head}"),
+                    cumulative_cpu_upper_bound_ns: cpu,
+                    proof_nodes: 1,
+                    proof_depth: 1,
+                    encoded_bytes: 1,
+                    dependencies: 0,
+                    axioms: 0,
+                });
+            }
+        }
+        let gate = time_gate(&records, &targets);
+        assert!(gate.point_gate_passed);
+        assert!(gate.interval_gate_evaluated);
+        assert!(gate.passed);
+        assert!(
+            gate.geometric_mean_speedup
+                .is_some_and(|speedup| speedup >= 10.0)
+        );
+    }
+}
