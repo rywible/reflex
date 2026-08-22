@@ -12,7 +12,7 @@ use reflex::{
 use reflex_lean::catalog::LeanCatalog;
 use reflex_lean::domain::{LeanCorpus, LeanDomain, LeanMetric, LeanSeedScope};
 use reflex_lean::temporal::{TemporalExample, TemporalSnapshot};
-use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig};
+use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig, VerificationItem};
 use serde::Serialize;
 
 use crate::harness::{
@@ -21,7 +21,7 @@ use crate::harness::{
     require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v4";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v5";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -99,6 +99,7 @@ struct Report {
     training_artifacts: usize,
     heldout_artifacts: usize,
     primary_proof_node_limit: usize,
+    primary_selection: &'static str,
     september_catalog_sha256: String,
     december_catalog_sha256: String,
     selected_artifacts: Vec<SelectedArtifact>,
@@ -388,6 +389,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         training_artifacts,
         heldout_artifacts,
         primary_proof_node_limit: PRIMARY_PROOF_NODE_LIMIT,
+        primary_selection: "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; development opportunity corpus, not confirmation sampling",
         september_catalog_sha256,
         december_catalog_sha256,
         selected_artifacts,
@@ -423,38 +425,43 @@ fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> 
         selection_pools(&september_artifacts, &december_artifacts, arguments);
     let config = LeanWorkerConfig::pinned(&arguments.lake, &arguments.december_root);
     let worker = LeanWorker::start(&config)?;
-    let training = fetch_primary(&worker, &training_pool, arguments.training_artifacts)?;
-    let heldout = fetch_primary(&worker, &heldout_pool, arguments.heldout_artifacts)?;
-    if training.len() != arguments.training_artifacts
-        || heldout.len() != arguments.heldout_artifacts
-    {
-        return Err(
-            "Lean development corpus cannot satisfy the requested human-facing primary scopes"
-                .into(),
-        );
-    }
-    let training_count = training.len();
-    let heldout_count = heldout.len();
-
-    let selected_names = training
+    let training_candidates = fetch_primary(&worker, &training_pool, training_pool.len())?;
+    let heldout_candidates = fetch_primary(&worker, &heldout_pool, heldout_pool.len())?;
+    let selected_names = training_candidates
         .iter()
-        .chain(&heldout)
+        .chain(&heldout_candidates)
         .map(|selected| selected.theorem.name.clone())
         .collect::<HashSet<_>>();
-    let training_library = fetch_library(
+    let training_library_candidates = fetch_library(
         &worker,
         &december_artifacts,
-        &training,
+        &training_candidates,
         &selected_names,
         |artifact| earlier_names.contains(&artifact.declaration),
     )?;
-    let heldout_library = fetch_library(
+    let heldout_library_candidates = fetch_library(
         &worker,
         &december_artifacts,
-        &heldout,
+        &heldout_candidates,
         &selected_names,
         |_| true,
     )?;
+    let training = select_verified_improvements(
+        &worker,
+        &training_candidates,
+        &training_library_candidates,
+        arguments.training_artifacts,
+    )?;
+    let heldout = select_verified_improvements(
+        &worker,
+        &heldout_candidates,
+        &heldout_library_candidates,
+        arguments.heldout_artifacts,
+    )?;
+    let training_library = library_for(&training, training_library_candidates);
+    let heldout_library = library_for(&heldout, heldout_library_candidates);
+    let training_count = training.len();
+    let heldout_count = heldout.len();
 
     let (training_corpus, heldout_corpus) = build_corpora(
         &worker,
@@ -644,16 +651,64 @@ fn fetch_library(
     candidates.sort_unstable_by(|left, right| left.declaration.cmp(&right.declaration));
     candidates.dedup_by(|left, right| left.declaration == right.declaration);
     let fetched = fetch_primary(worker, &candidates, candidates.len())?;
-    if seeds.iter().any(|seed| {
-        !fetched
-            .iter()
-            .any(|candidate| candidate.example.statement_hash == seed.example.statement_hash)
-    }) {
-        return Err(
-            "every selected Lean Seed requires a fetchable same-statement library Artifact".into(),
-        );
-    }
     Ok(fetched)
+}
+
+fn select_verified_improvements(
+    worker: &LeanWorker,
+    candidates: &[SelectedTheorem],
+    library: &[SelectedTheorem],
+    count: usize,
+) -> Result<Vec<SelectedTheorem>, AnyError> {
+    let mut selected = Vec::with_capacity(count);
+    for seed in candidates {
+        let mut accepted = false;
+        for alternative in library.iter().filter(|alternative| {
+            alternative.example.statement_hash == seed.example.statement_hash
+                && alternative.theorem.proof_term.node_count()
+                    < seed.theorem.proof_term.node_count()
+        }) {
+            let (results, _) = worker.verify(&[VerificationItem {
+                level_params: seed.theorem.level_params.clone(),
+                claim_proposition: seed.theorem.proposition.clone(),
+                candidate_proposition: seed.theorem.proposition.clone(),
+                proof_term: alternative.theorem.proof_term.clone(),
+                allowed_axioms: seed.theorem.axioms.clone(),
+            }])?;
+            if results[0].accepted {
+                accepted = true;
+                break;
+            }
+        }
+        if accepted {
+            selected.push(SelectedTheorem {
+                example: seed.example.clone(),
+                theorem: seed.theorem.clone(),
+            });
+            if selected.len() == count {
+                break;
+            }
+        }
+    }
+    if selected.len() != count {
+        return Err(format!(
+            "Lean development found {} kernel-accepted primary improvements, required {count}",
+            selected.len()
+        )
+        .into());
+    }
+    Ok(selected)
+}
+
+fn library_for(seeds: &[SelectedTheorem], library: Vec<SelectedTheorem>) -> Vec<SelectedTheorem> {
+    let statements = seeds
+        .iter()
+        .map(|seed| seed.example.statement_hash)
+        .collect::<HashSet<_>>();
+    library
+        .into_iter()
+        .filter(|artifact| statements.contains(&artifact.example.statement_hash))
+        .collect()
 }
 
 fn is_human_facing(name: &reflex_lean::ast::LeanName) -> bool {
