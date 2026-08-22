@@ -31,6 +31,7 @@ pub(super) struct ChildCapture {
     pub(super) stdout: String,
     pub(super) stderr: String,
     pub(super) timed_out: bool,
+    pub(super) resident_limit_exceeded: bool,
     pub(super) process_tree_cpu_ns: u64,
     pub(super) peak_process_tree_resident_bytes: u64,
 }
@@ -91,7 +92,7 @@ pub(super) fn capture_child(
     evidence_prefix: &Path,
     timeout: Option<Duration>,
 ) -> Result<ChildCapture, AnyError> {
-    capture_child_with_environment(executable, arguments, evidence_prefix, timeout, &[])
+    capture_child_with_limits(executable, arguments, evidence_prefix, timeout, None, &[])
 }
 
 pub(super) fn capture_child_with_environment(
@@ -99,6 +100,41 @@ pub(super) fn capture_child_with_environment(
     arguments: &[OsString],
     evidence_prefix: &Path,
     timeout: Option<Duration>,
+    environment: &[(OsString, OsString)],
+) -> Result<ChildCapture, AnyError> {
+    capture_child_with_limits(
+        executable,
+        arguments,
+        evidence_prefix,
+        timeout,
+        None,
+        environment,
+    )
+}
+
+pub(super) fn capture_child_bounded(
+    executable: &Path,
+    arguments: &[OsString],
+    evidence_prefix: &Path,
+    timeout: Duration,
+    resident_bytes: u64,
+) -> Result<ChildCapture, AnyError> {
+    capture_child_with_limits(
+        executable,
+        arguments,
+        evidence_prefix,
+        Some(timeout),
+        Some(resident_bytes),
+        &[],
+    )
+}
+
+fn capture_child_with_limits(
+    executable: &Path,
+    arguments: &[OsString],
+    evidence_prefix: &Path,
+    timeout: Option<Duration>,
+    resident_bytes: Option<u64>,
     environment: &[(OsString, OsString)],
 ) -> Result<ChildCapture, AnyError> {
     let stdout_path = evidence_prefix.with_extension("child.stdout");
@@ -115,15 +151,22 @@ pub(super) fn capture_child_with_environment(
         .spawn()?;
     let started = Instant::now();
     let mut peak_process_tree_resident_bytes = 0;
-    let timed_out = loop {
-        peak_process_tree_resident_bytes =
-            peak_process_tree_resident_bytes.max(process_tree_resident_bytes(child.id()));
+    let (timed_out, resident_limit_exceeded) = loop {
+        let current_resident =
+            process_tree_resident_bytes(child.id()).saturating_add(peak_process_resident_bytes());
+        peak_process_tree_resident_bytes = peak_process_tree_resident_bytes.max(current_resident);
         if child.try_wait()?.is_some() {
-            break false;
+            break (false, false);
+        }
+        if resident_bytes.is_some_and(|limit| current_resident > limit) {
+            terminate_process_tree(child.id());
+            let _ = child.kill();
+            break (false, true);
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-            child.kill()?;
-            break true;
+            terminate_process_tree(child.id());
+            let _ = child.kill();
+            break (true, false);
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -144,24 +187,35 @@ pub(super) fn capture_child_with_environment(
         stdout,
         stderr,
         timed_out,
+        resident_limit_exceeded,
         process_tree_cpu_ns,
         peak_process_tree_resident_bytes,
     })
 }
 
-fn process_tree_resident_bytes(root: u32) -> u64 {
+#[cfg(target_os = "linux")]
+fn terminate_process_tree(root: u32) {
+    let mut processes = process_tree_ids(root);
+    processes.reverse();
+    for process in processes {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &process.to_string()])
+            .status();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_process_tree(_root: u32) {}
+
+fn process_tree_ids(root: u32) -> Vec<u32> {
     let mut pending = vec![root];
     let mut seen = BTreeSet::new();
-    let mut total = 0_u64;
     while let Some(process) = pending.pop() {
         if !seen.insert(process) {
             continue;
         }
-        let root = format!("/proc/{process}");
-        if let Ok(status) = std::fs::read_to_string(format!("{root}/status")) {
-            total = total.saturating_add(parse_resident_bytes(&status));
-        }
-        if let Ok(children) = std::fs::read_to_string(format!("{root}/task/{process}/children")) {
+        let children = format!("/proc/{process}/task/{process}/children");
+        if let Ok(children) = std::fs::read_to_string(children) {
             pending.extend(
                 children
                     .split_whitespace()
@@ -169,7 +223,18 @@ fn process_tree_resident_bytes(root: u32) -> u64 {
             );
         }
     }
-    total
+    seen.into_iter().collect()
+}
+
+fn process_tree_resident_bytes(root: u32) -> u64 {
+    process_tree_ids(root)
+        .into_iter()
+        .map(|process| {
+            let root = format!("/proc/{process}");
+            std::fs::read_to_string(format!("{root}/status"))
+                .map_or(0, |status| parse_resident_bytes(&status))
+        })
+        .fold(0_u64, u64::saturating_add)
 }
 
 fn parse_resident_bytes(status: &str) -> u64 {
@@ -304,9 +369,12 @@ fn cpu_description() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::time::Duration;
+
     use super::{
-        parse_completed_child_cpu_ticks, parse_peak_resident_bytes, parse_resident_bytes,
-        ticks_to_nanoseconds,
+        capture_child_bounded, parse_completed_child_cpu_ticks, parse_peak_resident_bytes,
+        parse_resident_bytes, ticks_to_nanoseconds,
     };
 
     #[test]
@@ -327,5 +395,23 @@ mod tests {
     fn clock_ticks_convert_without_floating_point() {
         assert_eq!(ticks_to_nanoseconds(25, 100), 250_000_000);
         assert_eq!(ticks_to_nanoseconds(u64::MAX, 0), u64::MAX);
+    }
+
+    #[test]
+    fn bounded_child_is_killed_at_its_wall_limit() {
+        let prefix = std::env::temp_dir().join(format!(
+            "reflex-capture-timeout-test-{}",
+            std::process::id()
+        ));
+        let capture = capture_child_bounded(
+            std::path::Path::new("sh"),
+            &[OsString::from("-c"), OsString::from("sleep 2")],
+            &prefix,
+            Duration::from_millis(20),
+            u64::MAX,
+        )
+        .expect("bounded child supervision succeeds");
+        assert!(capture.timed_out);
+        assert!(!capture.resident_limit_exceeded);
     }
 }

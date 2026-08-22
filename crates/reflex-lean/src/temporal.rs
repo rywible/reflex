@@ -43,7 +43,8 @@ impl PotentialHead {
         Self::DeadEnd,
     ];
 
-    const fn index(self) -> usize {
+    #[must_use]
+    pub const fn index(self) -> usize {
         match self {
             Self::Anticipation => 0,
             Self::Descendants => 1,
@@ -53,6 +54,24 @@ impl PotentialHead {
             Self::DependencyCost => 5,
             Self::DeadEnd => 6,
         }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Anticipation => "anticipation",
+            Self::Descendants => "descendants",
+            Self::Reuse => "reuse",
+            Self::Compression => "compression",
+            Self::DeclarationSurvival => "declaration-survival",
+            Self::DependencyCost => "dependency-cost",
+            Self::DeadEnd => "dead-end",
+        }
+    }
+
+    #[must_use]
+    pub const fn lower_is_better(self) -> bool {
+        matches!(self, Self::DependencyCost | Self::DeadEnd)
     }
 }
 
@@ -207,7 +226,7 @@ impl TemporalSnapshot {
     }
 
     #[must_use]
-    pub fn candidate_examples(&self) -> Vec<TemporalExample> {
+    pub fn forecast_artifacts(&self) -> Vec<TemporalExample> {
         self.entries
             .iter()
             .filter(|entry| matches!(entry.kind, DeclarationKind::Theorem))

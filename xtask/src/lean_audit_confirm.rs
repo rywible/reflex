@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 use std::time::Instant;
 
 use reflex_lean::ast::LeanName;
 use reflex_lean::catalog::LeanCatalog;
 use reflex_lean::temporal::{
-    POTENTIAL_HEADS, RelationshipKind, TemporalPair, TemporalSnapshot, certify_relationship,
-    consolidate_certificates, migrate_theorems,
+    POTENTIAL_HEADS, PotentialHead, RelationshipKind, TemporalPair, TemporalSnapshot,
+    certify_relationship, consolidate_certificates, migrate_theorems,
 };
 use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig};
 use reflex_lean::{LeanSnapshotPin, temporal::RelationshipCandidate};
@@ -14,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    AnyError, HostEnvironment, duration_ns, environment, hash_file, hash_json,
-    peak_process_resident_bytes, require_absent, require_clean, require_release,
+    AnyError, HostEnvironment, capture_child_bounded, duration_ns, environment, hash_file,
+    hash_json, peak_process_resident_bytes, require_absent, require_clean, require_release,
 };
 
 const SCHEMA: &str = "reflex-lean-temporal-audit-result-v1";
@@ -23,6 +26,8 @@ const FREEZE_SCHEMA: &str = "reflex-lean-temporal-audit-freeze-v1";
 const LOCK_SCHEMA: &str = "reflex-lean-temporal-audit-lock-v1";
 const REPLAY_PER_HEAD: usize = 16;
 const RELATIONSHIP_LIMIT: usize = 64;
+const WALL_LIMIT: Duration = Duration::from_hours(24);
+const RESIDENT_LIMIT: u64 = 48 * 1024 * 1024 * 1024;
 
 struct Arguments {
     manifest: PathBuf,
@@ -36,8 +41,15 @@ struct Arguments {
     critique_packet: PathBuf,
 }
 
+struct FinalizeArguments {
+    mechanical_report: PathBuf,
+    critique_packet: PathBuf,
+    assessment: PathBuf,
+    output: PathBuf,
+}
+
 #[derive(Clone, Deserialize)]
-struct Candidate {
+struct FrozenArtifact {
     declaration: String,
     module: String,
     semantic_family: String,
@@ -49,7 +61,7 @@ struct Ranking {
     training_cpu_ns: u64,
     #[serde(rename = "ranking_cpu_ns")]
     selection_cpu_ns: [u64; POTENTIAL_HEADS],
-    heads: [Vec<Candidate>; POTENTIAL_HEADS],
+    heads: [Vec<FrozenArtifact>; POTENTIAL_HEADS],
 }
 
 #[derive(Deserialize)]
@@ -57,7 +69,7 @@ struct Manifest {
     schema: String,
     protocol_sha256: String,
     catalog_sha256: [String; 3],
-    candidate_set_sha256: String,
+    audit_artifact_set_sha256: String,
     rankings: Vec<Ranking>,
     content_sha256: String,
 }
@@ -69,9 +81,14 @@ struct Lock {
     freeze_manifest_file_sha256: String,
     freeze_manifest_content_sha256: String,
     protocol_sha256: String,
-    candidate_set_sha256: String,
+    audit_artifact_set_sha256: String,
     audit_boundary: String,
     mathlib_commit: String,
+    mathlib_commit_timestamp: String,
+    boundary_successor_commit: String,
+    boundary_successor_timestamp: String,
+    boundary_successor_first_parent: String,
+    boundary_evidence_url: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -103,6 +120,8 @@ struct HeadOutcome {
     missing: usize,
     raw_mean: f64,
     directional_utility: f64,
+    evaluation_cpu_ns: u64,
+    exhaustion_cpu_ns: u64,
 }
 
 #[derive(Serialize)]
@@ -164,9 +183,12 @@ struct ReplayRecord {
     cumulative_cpu_upper_bound_ns: u64,
     proof_nodes: usize,
     proof_depth: usize,
-    encoded_bytes: usize,
-    dependencies: usize,
-    axioms: usize,
+    proof_encoded_bytes: usize,
+    source_dependencies: usize,
+    source_axioms: usize,
+    replayed_dependencies: Option<usize>,
+    replayed_axioms: Option<usize>,
+    elegance_preserved: bool,
 }
 
 #[derive(Serialize)]
@@ -191,6 +213,21 @@ struct RelationshipSummary {
     derivation: usize,
     family_collapse: usize,
     corpus_compression: usize,
+    proof_nodes_removed: usize,
+    records: Vec<RelationshipRecord>,
+}
+
+#[derive(Serialize)]
+struct RelationshipRecord {
+    earlier_declaration: String,
+    later_declaration: String,
+    expected_kind: RelationshipKind,
+    certified_kind: Option<RelationshipKind>,
+    kernel_accepted: bool,
+    kernel_dependencies: Vec<String>,
+    kernel_axioms: Vec<String>,
+    kernel_diagnostic: String,
+    kernel_evidence_sha256: String,
     proof_nodes_removed: usize,
 }
 
@@ -217,7 +254,8 @@ struct Economics {
 #[derive(Serialize)]
 struct AnytimeCheckpoint {
     cpu_seconds: u64,
-    candidates_exhausted: bool,
+    all_artifacts_exhausted: bool,
+    maximum_exhaustion_cpu_ns: u64,
     outcome_reference: &'static str,
 }
 
@@ -237,7 +275,7 @@ struct Report {
     freeze_manifest_content_sha256: String,
     audit_lock_content_sha256: String,
     execution_receipt_file_sha256: String,
-    candidate_set_sha256: String,
+    audit_artifact_set_sha256: String,
     december_catalog_sha256: String,
     audit_catalog_sha256: String,
     audit_mathlib_commit: String,
@@ -250,9 +288,12 @@ struct Report {
     causal_ablations: Vec<AblationOutcome>,
     causal_ablations_passed: bool,
     anytime: Vec<AnytimeCheckpoint>,
+    anytime_gate_passed: bool,
     time_to_utility: TimeGate,
     replay: ReplaySummary,
     relationships: RelationshipSummary,
+    no_regression_passed: bool,
+    wall_limit_passed: bool,
     economics: Economics,
     host: HostEnvironment,
     protocol_deviations: Vec<String>,
@@ -267,7 +308,9 @@ struct CritiqueItem {
     semantic_family: String,
     proof_nodes: usize,
     proof_depth: usize,
+    proof_encoded_bytes: usize,
     dependencies: usize,
+    allowed_axioms: usize,
     target_profile: [f32; POTENTIAL_HEADS],
     certified_future_relationships: Vec<CritiqueRelationship>,
 }
@@ -299,11 +342,221 @@ struct ExecutionReceipt<'a> {
     git_revision: &'a str,
 }
 
+#[derive(Serialize)]
+struct FailureReport<'a> {
+    schema: &'static str,
+    status: &'static str,
+    error: &'a str,
+    timed_out: bool,
+    resident_limit_exceeded: bool,
+    child_exit_code: Option<i32>,
+    child_stdout: &'a str,
+    child_stderr: &'a str,
+    process_tree_cpu_ns: u64,
+    peak_process_tree_resident_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct MechanicalIdentity {
+    schema: String,
+    mechanical_gate_passed: bool,
+    content_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct CritiquePacketIdentity {
+    schema: String,
+    mechanical_report_file_sha256: String,
+    items: Vec<CritiqueItemIdentity>,
+    content_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct CritiqueItemIdentity {
+    blinded_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CritiqueAssessment {
+    schema: String,
+    reviewer: String,
+    critique_packet_file_sha256: String,
+    items: Vec<AssessedCritiqueItem>,
+    overall_assessment: String,
+    protocol_deviations: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AssessedCritiqueItem {
+    blinded_id: String,
+    generality: String,
+    proof_collapse: String,
+    local_elegance: String,
+    family_elegance: String,
+    corpus_compression: String,
+    human_value: String,
+    notes: String,
+}
+
+#[derive(Serialize)]
+struct FinalReport {
+    schema: &'static str,
+    status: &'static str,
+    critique_complete: bool,
+    mechanical_gate_passed: bool,
+    scientifically_confirmed: bool,
+    mechanical_report_file_sha256: String,
+    mechanical_report_content_sha256: String,
+    critique_packet_file_sha256: String,
+    critique_packet_content_sha256: String,
+    critique_assessment_file_sha256: String,
+    critique: CritiqueAssessment,
+    next_domain: &'static str,
+    next_domain_role: &'static str,
+    content_sha256: String,
+}
+
+pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
+    require_release("lean-temporal-audit-confirm")?;
+    let host = environment()?;
+    require_clean(&host, SCHEMA)?;
+    parse(arguments)?;
+    require_absent(
+        &execution_receipt_path()?,
+        "Lean Temporal Audit execution receipt",
+    )?;
+    let executable = std::env::current_exe()?;
+    let child_arguments = std::iter::once(OsString::from("lean-temporal-audit-confirm-child"))
+        .chain(arguments.iter().map(OsString::from))
+        .collect::<Vec<_>>();
+    let evidence_prefix = std::env::temp_dir().join(format!(
+        "reflex-lean-temporal-audit-supervisor-{}",
+        std::process::id()
+    ));
+    let capture = capture_child_bounded(
+        &executable,
+        &child_arguments,
+        &evidence_prefix,
+        WALL_LIMIT,
+        RESIDENT_LIMIT,
+    )?;
+    if capture.status.success() && !capture.timed_out && !capture.resident_limit_exceeded {
+        print!("{}", capture.stdout);
+        return Ok(());
+    }
+    let error = if capture.timed_out {
+        "Lean Temporal Audit exceeded its 24-hour wall limit"
+    } else if capture.resident_limit_exceeded {
+        "Lean Temporal Audit exceeded its 48-GiB combined resident limit"
+    } else {
+        "Lean Temporal Audit child failed"
+    };
+    retain_failure_if_exposed(&FailureReport {
+        schema: "reflex-lean-temporal-audit-failure-v1",
+        status: "sealed-failure; rerun-forbidden",
+        error,
+        timed_out: capture.timed_out,
+        resident_limit_exceeded: capture.resident_limit_exceeded,
+        child_exit_code: capture.status.code(),
+        child_stdout: &capture.stdout,
+        child_stderr: &capture.stderr,
+        process_tree_cpu_ns: capture.process_tree_cpu_ns,
+        peak_process_tree_resident_bytes: capture.peak_process_tree_resident_bytes,
+    })?;
+    Err(format!("{error}: {}", capture.stderr.trim()).into())
+}
+
+pub fn confirm_child(arguments: &[String]) -> Result<(), AnyError> {
+    match confirm_once(arguments) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            retain_failure_if_exposed(&FailureReport {
+                schema: "reflex-lean-temporal-audit-failure-v1",
+                status: "sealed-failure; rerun-forbidden",
+                error: &message,
+                timed_out: false,
+                resident_limit_exceeded: false,
+                child_exit_code: None,
+                child_stdout: "",
+                child_stderr: "",
+                process_tree_cpu_ns: 0,
+                peak_process_tree_resident_bytes: peak_process_resident_bytes(),
+            })?;
+            Err(error)
+        }
+    }
+}
+
+pub fn finalize(arguments: &[String]) -> Result<(), AnyError> {
+    require_release("lean-temporal-audit-finalize")?;
+    let arguments = parse_finalize(arguments)?;
+    require_absent(&arguments.output, "Lean Temporal Audit final report")?;
+    if !execution_receipt_path()?.exists() {
+        return Err("Lean Temporal Audit cannot finalize before its one-shot execution".into());
+    }
+    let mechanical: MechanicalIdentity =
+        serde_json::from_slice(&std::fs::read(&arguments.mechanical_report)?)?;
+    let packet: CritiquePacketIdentity =
+        serde_json::from_slice(&std::fs::read(&arguments.critique_packet)?)?;
+    let assessment: CritiqueAssessment =
+        serde_json::from_slice(&std::fs::read(&arguments.assessment)?)?;
+    if mechanical.schema != SCHEMA
+        || packet.schema != "reflex-lean-blinded-mathematical-critique-v1"
+        || assessment.schema != "reflex-lean-mathematical-critique-assessment-v1"
+    {
+        return Err("Lean Temporal Audit finalization schema differs".into());
+    }
+    let mechanical_file_sha256 = hash_file(&arguments.mechanical_report)?;
+    let packet_file_sha256 = hash_file(&arguments.critique_packet)?;
+    if packet.mechanical_report_file_sha256 != mechanical_file_sha256
+        || assessment.critique_packet_file_sha256 != packet_file_sha256
+    {
+        return Err("Lean Temporal Audit critique chain is not content-addressed".into());
+    }
+    validate_assessment(&packet, &assessment)?;
+    let confirmed = mechanical.mechanical_gate_passed;
+    let mut report = FinalReport {
+        schema: "reflex-lean-temporal-audit-final-v1",
+        status: if confirmed {
+            "scientific-confirmation"
+        } else {
+            "null-result"
+        },
+        critique_complete: true,
+        mechanical_gate_passed: mechanical.mechanical_gate_passed,
+        scientifically_confirmed: confirmed,
+        mechanical_report_file_sha256: mechanical_file_sha256,
+        mechanical_report_content_sha256: mechanical.content_sha256,
+        critique_packet_file_sha256: packet_file_sha256,
+        critique_packet_content_sha256: packet.content_sha256,
+        critique_assessment_file_sha256: hash_file(&arguments.assessment)?,
+        critique: assessment,
+        next_domain: "Wrela",
+        next_domain_role: "registered-third-domain; not-rescue-analysis",
+        content_sha256: String::new(),
+    };
+    report.content_sha256 = hash_json(&report)?;
+    if let Some(parent) = arguments.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&arguments.output)?;
+    serde_json::to_writer_pretty(file, &report)?;
+    println!(
+        "status={} content_sha256={} next_domain=Wrela",
+        report.status, report.content_sha256
+    );
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the one-shot audit controller keeps exposure, sealing, replay, and resource gates visibly ordered"
 )]
-pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
+fn confirm_once(arguments: &[String]) -> Result<(), AnyError> {
     require_release("lean-temporal-audit-confirm")?;
     let run_started = Instant::now();
     let run_cpu = cpu_time::ProcessTime::now();
@@ -324,7 +577,7 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
     let lock: Lock = serde_json::from_slice(&std::fs::read(&arguments.lock)?)?;
     validate_inputs(&arguments, &manifest, &lock)?;
-    let receipt_path = arguments.output.with_extension("started.json");
+    let receipt_path = execution_receipt_path()?;
     require_absent(&receipt_path, "Lean Temporal Audit execution receipt")?;
     let receipt = ExecutionReceipt {
         schema: "reflex-lean-temporal-audit-execution-v1",
@@ -380,9 +633,28 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
             .all(|outcome| outcome.simultaneous_lower_bound_99 >= 0.0);
     let causal_ablations = ablation_outcomes(&outcomes)?;
     let causal_ablations_passed = causal_ablations.iter().all(|outcome| outcome.passed);
+    let maximum_exhaustion_cpu_ns = outcomes
+        .iter()
+        .flat_map(|outcome| &outcome.heads)
+        .map(|head| head.exhaustion_cpu_ns)
+        .max()
+        .unwrap_or(u64::MAX);
+    let anytime = [3_600, 14_400, 57_600, 230_400]
+        .into_iter()
+        .map(|cpu_seconds| AnytimeCheckpoint {
+            cpu_seconds,
+            all_artifacts_exhausted: maximum_exhaustion_cpu_ns
+                <= cpu_seconds.saturating_mul(1_000_000_000),
+            maximum_exhaustion_cpu_ns,
+            outcome_reference: "measured final frozen-artifact outcomes",
+        })
+        .collect::<Vec<_>>();
+    let anytime_gate_passed = anytime
+        .first()
+        .is_some_and(|checkpoint| checkpoint.all_artifacts_exhausted);
 
     let verifier_resident = 2 * reflex_lean::worker::DEFAULT_WORKER_RESIDENT_BYTES;
-    if peak_process_resident_bytes().saturating_add(verifier_resident) > 48 * 1024 * 1024 * 1024 {
+    if peak_process_resident_bytes().saturating_add(verifier_resident) > RESIDENT_LIMIT {
         return Err("Lean Temporal Audit cannot start the second verifier inside 48 GiB".into());
     }
     let december_worker = LeanWorker::start(&LeanWorkerConfig::pinned(
@@ -465,12 +737,21 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
     };
     let controller_peak = peak_process_resident_bytes();
     let combined_resident_upper_bound_bytes = controller_peak.saturating_add(verifier_resident);
+    let wall_limit_passed = run_started.elapsed() <= WALL_LIMIT;
     let no_regression = replay.rejected == 0
+        && replay
+            .records
+            .iter()
+            .all(|record| record.elegance_preserved)
         && replay.cold_recovery_attempted == replay.cold_recovery_decisions_matched
         && replay.cold_recovery_attempted == replay.cold_recovery_evidence_matched
-        && combined_resident_upper_bound_bytes <= 48 * 1024 * 1024 * 1024;
-    let mechanical_gate_passed =
-        pareto_dominates && causal_ablations_passed && time_to_utility.passed && no_regression;
+        && combined_resident_upper_bound_bytes <= RESIDENT_LIMIT
+        && wall_limit_passed;
+    let mechanical_gate_passed = pareto_dominates
+        && causal_ablations_passed
+        && anytime_gate_passed
+        && time_to_utility.passed
+        && no_regression;
     let critique_items = build_critique_items(
         &manifest.rankings,
         &sources,
@@ -488,7 +769,7 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
         freeze_manifest_content_sha256: manifest.content_sha256,
         audit_lock_content_sha256: lock.content_sha256,
         execution_receipt_file_sha256,
-        candidate_set_sha256: manifest.candidate_set_sha256,
+        audit_artifact_set_sha256: manifest.audit_artifact_set_sha256,
         december_catalog_sha256: december_catalog.content_sha256().into(),
         audit_catalog_sha256: audit_catalog.content_sha256().into(),
         audit_mathlib_commit: lock.mathlib_commit,
@@ -500,17 +781,13 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
         pareto_dominates,
         causal_ablations,
         causal_ablations_passed,
-        anytime: [3_600, 14_400, 57_600, 230_400]
-            .into_iter()
-            .map(|cpu_seconds| AnytimeCheckpoint {
-                cpu_seconds,
-                candidates_exhausted: true,
-                outcome_reference: "final frozen-candidate outcomes",
-            })
-            .collect(),
+        anytime,
+        anytime_gate_passed,
         time_to_utility,
         replay,
         relationships: relationship_evaluation.summary,
+        no_regression_passed: no_regression,
+        wall_limit_passed,
         economics: Economics {
             wall_ns: duration_ns(run_started.elapsed()),
             controller_cpu_ns: duration_ns(run_cpu.elapsed()),
@@ -565,7 +842,7 @@ fn validate_inputs(
     if hash_file(&arguments.manifest)? != lock.freeze_manifest_file_sha256
         || manifest.content_sha256 != lock.freeze_manifest_content_sha256
         || manifest.protocol_sha256 != lock.protocol_sha256
-        || manifest.candidate_set_sha256 != lock.candidate_set_sha256
+        || manifest.audit_artifact_set_sha256 != lock.audit_artifact_set_sha256
     {
         return Err("Lean Temporal Audit manifest does not match its committed lock".into());
     }
@@ -576,6 +853,11 @@ fn validate_inputs(
     let expected_lock_hash = std::mem::take(&mut unhashed_lock.content_sha256);
     if hash_json(&unhashed_lock)? != expected_lock_hash {
         return Err("Lean Temporal Audit lock content identity differs".into());
+    }
+    if git_output(&["rev-parse", "HEAD^"])? != lock.host.git_revision {
+        return Err(
+            "Lean Temporal Audit confirmation must run from the committed lock revision".into(),
+        );
     }
     Ok(())
 }
@@ -593,16 +875,24 @@ fn evaluate(
                 .iter()
                 .enumerate()
                 .map(|(head, candidates)| {
+                    let evaluation_cpu = cpu_time::ProcessTime::now();
                     let values = candidates
                         .iter()
                         .map(|candidate| {
                             targets.get(&candidate.declaration).map_or_else(
-                                || if head >= 5 { 1.0 } else { 0.0 },
+                                || {
+                                    if PotentialHead::ALL[head].lower_is_better() {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                },
                                 |targets| f64::from(targets[head]),
                             )
                         })
                         .collect::<Vec<_>>();
                     let raw_mean = mean(&values);
+                    let evaluation_cpu_ns = duration_ns(evaluation_cpu.elapsed());
                     HeadOutcome {
                         head: head_name(head),
                         selected: candidates
@@ -615,6 +905,11 @@ fn evaluate(
                             .count(),
                         raw_mean,
                         directional_utility: directional(head, raw_mean),
+                        evaluation_cpu_ns,
+                        exhaustion_cpu_ns: ranking
+                            .training_cpu_ns
+                            .saturating_add(ranking.selection_cpu_ns[head])
+                            .saturating_add(evaluation_cpu_ns),
                     }
                 })
                 .collect(),
@@ -725,8 +1020,8 @@ fn pareto_outcomes(
 }
 
 fn clustered_difference_lower_bound(
-    full: &[Candidate],
-    baseline: &[Candidate],
+    full: &[FrozenArtifact],
+    baseline: &[FrozenArtifact],
     head: usize,
     targets: &HashMap<String, [f32; POTENTIAL_HEADS]>,
 ) -> f64 {
@@ -1058,9 +1353,12 @@ fn replay_rankings(
                         cumulative_cpu_upper_bound_ns: cumulative,
                         proof_nodes: 0,
                         proof_depth: 0,
-                        encoded_bytes: 0,
-                        dependencies: 0,
-                        axioms: 0,
+                        proof_encoded_bytes: 0,
+                        source_dependencies: 0,
+                        source_axioms: 0,
+                        replayed_dependencies: None,
+                        replayed_axioms: None,
+                        elegance_preserved: false,
                     });
                     continue;
                 };
@@ -1082,6 +1380,20 @@ fn replay_rankings(
                     migration.migrated.first(),
                     &diagnostic,
                 )?;
+                let proof_nodes = source.proof_term.node_count();
+                let proof_depth = source.proof_term.depth();
+                let proof_encoded_bytes = serde_json::to_vec(&source.proof_term)?.len();
+                let replayed = migration.migrated.first();
+                let replayed_dependencies = replayed.map(|theorem| theorem.dependencies.len());
+                let replayed_axioms = replayed.map(|theorem| theorem.axioms.len());
+                let elegance_preserved = replayed.is_some_and(|theorem| {
+                    theorem.proof_term.node_count() <= proof_nodes
+                        && theorem.proof_term.depth() <= proof_depth
+                        && serde_json::to_vec(&theorem.proof_term)
+                            .is_ok_and(|encoded| encoded.len() <= proof_encoded_bytes)
+                        && theorem.dependencies.len() <= source.dependencies.len()
+                        && theorem.axioms.len() <= source.axioms.len()
+                });
                 records.push(ReplayRecord {
                     treatment: ranking.treatment.clone(),
                     head: head_name(head),
@@ -1093,11 +1405,14 @@ fn replay_rankings(
                     diagnostic,
                     kernel_evidence_sha256,
                     cumulative_cpu_upper_bound_ns: cumulative,
-                    proof_nodes: source.proof_term.node_count(),
-                    proof_depth: source.proof_term.depth(),
-                    encoded_bytes: serde_json::to_vec(&source)?.len(),
-                    dependencies: source.dependencies.len(),
-                    axioms: source.axioms.len(),
+                    proof_nodes,
+                    proof_depth,
+                    proof_encoded_bytes,
+                    source_dependencies: source.dependencies.len(),
+                    source_axioms: source.axioms.len(),
+                    replayed_dependencies,
+                    replayed_axioms,
+                    elegance_preserved,
                 });
             }
         }
@@ -1138,12 +1453,13 @@ fn certify_selected_relationships(
         .flat_map(|head| head.iter())
         .map(|candidate| candidate.declaration.as_str())
         .collect::<HashSet<_>>();
-    let sample = candidates
+    let eligible = candidates
         .iter()
         .filter(|candidate| selected.contains(candidate.earlier.to_string().as_str()))
-        .take(RELATIONSHIP_LIMIT)
         .collect::<Vec<_>>();
+    let sample = stratified_relationships(&eligible, RELATIONSHIP_LIMIT);
     let mut certified = Vec::new();
+    let mut records = Vec::with_capacity(sample.len());
     let mut calls = 0_usize;
     let mut cpu = 0_u64;
     for candidate in &sample {
@@ -1153,7 +1469,10 @@ fn certify_selected_relationships(
             cpu = cpu.saturating_add(duration_ns(usage.cpu_upper_bound));
         }
         if let Some(certificate) = certificate {
+            records.push(certified_relationship_record(candidate, &certificate)?);
             certified.push(certificate);
+        } else {
+            records.push(unavailable_relationship_record(candidate));
         }
     }
     let consolidated = consolidate_certificates(&certified);
@@ -1195,11 +1514,98 @@ fn certify_selected_relationships(
                 .iter()
                 .map(|certificate| certificate.proof_nodes_removed)
                 .sum(),
+            records,
         },
         critique: critique_relationships,
         kernel_calls: calls,
         kernel_cpu_upper_bound_ns: cpu,
     })
+}
+
+fn certified_relationship_record(
+    candidate: &RelationshipCandidate,
+    certificate: &reflex_lean::temporal::CertifiedRelationship,
+) -> Result<RelationshipRecord, AnyError> {
+    Ok(RelationshipRecord {
+        earlier_declaration: candidate.earlier.to_string(),
+        later_declaration: candidate.later.to_string(),
+        expected_kind: candidate.expected,
+        certified_kind: Some(certificate.kind),
+        kernel_accepted: certificate.verification.accepted,
+        kernel_dependencies: certificate
+            .verification
+            .dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        kernel_axioms: certificate
+            .verification
+            .axioms
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        kernel_diagnostic: certificate.verification.diagnostic.clone(),
+        kernel_evidence_sha256: relationship_evidence_hash(candidate, &certificate.verification)?,
+        proof_nodes_removed: certificate.proof_nodes_removed,
+    })
+}
+
+fn unavailable_relationship_record(candidate: &RelationshipCandidate) -> RelationshipRecord {
+    RelationshipRecord {
+        earlier_declaration: candidate.earlier.to_string(),
+        later_declaration: candidate.later.to_string(),
+        expected_kind: candidate.expected,
+        certified_kind: None,
+        kernel_accepted: false,
+        kernel_dependencies: Vec::new(),
+        kernel_axioms: Vec::new(),
+        kernel_diagnostic: "relationship unavailable or rejected without a certificate".into(),
+        kernel_evidence_sha256: String::new(),
+        proof_nodes_removed: 0,
+    }
+}
+
+fn stratified_relationships<'a>(
+    candidates: &[&'a RelationshipCandidate],
+    limit: usize,
+) -> Vec<&'a RelationshipCandidate> {
+    let exact_limit = limit.saturating_mul(2).div_ceil(3);
+    let mut selected = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.expected == RelationshipKind::Exact)
+        .take(exact_limit)
+        .collect::<Vec<_>>();
+    let specialization_limit = limit.saturating_sub(selected.len()).div_ceil(2);
+    selected.extend(
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.expected == RelationshipKind::Specialization)
+            .take(specialization_limit),
+    );
+    selected.extend(
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.expected == RelationshipKind::Derivation)
+            .take(limit.saturating_sub(selected.len())),
+    );
+    selected
+}
+
+fn relationship_evidence_hash(
+    candidate: &RelationshipCandidate,
+    verification: &reflex_lean::worker::VerificationResult,
+) -> Result<String, AnyError> {
+    let mut digest = Sha256::new();
+    digest.update(b"reflex-lean-relationship-evidence-v1\0");
+    digest.update(candidate.earlier.to_string().as_bytes());
+    digest.update([0]);
+    digest.update(candidate.later.to_string().as_bytes());
+    digest.update([candidate.expected as u8]);
+    digest.update(serde_json::to_vec(verification)?);
+    Ok(hex(&digest.finalize()))
 }
 
 fn build_critique_items(
@@ -1256,7 +1662,9 @@ fn build_critique_items(
             semantic_family: candidate.semantic_family.clone(),
             proof_nodes: theorem.proof_term.node_count(),
             proof_depth: theorem.proof_term.depth(),
+            proof_encoded_bytes: serde_json::to_vec(&theorem.proof_term)?.len(),
             dependencies: theorem.dependencies.len(),
+            allowed_axioms: theorem.axioms.len(),
             target_profile,
             certified_future_relationships: relationships
                 .get(&candidate.declaration)
@@ -1299,6 +1707,126 @@ fn finalize_report(report: &mut Report) -> Result<Vec<u8>, AnyError> {
         report.economics.result_durable_bytes = encoded.len();
     }
     Err("Lean Temporal Audit durable-byte accounting did not converge".into())
+}
+
+fn execution_receipt_path() -> Result<PathBuf, AnyError> {
+    Ok(repository_root()?.join("docs/experiments/lean-temporal-audit-v1.started.json"))
+}
+
+fn failure_report_path() -> Result<PathBuf, AnyError> {
+    Ok(repository_root()?.join("docs/experiments/lean-temporal-audit-v1.failed.json"))
+}
+
+fn repository_root() -> Result<PathBuf, AnyError> {
+    Ok(PathBuf::from(git_output(&[
+        "rev-parse",
+        "--show-toplevel",
+    ])?))
+}
+
+fn git_output(arguments: &[&str]) -> Result<String, AnyError> {
+    let output = Command::new("git").args(arguments).output()?;
+    if !output.status.success() {
+        return Err("Lean Temporal Audit must run inside its committed repository".into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn retain_failure_if_exposed(report: &FailureReport<'_>) -> Result<(), AnyError> {
+    if !execution_receipt_path()?.exists() {
+        return Ok(());
+    }
+    let path = failure_report_path()?;
+    if path.exists() {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    serde_json::to_writer_pretty(file, report)?;
+    Ok(())
+}
+
+fn validate_assessment(
+    packet: &CritiquePacketIdentity,
+    assessment: &CritiqueAssessment,
+) -> Result<(), AnyError> {
+    if packet.items.len() != 32
+        || assessment.items.len() != 32
+        || assessment.reviewer.trim().is_empty()
+        || assessment.overall_assessment.trim().is_empty()
+    {
+        return Err("Lean Temporal Audit critique must completely assess 32 items".into());
+    }
+    let packet_ids = packet
+        .items
+        .iter()
+        .map(|item| item.blinded_id.as_str())
+        .collect::<HashSet<_>>();
+    let assessed_ids = assessment
+        .items
+        .iter()
+        .map(|item| item.blinded_id.as_str())
+        .collect::<HashSet<_>>();
+    if packet_ids.len() != 32 || assessed_ids != packet_ids {
+        return Err("Lean Temporal Audit critique IDs differ from the blinded packet".into());
+    }
+    for item in &assessment.items {
+        for rating in [
+            &item.generality,
+            &item.proof_collapse,
+            &item.local_elegance,
+            &item.family_elegance,
+            &item.corpus_compression,
+        ] {
+            if !matches!(rating.as_str(), "low" | "medium" | "high" | "not-observed") {
+                return Err("Lean Temporal Audit elegance ratings use an unknown value".into());
+            }
+        }
+        if !matches!(
+            item.human_value.as_str(),
+            "unlikely" | "plausible" | "clear" | "not-assessable"
+        ) || item.notes.trim().is_empty()
+        {
+            return Err("Lean Temporal Audit human-value assessment is incomplete".into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_finalize(arguments: &[String]) -> Result<FinalizeArguments, AnyError> {
+    let mut values = HashMap::<&str, &str>::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let flag = arguments[index].as_str();
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--mechanical-report" | "--critique-packet" | "--assessment" | "--output" => {
+                if values.insert(flag, value).is_some() {
+                    return Err(format!("duplicate argument {flag}").into());
+                }
+            }
+            _ => {
+                return Err(format!("unknown lean-temporal-audit-finalize argument {flag}").into());
+            }
+        }
+        index += 2;
+    }
+    let path = |flag| -> Result<PathBuf, AnyError> {
+        values
+            .get(flag)
+            .map(|value| PathBuf::from(*value))
+            .ok_or_else(|| format!("lean-temporal-audit-finalize requires {flag}").into())
+    };
+    Ok(FinalizeArguments {
+        mechanical_report: path("--mechanical-report")?,
+        critique_packet: path("--critique-packet")?,
+        assessment: path("--assessment")?,
+        output: path("--output")?,
+    })
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
@@ -1347,20 +1875,15 @@ fn mean(values: &[f64]) -> f64 {
 }
 
 fn directional(head: usize, value: f64) -> f64 {
-    if head >= 5 { 1.0 - value } else { value }
+    if PotentialHead::ALL[head].lower_is_better() {
+        1.0 - value
+    } else {
+        value
+    }
 }
 
-const fn head_name(head: usize) -> &'static str {
-    match head {
-        0 => "anticipation",
-        1 => "descendants",
-        2 => "reuse",
-        3 => "compression",
-        4 => "declaration-survival",
-        5 => "dependency-cost",
-        6 => "dead-end",
-        _ => panic!("Potential head index differs"),
-    }
+fn head_name(head: usize) -> &'static str {
+    PotentialHead::ALL[head].name()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1375,8 +1898,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn candidate(name: &str, module: &str, family: &str) -> Candidate {
-        Candidate {
+    fn artifact(name: &str, module: &str, family: &str) -> FrozenArtifact {
+        FrozenArtifact {
             declaration: name.into(),
             module: module.into(),
             semantic_family: family.into(),
@@ -1385,8 +1908,8 @@ mod tests {
 
     #[test]
     fn module_nested_bootstrap_is_deterministic_and_directional() {
-        let full = vec![candidate("A", "M1", "f1"), candidate("B", "M2", "f2")];
-        let baseline = vec![candidate("C", "M1", "f3"), candidate("D", "M2", "f4")];
+        let full = vec![artifact("A", "M1", "f1"), artifact("B", "M2", "f2")];
+        let baseline = vec![artifact("C", "M1", "f3"), artifact("D", "M2", "f4")];
         let targets = [
             ("A".into(), [1.0; POTENTIAL_HEADS]),
             ("B".into(), [1.0; POTENTIAL_HEADS]),
@@ -1399,6 +1922,31 @@ mod tests {
         let second = clustered_difference_lower_bound(&full, &baseline, 0, &targets);
         assert!(first >= 0.0);
         assert!((first - second).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn missing_audit_artifacts_remain_in_every_head_denominator() {
+        let ranking = Ranking {
+            treatment: "full".into(),
+            training_cpu_ns: 10,
+            selection_cpu_ns: [20; POTENTIAL_HEADS],
+            heads: std::array::from_fn(|_| {
+                vec![
+                    artifact("present", "M", "f1"),
+                    artifact("missing", "M", "f2"),
+                ]
+            }),
+        };
+        let targets = [("present".into(), [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0])]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let outcomes = evaluate(&[ranking], &targets);
+        for head in &outcomes[0].heads {
+            assert_eq!(head.selected, 1);
+            assert_eq!(head.missing, 1);
+            assert!((head.directional_utility - 0.5).abs() < f64::EPSILON);
+            assert!(head.exhaustion_cpu_ns >= 30);
+        }
     }
 
     #[test]
@@ -1433,9 +1981,12 @@ mod tests {
                     cumulative_cpu_upper_bound_ns: cpu,
                     proof_nodes: 1,
                     proof_depth: 1,
-                    encoded_bytes: 1,
-                    dependencies: 0,
-                    axioms: 0,
+                    proof_encoded_bytes: 1,
+                    source_dependencies: 0,
+                    source_axioms: 0,
+                    replayed_dependencies: Some(0),
+                    replayed_axioms: Some(0),
+                    elegance_preserved: true,
                 });
             }
         }

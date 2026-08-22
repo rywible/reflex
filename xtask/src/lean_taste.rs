@@ -355,7 +355,7 @@ fn evaluate_treatment(
             model.rank_for_head(selection, limit, head)
         };
         selected_union.extend(selected.iter().copied());
-        let index = head_index(head);
+        let index = head.index();
         mean_targets[index] = means(selection, &selected)[index];
     }
     let ranking_wall_ns = duration_ns(rank_started.elapsed());
@@ -623,18 +623,6 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-const fn head_index(head: PotentialHead) -> usize {
-    match head {
-        PotentialHead::Anticipation => 0,
-        PotentialHead::Descendants => 1,
-        PotentialHead::Reuse => 2,
-        PotentialHead::Compression => 3,
-        PotentialHead::DeclarationSurvival => 4,
-        PotentialHead::DependencyCost => 5,
-        PotentialHead::DeadEnd => 6,
-    }
 }
 
 #[allow(dead_code)]

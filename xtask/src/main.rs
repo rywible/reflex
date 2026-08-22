@@ -217,8 +217,16 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean_audit_confirm::confirm(&arguments)
         }
+        Some("lean-temporal-audit-confirm-child") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_audit_confirm::confirm_child(&arguments)
+        }
+        Some("lean-temporal-audit-finalize") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_audit_confirm::finalize(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
                 .into(),
         ),
     }

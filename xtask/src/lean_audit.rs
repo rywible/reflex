@@ -32,6 +32,11 @@ struct LockArguments {
     manifest: PathBuf,
     output: PathBuf,
     mathlib_commit: String,
+    mathlib_commit_timestamp: String,
+    boundary_successor_commit: String,
+    boundary_successor_timestamp: String,
+    boundary_successor_first_parent: String,
+    boundary_evidence_url: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -42,7 +47,7 @@ struct LockArguments {
 struct ManifestIdentity {
     schema: String,
     protocol_sha256: String,
-    candidate_set_sha256: String,
+    audit_artifact_set_sha256: String,
     content_sha256: String,
 }
 
@@ -53,9 +58,14 @@ struct AuditLock {
     freeze_manifest_file_sha256: String,
     freeze_manifest_content_sha256: String,
     protocol_sha256: String,
-    candidate_set_sha256: String,
+    audit_artifact_set_sha256: String,
     audit_boundary: &'static str,
     mathlib_commit: String,
+    mathlib_commit_timestamp: String,
+    boundary_successor_commit: String,
+    boundary_successor_timestamp: String,
+    boundary_successor_first_parent: String,
+    boundary_evidence_url: String,
     lean_toolchain: String,
     lean_toolchain_alias: String,
     lean_version: String,
@@ -70,9 +80,9 @@ struct Protocol {
     schema: &'static str,
     cutoff: &'static str,
     training_pairs: [[&'static str; 2]; 2],
-    candidate_snapshot: &'static str,
-    candidate_exclusion: &'static str,
-    candidates_per_head: usize,
+    audit_artifact_snapshot: &'static str,
+    audit_artifact_exclusion: &'static str,
+    audit_artifacts_per_head: usize,
     heads: [&'static str; POTENTIAL_HEADS],
     treatments: [&'static str; 8],
     cpu_checkpoints_seconds: [u64; 4],
@@ -84,11 +94,11 @@ struct Protocol {
     statistical_unit: &'static str,
     interval: &'static str,
     bootstrap_resamples: usize,
-    kernel_replay_candidates_per_head: usize,
+    kernel_replay_artifacts_per_head: usize,
     relationship_certificate_limit: usize,
     critique_items: usize,
     stopping_rule: &'static str,
-    promotion_rule: &'static str,
+    confirmation_rule: &'static str,
     causal_ablation_rule: &'static str,
     time_to_utility_rule: &'static str,
     no_regression_rule: &'static str,
@@ -108,7 +118,7 @@ struct PairSummary {
 }
 
 #[derive(Clone, Serialize)]
-struct FrozenCandidate {
+struct FrozenArtifact {
     declaration: String,
     module: String,
     semantic_family: String,
@@ -124,7 +134,7 @@ struct FrozenRanking {
     ranking_wall_ns: [u64; POTENTIAL_HEADS],
     ranking_cpu_ns: [u64; POTENTIAL_HEADS],
     strategies: [&'static str; POTENTIAL_HEADS],
-    heads: [Vec<FrozenCandidate>; POTENTIAL_HEADS],
+    heads: [Vec<FrozenArtifact>; POTENTIAL_HEADS],
 }
 
 #[derive(Serialize)]
@@ -137,8 +147,8 @@ struct FreezeManifest {
     catalog_durable_bytes: [u64; 3],
     pairs: [PairSummary; 2],
     training_examples: usize,
-    candidate_examples: usize,
-    candidate_set_sha256: String,
+    audit_artifacts: usize,
+    audit_artifact_set_sha256: String,
     rankings: Vec<FrozenRanking>,
     host: HostEnvironment,
     protocol_deviations: Vec<String>,
@@ -166,18 +176,18 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         .iter()
         .map(|example| example.semantic_group)
         .collect::<HashSet<_>>();
-    let candidates = december
-        .candidate_examples()
+    let audit_artifacts = december
+        .forecast_artifacts()
         .into_iter()
         .filter(|candidate| !seen.contains(&candidate.semantic_group))
         .collect::<Vec<_>>();
-    if candidates.len() < CANDIDATES_PER_HEAD {
-        return Err("pre-cutoff semantic-family exclusion leaves too few audit candidates".into());
+    if audit_artifacts.len() < CANDIDATES_PER_HEAD {
+        return Err("pre-cutoff semantic-family exclusion leaves too few audit artifacts".into());
     }
 
     let protocol = frozen_protocol();
     let protocol_sha256 = hash_json(&protocol)?;
-    let candidate_set_sha256 = candidate_set_hash(&candidates);
+    let audit_artifact_set_sha256 = audit_artifact_set_hash(&audit_artifacts);
     let mut rankings = Vec::new();
     for (name, treatment) in [
         ("full", Treatment::Full),
@@ -186,10 +196,15 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         ("no-consolidation", Treatment::NoConsolidation),
         ("immediate-only", Treatment::ImmediateOnly),
     ] {
-        rankings.push(freeze_treatment(name, treatment, &experience, &candidates)?);
+        rankings.push(freeze_treatment(
+            name,
+            treatment,
+            &experience,
+            &audit_artifacts,
+        )?);
     }
     for baseline in ["uniform", "dependency-light", "historical-reuse"] {
-        rankings.push(freeze_baseline(baseline, &candidates));
+        rankings.push(freeze_baseline(baseline, &audit_artifacts));
     }
 
     let mut manifest = FreezeManifest {
@@ -209,8 +224,8 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
         ],
         pairs: [pair_summary(&first), pair_summary(&second)],
         training_examples: experience.len(),
-        candidate_examples: candidates.len(),
-        candidate_set_sha256,
+        audit_artifacts: audit_artifacts.len(),
+        audit_artifact_set_sha256,
         rankings,
         host,
         protocol_deviations: Vec::new(),
@@ -222,11 +237,11 @@ pub fn freeze(arguments: &[String]) -> Result<(), AnyError> {
     }
     std::fs::write(&arguments.output, serde_json::to_vec_pretty(&manifest)?)?;
     println!(
-        "protocol_sha256={} content_sha256={} candidate_set_sha256={} candidates={} durable_bytes={}",
+        "protocol_sha256={} content_sha256={} audit_artifact_set_sha256={} audit_artifacts={} durable_bytes={}",
         manifest.protocol_sha256,
         manifest.content_sha256,
-        manifest.candidate_set_sha256,
-        manifest.candidate_examples,
+        manifest.audit_artifact_set_sha256,
+        manifest.audit_artifacts,
         std::fs::metadata(&arguments.output)?.len()
     );
     Ok(())
@@ -244,7 +259,10 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         return Err("Lean Temporal Audit freeze manifest schema differs".into());
     }
     validate_commit(&arguments.mathlib_commit)?;
+    validate_commit(&arguments.boundary_successor_commit)?;
+    validate_commit(&arguments.boundary_successor_first_parent)?;
     validate_commit(&arguments.lean_commit)?;
+    validate_audit_boundary(&arguments)?;
     if arguments.lean_toolchain.trim().is_empty()
         || arguments.lean_toolchain_alias.trim().is_empty()
         || arguments.lean_version.trim().is_empty()
@@ -257,9 +275,14 @@ pub fn lock(arguments: &[String]) -> Result<(), AnyError> {
         freeze_manifest_file_sha256: crate::harness::hash_file(&arguments.manifest)?,
         freeze_manifest_content_sha256: identity.content_sha256,
         protocol_sha256: identity.protocol_sha256,
-        candidate_set_sha256: identity.candidate_set_sha256,
+        audit_artifact_set_sha256: identity.audit_artifact_set_sha256,
         audit_boundary: "strictly before 2026-07-01T00:00:00Z",
         mathlib_commit: arguments.mathlib_commit,
+        mathlib_commit_timestamp: arguments.mathlib_commit_timestamp,
+        boundary_successor_commit: arguments.boundary_successor_commit,
+        boundary_successor_timestamp: arguments.boundary_successor_timestamp,
+        boundary_successor_first_parent: arguments.boundary_successor_first_parent,
+        boundary_evidence_url: arguments.boundary_evidence_url,
         lean_toolchain: arguments.lean_toolchain,
         lean_toolchain_alias: arguments.lean_toolchain_alias,
         lean_version: arguments.lean_version,
@@ -285,18 +308,10 @@ fn frozen_protocol() -> Protocol {
         schema: SCHEMA,
         cutoff: CUTOFF,
         training_pairs: [["2024-06-30", "2024-09-30"], ["2024-09-30", "2024-12-31"]],
-        candidate_snapshot: "2024-12-31",
-        candidate_exclusion: "exclude every semantic family observed in either training pair",
-        candidates_per_head: CANDIDATES_PER_HEAD,
-        heads: [
-            "anticipation",
-            "descendants",
-            "reuse",
-            "compression",
-            "declaration-survival",
-            "dependency-cost",
-            "dead-end",
-        ],
+        audit_artifact_snapshot: "2024-12-31",
+        audit_artifact_exclusion: "exclude every semantic family observed in either training pair",
+        audit_artifacts_per_head: CANDIDATES_PER_HEAD,
+        heads: PotentialHead::ALL.map(PotentialHead::name),
         treatments: [
             "full",
             "bootstrap",
@@ -316,13 +331,13 @@ fn frozen_protocol() -> Protocol {
         statistical_unit: "semantic theorem family nested in exact Lean source module; paired by frozen family identity",
         interval: "module-clustered paired percentile bootstrap, simultaneous one-sided 99% lower bounds",
         bootstrap_resamples: 10_000,
-        kernel_replay_candidates_per_head: 16,
+        kernel_replay_artifacts_per_head: 16,
         relationship_certificate_limit: 64,
         critique_items: 32,
-        stopping_rule: "carry the final anytime value forward after all 256 frozen candidates for a head are exhausted; never burn CPU to fill a checkpoint",
-        promotion_rule: "Full weakly improves every head versus the virtual-best baseline and strictly improves at least one",
+        stopping_rule: "carry the final anytime value forward after all 256 frozen artifacts for a head are exhausted; never burn CPU to fill a checkpoint",
+        confirmation_rule: "Full weakly improves every head versus the virtual-best baseline and strictly improves at least one",
         causal_ablation_rule: "Full weakly improves every head and strictly improves at least one head versus each registered learned-system ablation",
-        time_to_utility_rule: "for each head use the lower of Full and virtual-best final directional utility over 16 kernel-replayed candidates as the common target; CPU includes frozen training, ranking, fetch, and kernel replay; require geometric-mean baseline/Full time at least 10x with simultaneous 99% lower bound above 3x",
+        time_to_utility_rule: "for each head use the lower of Full and virtual-best final directional utility over 16 kernel-replayed artifacts as the common target; CPU includes frozen training, ranking, fetch, and kernel replay; require geometric-mean baseline/Full time at least 10x with simultaneous 99% lower bound above 3x",
         no_regression_rule: "zero regression in kernel migration, protected elegance measurements, recovery, or resource limits",
         recovery_rule: "cold reconstruction reproduces every mechanical decision and kernel certificate hash",
         audit_snapshot_rule: "latest mathlib commit with commit timestamp strictly before 2026-07-01T00:00:00Z; exact commit and Lean pin locked before checkout",
@@ -414,12 +429,12 @@ fn baseline_indexes(examples: &[TemporalExample], name: &str) -> Vec<usize> {
     ranked
 }
 
-fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<FrozenCandidate> {
+fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<FrozenArtifact> {
     indexes
         .iter()
         .map(|index| {
             let example = &examples[*index];
-            FrozenCandidate {
+            FrozenArtifact {
                 declaration: example.declaration.to_string(),
                 module: example.module.to_string(),
                 semantic_family: hex(&example.semantic_group),
@@ -428,9 +443,9 @@ fn freeze_candidates(examples: &[TemporalExample], indexes: &[usize]) -> Vec<Fro
         .collect()
 }
 
-fn candidate_set_hash(candidates: &[TemporalExample]) -> String {
+fn audit_artifact_set_hash(candidates: &[TemporalExample]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"reflex-lean-audit-candidates-v1\0");
+    digest.update(b"reflex-lean-audit-artifacts-v1\0");
     for candidate in candidates {
         digest.update(candidate.declaration.to_string().as_bytes());
         digest.update([0]);
@@ -495,6 +510,11 @@ fn parse_lock(arguments: &[String]) -> Result<LockArguments, AnyError> {
             "--manifest"
             | "--output"
             | "--mathlib-commit"
+            | "--mathlib-commit-timestamp"
+            | "--boundary-successor-commit"
+            | "--boundary-successor-timestamp"
+            | "--boundary-successor-first-parent"
+            | "--boundary-evidence-url"
             | "--lean-toolchain"
             | "--lean-toolchain-alias"
             | "--lean-version"
@@ -517,6 +537,11 @@ fn parse_lock(arguments: &[String]) -> Result<LockArguments, AnyError> {
         manifest: PathBuf::from(value("--manifest")?),
         output: PathBuf::from(value("--output")?),
         mathlib_commit: value("--mathlib-commit")?,
+        mathlib_commit_timestamp: value("--mathlib-commit-timestamp")?,
+        boundary_successor_commit: value("--boundary-successor-commit")?,
+        boundary_successor_timestamp: value("--boundary-successor-timestamp")?,
+        boundary_successor_first_parent: value("--boundary-successor-first-parent")?,
+        boundary_evidence_url: value("--boundary-evidence-url")?,
         lean_toolchain: value("--lean-toolchain")?,
         lean_toolchain_alias: value("--lean-toolchain-alias")?,
         lean_version: value("--lean-version")?,
@@ -536,6 +561,42 @@ fn validate_commit(commit: &str) -> Result<(), AnyError> {
     }
 }
 
+fn validate_audit_boundary(arguments: &LockArguments) -> Result<(), AnyError> {
+    const BOUNDARY: &str = "2026-07-01T00:00:00Z";
+    for timestamp in [
+        &arguments.mathlib_commit_timestamp,
+        &arguments.boundary_successor_timestamp,
+    ] {
+        if timestamp.len() != BOUNDARY.len()
+            || timestamp.as_bytes().get(4) != Some(&b'-')
+            || timestamp.as_bytes().get(7) != Some(&b'-')
+            || timestamp.as_bytes().get(10) != Some(&b'T')
+            || timestamp.as_bytes().get(13) != Some(&b':')
+            || timestamp.as_bytes().get(16) != Some(&b':')
+            || timestamp.as_bytes().get(19) != Some(&b'Z')
+            || timestamp
+                .bytes()
+                .enumerate()
+                .filter(|(index, _)| ![4, 7, 10, 13, 16, 19].contains(index))
+                .any(|(_, byte)| !byte.is_ascii_digit())
+        {
+            return Err(
+                "Lean Temporal Audit boundary timestamps must use YYYY-MM-DDTHH:MM:SSZ".into(),
+            );
+        }
+    }
+    if arguments.mathlib_commit_timestamp.as_str() >= BOUNDARY
+        || arguments.boundary_successor_timestamp.as_str() < BOUNDARY
+        || arguments.boundary_successor_first_parent != arguments.mathlib_commit
+        || !arguments
+            .boundary_evidence_url
+            .starts_with("https://github.com/leanprover-community/mathlib4/")
+    {
+        return Err("Lean Temporal Audit pin does not bracket the registered boundary on mathlib's first-parent history".into());
+    }
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut output, byte| {
@@ -547,6 +608,24 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boundary_arguments() -> LockArguments {
+        LockArguments {
+            manifest: PathBuf::from("manifest.json"),
+            output: PathBuf::from("lock.json"),
+            mathlib_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            mathlib_commit_timestamp: "2026-06-30T23:59:59Z".into(),
+            boundary_successor_commit: "89abcdef0123456789abcdef0123456789abcdef".into(),
+            boundary_successor_timestamp: "2026-07-01T00:00:00Z".into(),
+            boundary_successor_first_parent: "0123456789abcdef0123456789abcdef01234567".into(),
+            boundary_evidence_url:
+                "https://github.com/leanprover-community/mathlib4/commits/master/".into(),
+            lean_toolchain: "leanprover/lean4:v4.example".into(),
+            lean_toolchain_alias: "example".into(),
+            lean_version: "4.example".into(),
+            lean_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+        }
+    }
 
     #[test]
     fn audit_pins_require_exact_lowercase_commits() {
@@ -563,5 +642,19 @@ mod tests {
         assert_eq!(protocol.cpu_checkpoints_seconds, CPU_CHECKPOINT_SECONDS);
         assert_eq!(protocol.lanes, 8);
         assert_eq!(protocol.in_process_lanes + protocol.verifier_processes, 8);
+    }
+
+    #[test]
+    fn audit_boundary_requires_adjacent_first_parent_revisions_around_cutoff() {
+        let valid = boundary_arguments();
+        assert!(validate_audit_boundary(&valid).is_ok());
+
+        let mut late = boundary_arguments();
+        late.mathlib_commit_timestamp = "2026-07-01T00:00:00Z".into();
+        assert!(validate_audit_boundary(&late).is_err());
+
+        let mut detached = boundary_arguments();
+        detached.boundary_successor_first_parent = detached.boundary_successor_commit.clone();
+        assert!(validate_audit_boundary(&detached).is_err());
     }
 }
