@@ -99,6 +99,59 @@ pub struct ConsolidatedRelationship {
     pub proof_nodes_removed: usize,
 }
 
+/// Independently interpretable proof-, dependency-, family-, and corpus-level
+/// elegance Measurements. No ordering or scalarization is attached.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EleganceProfile {
+    pub proof_nodes: usize,
+    pub proof_depth: usize,
+    pub encoded_bytes: usize,
+    pub allowed_axioms: usize,
+    pub direct_dependencies: usize,
+    pub verified_descendants: usize,
+    pub family_collapses: usize,
+    pub corpus_proof_nodes_removed: usize,
+}
+
+impl EleganceProfile {
+    #[must_use]
+    pub fn from_verified_theorem(
+        theorem: &IndexedTheorem,
+        relationships: &[CertifiedRelationship],
+        consolidated: &[ConsolidatedRelationship],
+    ) -> Self {
+        let descendants = relationships
+            .iter()
+            .filter(|relationship| relationship.earlier.name == theorem.name)
+            .count();
+        let families = consolidated
+            .iter()
+            .filter(|relationship| {
+                relationship.source == theorem.name
+                    && relationship.kind == RelationshipKind::FamilyCollapse
+            })
+            .count();
+        let removed = consolidated
+            .iter()
+            .filter(|relationship| {
+                relationship.source == theorem.name
+                    && relationship.kind == RelationshipKind::CorpusCompression
+            })
+            .map(|relationship| relationship.proof_nodes_removed)
+            .sum();
+        Self {
+            proof_nodes: theorem.proof_term.node_count(),
+            proof_depth: theorem.proof_term.depth(),
+            encoded_bytes: serde_json::to_vec(theorem).map_or(usize::MAX, |bytes| bytes.len()),
+            allowed_axioms: theorem.axioms.len(),
+            direct_dependencies: theorem.dependencies.len(),
+            verified_descendants: descendants,
+            family_collapses: families,
+            corpus_proof_nodes_removed: removed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GraphEntry {
     name: LeanName,
@@ -372,7 +425,9 @@ pub fn certify_relationship(
         } else {
             RelationshipKind::Definitional
         }
-    } else if matches!(source.proposition, LeanExpr::ForallE { .. }) {
+    } else if candidate.expected == RelationshipKind::Specialization
+        && matches!(source.proposition, LeanExpr::ForallE { .. })
+    {
         RelationshipKind::Specialization
     } else {
         RelationshipKind::Derivation

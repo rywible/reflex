@@ -428,16 +428,23 @@ fn stratified_relationships(
     limit: usize,
 ) -> Vec<&reflex_lean::temporal::RelationshipCandidate> {
     use reflex_lean::temporal::RelationshipKind;
-    let exact_limit = limit.div_ceil(2);
+    let exact_limit = limit.saturating_mul(2).div_ceil(3);
     let mut selected = candidates
         .iter()
         .filter(|candidate| candidate.expected == RelationshipKind::Exact)
         .take(exact_limit)
         .collect::<Vec<_>>();
+    let remaining = limit.saturating_sub(selected.len());
     selected.extend(
         candidates
             .iter()
-            .filter(|candidate| candidate.expected != RelationshipKind::Exact)
+            .filter(|candidate| candidate.expected == RelationshipKind::Specialization)
+            .take(remaining.div_ceil(2)),
+    );
+    selected.extend(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.expected == RelationshipKind::Derivation)
             .take(limit.saturating_sub(selected.len())),
     );
     selected
