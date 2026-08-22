@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
-    OptimizationGoal, Preference, ResourceEnvelope, ResourceUsage, improve,
+    OptimizationGoal, ParetoUpdate, Preference, ResourceEnvelope, ResourceUsage, improve,
 };
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 use reflex_lean::catalog::LeanCatalog;
 use reflex_lean::domain::{LeanCorpus, LeanDomain, LeanMetric, LeanSeedScope};
 use reflex_lean::temporal::{TemporalExample, TemporalSnapshot};
@@ -17,11 +18,11 @@ use serde::Serialize;
 
 use crate::harness::{
     AnyError, HostEnvironment, HostIsolation, HostIsolationPolicy, capture_child_host_isolated,
-    environment, hash_file, hash_json, inherited_host_isolation, parse_flag_values, require_absent,
-    require_clean, require_release,
+    environment, hash_file, hash_json, hex, inherited_host_isolation, parse_flag_values,
+    require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v6";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v7";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -43,6 +44,7 @@ struct Arguments {
     output: PathBuf,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    training_verification_requests: u64,
     verification_requests: u64,
 }
 
@@ -88,8 +90,25 @@ struct TreatmentResult {
     heldout_pareto_artifacts: usize,
     strict_proof_node_improvements: usize,
     proof_nodes_removed: usize,
+    strict_improvements: Vec<StrictImprovement>,
     usage: Usage,
     bundle_sha256: String,
+}
+
+#[derive(Serialize)]
+struct StrictImprovement {
+    observer_sequence: u64,
+    artifact_key: String,
+    declaration: String,
+    seed_proof_nodes: usize,
+    proof_nodes: usize,
+    proof_nodes_removed: usize,
+}
+
+#[derive(Serialize)]
+struct LearningSummary {
+    generation: u64,
+    champion_present: bool,
 }
 
 #[derive(Serialize)]
@@ -98,12 +117,15 @@ struct Report {
     status: &'static str,
     training_artifacts: usize,
     heldout_artifacts: usize,
+    training_verification_limit: u64,
+    evaluation_verification_limit: u64,
     primary_proof_node_limit: usize,
     primary_selection: &'static str,
     september_catalog_sha256: String,
     december_catalog_sha256: String,
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
+    training_learning: LearningSummary,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -124,6 +146,7 @@ struct ReportInputs {
     december_catalog_sha256: String,
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
+    training_learning: LearningSummary,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -255,29 +278,27 @@ fn run_treatments(
                 start: 0,
                 count: prepared.training,
             },
-            arguments.verification_requests,
+            arguments.training_verification_requests,
             BundlePlan::Fresh {
                 target: training_bundle.clone(),
             },
         )?,
         |_| ControlFlow::Continue(()),
     )?);
-    let bootstrap = finish_treatment(
+    let training_learning = learning_summary(&training_bundle)?;
+    if !training_learning.champion_present {
+        return Err(format!(
+            "Lean training produced no promoted Model Revision after {} Artifacts and {} Verification requests; a Full versus no-model treatment would be a placebo",
+            prepared.training, training_usage.verification_requests
+        )
+        .into());
+    }
+    let bootstrap = run_fresh_treatment(
         "bootstrap",
-        improve(
-            LeanDomain::new(prepared.config.clone(), prepared.heldout_corpus.clone())?,
-            request(
-                LeanSeedScope {
-                    start: 0,
-                    count: prepared.heldout,
-                },
-                arguments.verification_requests,
-                BundlePlan::Fresh {
-                    target: bootstrap_bundle.clone(),
-                },
-            )?,
-            |_| ControlFlow::Continue(()),
-        )?,
+        &prepared.config,
+        &prepared.heldout_corpus,
+        prepared.heldout,
+        arguments.verification_requests,
         &prepared.heldout_seed_nodes,
         &bootstrap_bundle,
     )?;
@@ -327,6 +348,7 @@ fn run_treatments(
         december_catalog_sha256: prepared.december_catalog_sha256,
         selected_artifacts: prepared.selected_artifacts,
         training_usage,
+        training_learning,
         full,
         no_model,
         no_derived,
@@ -367,6 +389,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         december_catalog_sha256,
         selected_artifacts,
         training_usage,
+        training_learning,
         full,
         no_model,
         no_derived,
@@ -388,12 +411,15 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         status: "development-only; no 2026 exposure",
         training_artifacts,
         heldout_artifacts,
+        training_verification_limit: arguments.training_verification_requests,
+        evaluation_verification_limit: arguments.verification_requests,
         primary_proof_node_limit: PRIMARY_PROOF_NODE_LIMIT,
         primary_selection: "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; held-out names are absent from September and held-out statement fingerprints are disjoint from selected training; development opportunity corpus, not confirmation sampling",
         september_catalog_sha256,
         december_catalog_sha256,
         selected_artifacts,
         training_usage,
+        training_learning,
         full,
         no_model,
         no_derived,
@@ -818,9 +844,39 @@ fn require_supervising_parent() -> Result<(), AnyError> {
     Ok(())
 }
 
+fn run_fresh_treatment(
+    name: &'static str,
+    config: &LeanWorkerConfig,
+    corpus: &LeanCorpus,
+    heldout: usize,
+    verification_requests: u64,
+    seed_nodes: &HashMap<String, usize>,
+    target: &Path,
+) -> Result<TreatmentResult, AnyError> {
+    let mut strict_improvements = Vec::new();
+    let outcome = improve(
+        LeanDomain::new(config.clone(), corpus.clone())?,
+        request(
+            LeanSeedScope {
+                start: 0,
+                count: heldout,
+            },
+            verification_requests,
+            BundlePlan::Fresh {
+                target: target.to_path_buf(),
+            },
+        )?,
+        |update| {
+            record_strict_improvements(&update, seed_nodes, &mut strict_improvements);
+            ControlFlow::Continue(())
+        },
+    )?;
+    finish_treatment(name, outcome, seed_nodes, strict_improvements, target)
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "a causal treatment binds its immutable source, output, corpus, budget, and result accounting"
+    reason = "a resumed causal treatment also binds the immutable source Bundle"
 )]
 fn run_resumed_treatment(
     name: &'static str,
@@ -832,26 +888,26 @@ fn run_resumed_treatment(
     target: &Path,
     seed_nodes: &HashMap<String, usize>,
 ) -> Result<TreatmentResult, AnyError> {
-    finish_treatment(
-        name,
-        improve(
-            LeanDomain::new(config.clone(), corpus.clone())?,
-            request(
-                LeanSeedScope {
-                    start: 0,
-                    count: heldout,
-                },
-                verification_requests,
-                BundlePlan::Resume {
-                    source: source.to_path_buf(),
-                    target: target.to_path_buf(),
-                },
-            )?,
-            |_| ControlFlow::Continue(()),
+    let mut strict_improvements = Vec::new();
+    let outcome = improve(
+        LeanDomain::new(config.clone(), corpus.clone())?,
+        request(
+            LeanSeedScope {
+                start: 0,
+                count: heldout,
+            },
+            verification_requests,
+            BundlePlan::Resume {
+                source: source.to_path_buf(),
+                target: target.to_path_buf(),
+            },
         )?,
-        seed_nodes,
-        target,
-    )
+        |update| {
+            record_strict_improvements(&update, seed_nodes, &mut strict_improvements);
+            ControlFlow::Continue(())
+        },
+    )?;
+    finish_treatment(name, outcome, seed_nodes, strict_improvements, target)
 }
 
 fn finish_training(outcome: reflex::SessionOutcome<LeanDomain>) -> Usage {
@@ -864,6 +920,7 @@ fn finish_treatment(
     name: &'static str,
     outcome: reflex::SessionOutcome<LeanDomain>,
     seed_nodes: &HashMap<String, usize>,
+    strict_improvements: Vec<StrictImprovement>,
     bundle: &Path,
 ) -> Result<TreatmentResult, AnyError> {
     let heldout = outcome
@@ -889,11 +946,42 @@ fn finish_treatment(
             .iter()
             .map(|(seed, artifact)| seed.saturating_sub(*artifact))
             .sum(),
+        strict_improvements,
         usage: usage(outcome.usage()),
         bundle_sha256: hash_file(bundle)?,
     };
     drop(outcome);
     Ok(summary)
+}
+
+fn record_strict_improvements(
+    update: &ParetoUpdate<'_, LeanDomain>,
+    seed_nodes: &HashMap<String, usize>,
+    output: &mut Vec<StrictImprovement>,
+) {
+    for artifact in update.added() {
+        let artifact_key = hex(artifact.key().as_bytes());
+        let declaration = artifact.artifact().declaration.name.to_string();
+        let Some(seed_proof_nodes) = seed_nodes.get(&declaration).copied() else {
+            continue;
+        };
+        let proof_nodes = artifact.artifact().proof_term.node_count();
+        if proof_nodes >= seed_proof_nodes
+            || output
+                .iter()
+                .any(|known| known.artifact_key == artifact_key)
+        {
+            continue;
+        }
+        output.push(StrictImprovement {
+            observer_sequence: update.sequence(),
+            artifact_key,
+            declaration,
+            seed_proof_nodes,
+            proof_nodes,
+            proof_nodes_removed: seed_proof_nodes - proof_nodes,
+        });
+    }
 }
 
 fn usage(usage: ResourceUsage) -> Usage {
@@ -905,6 +993,64 @@ fn usage(usage: ResourceUsage) -> Usage {
         elapsed_ns: u64::try_from(usage.elapsed_time.as_nanos()).unwrap_or(u64::MAX),
         cpu_ns: u64::try_from(usage.cpu_time.as_nanos()).unwrap_or(u64::MAX),
     }
+}
+
+fn learning_summary(bundle: &Path) -> Result<LearningSummary, AnyError> {
+    let bytes = std::fs::read(bundle)?;
+    let decoded = CanonicalBundle::decode(&bytes, RUNTIME_RESIDENT_BYTES)?;
+    let revisions = decoded.segment(SegmentKind::Revisions);
+    if revisions.len() < 64 {
+        return Err("Lean training Bundle has a truncated Revisions segment".into());
+    }
+    let mut state = &revisions[64..];
+    take_summary_sized(&mut state)?;
+    let learning = take_summary_sized(&mut state)?;
+    if !state.is_empty() {
+        return Err("Lean training Bundle has trailing Revisions state".into());
+    }
+    learning_header(learning)
+}
+
+fn learning_header(learning: &[u8]) -> Result<LearningSummary, AnyError> {
+    if learning.len() < 14 || &learning[..5] != b"RFLS\x02" {
+        return Err("Lean training Bundle has incompatible Learning state".into());
+    }
+    let generation = u64::from_le_bytes(learning[5..13].try_into()?);
+    let champion_present = match learning[13] {
+        0 => false,
+        1 => {
+            if learning.len() < 22 {
+                return Err("Lean training Bundle has a truncated champion Model".into());
+            }
+            let model_bytes = usize::try_from(u64::from_le_bytes(learning[14..22].try_into()?))?;
+            if model_bytes > learning.len() - 22 {
+                return Err("Lean training Bundle has a truncated champion Model".into());
+            }
+            true
+        }
+        _ => return Err("Lean training Bundle has an invalid champion marker".into()),
+    };
+    if generation == 0 && champion_present {
+        return Err("Lean training Bundle has a champion at generation zero".into());
+    }
+    Ok(LearningSummary {
+        generation,
+        champion_present,
+    })
+}
+
+fn take_summary_sized<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], AnyError> {
+    if input.len() < 8 {
+        return Err("Lean training Bundle has a truncated sized field".into());
+    }
+    let length = usize::try_from(u64::from_le_bytes(input[..8].try_into()?))?;
+    *input = &input[8..];
+    if input.len() < length {
+        return Err("Lean training Bundle has a truncated sized payload".into());
+    }
+    let (value, remainder) = input.split_at(length);
+    *input = remainder;
+    Ok(value)
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
@@ -919,6 +1065,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
             "--output",
             "--training-artifacts",
             "--heldout-artifacts",
+            "--training-verification-requests",
             "--verification-requests",
         ],
         "lean-public-optimizer-development",
@@ -938,6 +1085,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
         output: value("--output")?.into(),
         training_artifacts: value("--training-artifacts")?.parse()?,
         heldout_artifacts: value("--heldout-artifacts")?.parse()?,
+        training_verification_requests: value("--training-verification-requests")?.parse()?,
         verification_requests: value("--verification-requests")?.parse()?,
     })
 }
@@ -1004,6 +1152,7 @@ mod tests {
             output: PathBuf::new(),
             training_artifacts: 1,
             heldout_artifacts: 1,
+            training_verification_requests: 1,
             verification_requests: 1,
         };
 
@@ -1013,5 +1162,27 @@ mod tests {
 
         assert_eq!(heldout.len(), 1);
         assert_eq!(heldout[0].statement_hash, 2);
+    }
+
+    #[test]
+    fn learning_header_distinguishes_bootstrap_from_a_promoted_champion() {
+        let mut bootstrap = b"RFLS\x02".to_vec();
+        bootstrap.extend_from_slice(&0_u64.to_le_bytes());
+        bootstrap.push(0);
+        let summary = learning_header(&bootstrap).unwrap();
+        assert_eq!(summary.generation, 0);
+        assert!(!summary.champion_present);
+
+        let mut promoted = b"RFLS\x02".to_vec();
+        promoted.extend_from_slice(&2_u64.to_le_bytes());
+        promoted.push(1);
+        promoted.extend_from_slice(&3_u64.to_le_bytes());
+        promoted.extend_from_slice(&[1, 2, 3]);
+        let summary = learning_header(&promoted).unwrap();
+        assert_eq!(summary.generation, 2);
+        assert!(summary.champion_present);
+
+        promoted[14..22].copy_from_slice(&4_u64.to_le_bytes());
+        assert!(learning_header(&promoted).is_err());
     }
 }
