@@ -584,7 +584,7 @@ impl TasteModel {
                 .then_with(|| compare_forecast_profiles(&left.2, &right.2, priority))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let exploration = limit.div_ceil(8).min(examples.len());
+        let exploration = limit.div_ceil(128).min(examples.len());
         let mut selected = ranked
             .iter()
             .take(limit.saturating_sub(exploration))

@@ -196,16 +196,12 @@ pub fn run(arguments: &[String]) -> Result<(), AnyError> {
 
     let june_worker = LeanWorker::start(&june_config)?;
     let september_worker = LeanWorker::start(&september_config)?;
-    let mut candidate_order = training.relationship_candidates.iter().collect::<Vec<_>>();
-    candidate_order.sort_by_key(|candidate| match candidate.expected {
-        reflex_lean::temporal::RelationshipKind::Exact => 0,
-        _ => 1,
-    });
+    let candidate_order = stratified_relationships(
+        &training.relationship_candidates,
+        arguments.certificate_limit,
+    );
     let mut certificates = Vec::new();
-    for candidate in candidate_order
-        .into_iter()
-        .take(arguments.certificate_limit)
-    {
+    for candidate in candidate_order {
         if let Some(certificate) = certify_relationship(&june_worker, &september_worker, candidate)?
         {
             certificates.push(certificate);
@@ -425,6 +421,26 @@ fn summarize_relationships(
             .map(|item| item.proof_nodes_removed)
             .sum(),
     }
+}
+
+fn stratified_relationships(
+    candidates: &[reflex_lean::temporal::RelationshipCandidate],
+    limit: usize,
+) -> Vec<&reflex_lean::temporal::RelationshipCandidate> {
+    use reflex_lean::temporal::RelationshipKind;
+    let exact_limit = limit.div_ceil(2);
+    let mut selected = candidates
+        .iter()
+        .filter(|candidate| candidate.expected == RelationshipKind::Exact)
+        .take(exact_limit)
+        .collect::<Vec<_>>();
+    selected.extend(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.expected != RelationshipKind::Exact)
+            .take(limit.saturating_sub(selected.len())),
+    );
+    selected
 }
 
 fn config(lake: &PathBuf, root: &PathBuf, snapshot: &str) -> Result<LeanWorkerConfig, AnyError> {
