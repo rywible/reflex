@@ -231,12 +231,18 @@ pub enum BundlePlan {
         source: PathBuf,
         target: PathBuf,
     },
+    Fork {
+        source: PathBuf,
+        target: PathBuf,
+    },
 }
 ```
 
 Every public Improvement Session produces a durable Domain Bundle. `source` and `target` may be equal; publication still uses a new sealed file followed by atomic replacement. Ephemeral Campaigns may exist privately, but ephemeral Sessions do not weaken the public durability contract.
 
-If `source` contains an interrupted Session, the Goal Set, Seed Scope, Semantic Identity, and original Resource Envelope must canonically match the request; already consumed resources remain consumed and recovery continues from the tail. If `source` contains a completed Session, its retained knowledge becomes the starting revision for a new request and the new Resource Envelope starts at zero usage. A mismatch never silently discards interrupted work.
+`Resume` continues exact retained search state. If its `source` contains an interrupted Session, the Goal Set, Seed Scope, Semantic Identity, and original Resource Envelope must canonically match the request; already consumed resources remain consumed and recovery continues from the tail. A mismatch never silently discards interrupted work.
+
+`Fork` starts new search from the verified Artifacts, Experience, Knowledge Revision, and Model Revision in a completed `source`, under the new request's Seed Scope, goals, and fresh Resource Envelope. It deliberately discards source Search Frontier, deferred Candidates, and pending-parent tail. Forking an interrupted Bundle is incompatible rather than an implicit loss of restart-complete work.
 
 ### Outcome and updates
 

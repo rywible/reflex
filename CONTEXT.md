@@ -212,6 +212,10 @@ _Avoid_: Failed challenger, global champion
 A portable, content-addressed data package of compatible domain knowledge, learned state, retained Experience, provenance, Verification requirements, and recovery state from which autonomous improvement can resume when paired with an installed Domain Definition of matching Semantic Identity.
 _Avoid_: Runtime checkpoint, remote registry, model file, executable plugin
 
+**Bundle Fork**:
+A new Improvement Session that imports the verified Artifacts, Experience, Knowledge Revision, and Model Revision from a completed Domain Bundle while starting new search from the caller's current Seed Scope, goals, and Resource Envelope. It never inherits or silently discards an interrupted Session.
+_Avoid_: Resume, model copy, checkpoint reset, fine-tuning
+
 **Operational Promotion**:
 The automatic, atomic, and rollback-capable adoption of a challenger Knowledge Revision or Model Revision after sufficient evidence shows improvement without violating protected Measurement tolerances. Incomparable challengers may instead become Specialist Revisions.
 _Avoid_: Scientific Confirmation, manual approval, unchecked replacement

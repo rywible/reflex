@@ -30,7 +30,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v17";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v18";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -468,7 +468,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v14";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v15";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -678,7 +678,7 @@ fn run_treatments(
         false,
     )?;
     crate::causal::ablate_bundle(&training_bundle, &no_derived_seed, None, true)?;
-    let full = run_resumed_treatment(
+    let full = run_forked_treatment(
         "full",
         &prepared.config,
         &prepared.heldout_corpus,
@@ -688,7 +688,7 @@ fn run_treatments(
         &full_bundle,
         &prepared.heldout_seed_nodes,
     )?;
-    let no_model = run_resumed_treatment(
+    let no_model = run_forked_treatment(
         "no-model",
         &prepared.config,
         &prepared.heldout_corpus,
@@ -698,7 +698,7 @@ fn run_treatments(
         &no_model_bundle,
         &prepared.heldout_seed_nodes,
     )?;
-    let no_derived = run_resumed_treatment(
+    let no_derived = run_forked_treatment(
         "no-derived",
         &prepared.config,
         &prepared.heldout_corpus,
@@ -1284,7 +1284,7 @@ fn run_fresh_treatment(
     clippy::too_many_arguments,
     reason = "a resumed causal treatment also binds the immutable source Bundle"
 )]
-fn run_resumed_treatment(
+fn run_forked_treatment(
     name: &'static str,
     config: &LeanWorkerConfig,
     corpus: &LeanCorpus,
@@ -1304,7 +1304,7 @@ fn run_resumed_treatment(
                 count: heldout,
             },
             verification_requests,
-            BundlePlan::Resume {
+            BundlePlan::Fork {
                 source: source.to_path_buf(),
                 target: target.to_path_buf(),
             },

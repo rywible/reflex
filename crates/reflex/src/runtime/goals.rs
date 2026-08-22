@@ -8,8 +8,6 @@ use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
 use crate::measurement::{MeasurementSpace, MetricOrdering};
 use crate::session::{GoalId, SessionError, VerifiedArtifact};
 
-use super::ProposedCandidate;
-
 /// The operational interpretation of a caller-supplied Goal Set.
 ///
 /// Runtime phases use this single interface for validation, stable identity,
@@ -19,6 +17,27 @@ pub(super) struct GoalEvaluator<'a, D: DomainDefinition> {
     domain: &'a D,
     goals: &'a GoalSet<D>,
     ids: Vec<GoalId>,
+}
+
+pub(super) struct ParentPreferenceRanks {
+    keys: Vec<crate::ArtifactKey>,
+    dominated_by: Vec<usize>,
+    ranks: Vec<usize>,
+}
+
+impl ParentPreferenceRanks {
+    pub(super) fn as_slice(&self) -> &[usize] {
+        &self.ranks
+    }
+
+    fn rebuild(&mut self) {
+        let mut order = (0..self.keys.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|index| (self.dominated_by[*index], *index));
+        self.ranks.resize(self.keys.len(), 0);
+        for (rank, index) in order.into_iter().enumerate() {
+            self.ranks[index] = rank;
+        }
+    }
 }
 
 impl<'a, D: DomainDefinition> GoalEvaluator<'a, D> {
@@ -94,24 +113,60 @@ impl<'a, D: DomainDefinition> GoalEvaluator<'a, D> {
             })
     }
 
-    pub(super) fn compare_parents(
+    pub(super) fn parent_ranks(
         &self,
         frontier: &[(VerifiedArtifact<D>, usize)],
-        left: &ProposedCandidate<D>,
-        right: &ProposedCandidate<D>,
+    ) -> ParentPreferenceRanks {
+        let mut ranks = ParentPreferenceRanks {
+            keys: Vec::new(),
+            dominated_by: Vec::new(),
+            ranks: Vec::new(),
+        };
+        self.extend_parent_ranks(frontier, &mut ranks);
+        ranks
+    }
+
+    pub(super) fn extend_parent_ranks(
+        &self,
+        frontier: &[(VerifiedArtifact<D>, usize)],
+        ranks: &mut ParentPreferenceRanks,
+    ) {
+        assert!(
+            ranks.keys.len() <= frontier.len(),
+            "Search Frontier cannot shrink while parent preference ranks are live"
+        );
+        let retained = ranks.keys.len();
+        assert!(
+            ranks
+                .keys
+                .iter()
+                .zip(frontier)
+                .all(|(key, (artifact, _))| *key == artifact.key()),
+            "Search Frontier prefix cannot change while parent preference ranks are live"
+        );
+        ranks.keys.extend(
+            frontier[retained..]
+                .iter()
+                .map(|(artifact, _)| artifact.key()),
+        );
+        ranks.dominated_by.resize(frontier.len(), 0);
+        for right in retained..frontier.len() {
+            for left in 0..right {
+                match self.compare_parent_artifacts(&frontier[left].0, &frontier[right].0) {
+                    Ordering::Less => ranks.dominated_by[right] += 1,
+                    Ordering::Greater => ranks.dominated_by[left] += 1,
+                    Ordering::Equal => {}
+                }
+            }
+        }
+        ranks.rebuild();
+    }
+
+    fn compare_parent_artifacts(
+        &self,
+        left_parent: &VerifiedArtifact<D>,
+        right_parent: &VerifiedArtifact<D>,
     ) -> Ordering {
-        let Some(left_parent) = frontier
-            .get(left.candidate.source_index)
-            .map(|parent| &parent.0)
-        else {
-            return Ordering::Equal;
-        };
-        let Some(right_parent) = frontier
-            .get(right.candidate.source_index)
-            .map(|parent| &parent.0)
-        else {
-            return Ordering::Equal;
-        };
         let mut left_better = false;
         let mut right_better = false;
         for goal in self.goals.goals.iter() {
@@ -139,6 +194,27 @@ impl<'a, D: DomainDefinition> GoalEvaluator<'a, D> {
         }
         Ok(output)
     }
+}
+
+#[cfg(test)]
+fn linearize_partial_order(
+    count: usize,
+    mut compare: impl FnMut(usize, usize) -> Ordering,
+) -> Vec<usize> {
+    let dominated_by = (0..count)
+        .map(|right| {
+            (0..count)
+                .filter(|left| *left != right && compare(*left, right) == Ordering::Less)
+                .count()
+        })
+        .collect::<Vec<_>>();
+    let mut order = (0..count).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|index| (dominated_by[*index], *index));
+    let mut ranks = vec![0; count];
+    for (rank, index) in order.into_iter().enumerate() {
+        ranks[index] = rank;
+    }
+    ranks
 }
 
 fn goal_ids<D: DomainDefinition>(
@@ -601,7 +677,31 @@ fn same_correctness_claim<D: DomainDefinition>(
 
 #[cfg(test)]
 mod tests {
-    use super::retain_nondominated;
+    use super::{linearize_partial_order, retain_nondominated};
+
+    #[test]
+    fn partial_preference_is_linearized_before_it_reaches_a_sort_comparator() {
+        let partial = |left: usize, right: usize| match (left, right) {
+            (0, 1) => std::cmp::Ordering::Less,
+            (1, 0) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+
+        let ranks = linearize_partial_order(3, partial);
+
+        assert_eq!(
+            ranks
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(
+            ranks[0] < ranks[1],
+            "strict preference must survive linearization"
+        );
+    }
 
     #[test]
     fn claim_grouped_retention_matches_the_quadratic_definition_in_input_order() {

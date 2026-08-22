@@ -191,7 +191,7 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         request(
             heldout.clone(),
             u64::try_from(replay_count + 10).unwrap(),
-            BundlePlan::Resume {
+            BundlePlan::Fork {
                 source: constrained.clone(),
                 target: constrained.clone(),
             },
@@ -237,8 +237,8 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         learned_accepted > 0
             && learned_queue_accepted > 0
             && learned_new.iter().any(|attempt| !attempt.accepted)
-            && bootstrap_accepted == 0,
-        "the learned allocator must prefer useful work while retaining protected exploration; learned accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
+            && learned_accepted > bootstrap_accepted,
+        "the learned allocator must beat Bootstrap while retaining protected exploration; learned accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
     );
     assert_eq!(
         learned_fates
@@ -268,7 +268,7 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         request(
             heldout.clone(),
             10_000,
-            BundlePlan::Resume {
+            BundlePlan::Fork {
                 source: learned_full.clone(),
                 target: learned_full.clone(),
             },

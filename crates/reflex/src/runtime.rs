@@ -227,7 +227,7 @@ const CHOICES_PER_VERIFICATION: u64 = 8;
 const GENERATION_COHORT_LOOKAHEAD: u64 = 2;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 13;
+const RUNTIME_REVISION: u64 = 14;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -757,12 +757,20 @@ where
     let setup_started = instrumentation.start();
     let goal_evaluator = GoalEvaluator::new(domain, &request.goals)?;
     let bundle_codec = RestartBundleCodec::new(domain, request);
-    let recovered_bundle = request
+    let mut recovered_bundle = request
         .bundle
         .source()
         .map(|source| bundle_codec.recover(source, resource_meter, worker_resident_bytes))
         .transpose()?
         .unwrap_or_default();
+    if request.bundle.forks() {
+        if recovered_bundle.interrupted_usage.is_some() {
+            return Err(SessionError::IncompatibleBundle);
+        }
+        recovered_bundle.frontier_keys.clear();
+        recovered_bundle.deferred_candidates.clear();
+        recovered_bundle.pending_parent_keys.clear();
+    }
     let recovered_has_search_tail = !recovered_bundle.deferred_candidates.is_empty()
         || !recovered_bundle.pending_parent_keys.is_empty();
     let recovered_resident_bytes = recovered_bundle.resident_bytes;
@@ -1104,6 +1112,7 @@ where
         .iter()
         .map(crate::OperatorDescriptor::operator)
         .collect::<Vec<_>>();
+    let mut parent_ranks = goal_evaluator.parent_ranks(&frontier);
     let initial_resident = worker_resident_bytes
         .saturating_add(resident_state_bytes(
             &known,
@@ -1432,7 +1441,7 @@ where
         let mut candidate_fates = novel.fates;
         let fate_is_new_generation = novel.fate_is_new_generation;
         deferred_candidates = order_by_learned_potential(
-            &goal_evaluator,
+            parent_ranks.as_slice(),
             &frontier,
             &covered_claims,
             pinned_model.as_ref(),
@@ -1783,6 +1792,7 @@ where
             .map_err(SessionError::Durability)?;
         test_fault_point("pareto-published");
         epoch.commit();
+        goal_evaluator.extend_parent_ranks(&frontier, &mut parent_ranks);
         instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
         pareto = proposed_pareto;
         checkpoint = proposed_checkpoint;
@@ -2079,6 +2089,9 @@ fn resident_state_bytes<D: DomainDefinition, O>(
     knowledge: &KnowledgeState,
     learning: &LearningState,
 ) -> u64 {
+    let parent_preference_bytes = (frontier.capacity() as u64).saturating_mul(
+        (std::mem::size_of::<ArtifactKey>() + 2 * std::mem::size_of::<usize>()) as u64,
+    );
     let records = known.iter().fold(0_u64, |bytes, artifact| {
         bytes
             .saturating_add(std::mem::size_of::<VerifiedArtifactRecord<D>>() as u64)
@@ -2092,6 +2105,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
         .saturating_add(vector_bytes(roots))
         .saturating_add(vector_bytes(pareto))
         .saturating_add(vector_bytes(frontier))
+        .saturating_add(parent_preference_bytes)
         .saturating_add(vector_bytes(recovered_keys))
         .saturating_add(vector_bytes(operators))
         .saturating_add(vector_bytes(checkpoint))
@@ -2514,7 +2528,7 @@ fn append_derived_candidates<D: DomainDefinition>(
 }
 
 fn order_by_learned_potential<D: DomainDefinition>(
-    goals: &GoalEvaluator<'_, D>,
+    parent_ranks: &[usize],
     frontier: &[(VerifiedArtifact<D>, usize)],
     covered_claims: &[[u8; 32]],
     model: Option<&FtrlModel>,
@@ -2522,7 +2536,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
     candidates: &mut Vec<ProposedCandidate<D>>,
     candidate_fates: &mut [CandidateFateObservation],
 ) -> Vec<ProposedCandidate<D>> {
-    rank_all_candidates(goals, frontier, model, candidates, candidate_fates);
+    rank_all_candidates(parent_ranks, model, candidates, candidate_fates);
     let (mut origin_exploration, remaining) =
         partition_origin_exploration(frontier, covered_claims, std::mem::take(candidates), limit);
     let (mut derived_exploration, mut unprotected) = partition_derived_exploration(remaining);
@@ -2583,22 +2597,23 @@ fn order_by_learned_potential<D: DomainDefinition>(
 }
 
 fn rank_all_candidates<D: DomainDefinition>(
-    goals: &GoalEvaluator<'_, D>,
-    frontier: &[(VerifiedArtifact<D>, usize)],
+    parent_ranks: &[usize],
     model: Option<&FtrlModel>,
     candidates: &mut [ProposedCandidate<D>],
     candidate_fates: &mut [CandidateFateObservation],
 ) {
     let bootstrap_compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
-        goals.compare_parents(frontier, left, right).then_with(|| {
-            left.operator_symbol
-                .cmp(&right.operator_symbol)
-                .then_with(|| {
-                    left.candidate
-                        .source_index
-                        .cmp(&right.candidate.source_index)
-                })
-        })
+        parent_ranks[left.candidate.source_index]
+            .cmp(&parent_ranks[right.candidate.source_index])
+            .then_with(|| {
+                left.operator_symbol
+                    .cmp(&right.operator_symbol)
+                    .then_with(|| {
+                        left.candidate
+                            .source_index
+                            .cmp(&right.candidate.source_index)
+                    })
+            })
     };
     let mut global_bootstrap = (0..candidates.len()).collect::<Vec<_>>();
     global_bootstrap
@@ -2621,7 +2636,8 @@ fn rank_all_candidates<D: DomainDefinition>(
         global_learned.sort_unstable_by(|left, right| {
             compare_forecasts(forecasts[*left], forecasts[*right])
                 .then_with(|| {
-                    goals.compare_parents(frontier, &candidates[*left], &candidates[*right])
+                    parent_ranks[candidates[*left].candidate.source_index]
+                        .cmp(&parent_ranks[candidates[*right].candidate.source_index])
                 })
                 .then_with(|| {
                     candidates[*left]
@@ -4596,18 +4612,22 @@ fn test_fault_point(_: &str) {}
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
+    #[cfg(feature = "internal-experiments")]
     use std::time::Duration;
 
+    #[cfg(feature = "internal-experiments")]
     use sha2::Digest;
 
+    #[cfg(feature = "internal-experiments")]
+    use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
     use super::{
-        RUNTIME_REVISION, append_proposal_features, candidate_generation_limit,
-        inspect_session_segment, operator_feature_values, protected_origin_keys, push_bytes,
-        push_duration, push_u64, sort_prefix_by,
+        append_proposal_features, candidate_generation_limit, operator_feature_values,
+        protected_origin_keys, sort_prefix_by,
     };
     use crate::ProposalFeatures;
     use crate::learning::{FEATURE_COUNT, Features};
 
+    #[cfg(feature = "internal-experiments")]
     #[test]
     fn session_inspection_reports_completion_and_resource_usage() {
         let mut encoded = vec![1];

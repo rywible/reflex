@@ -71,6 +71,32 @@ fn interrupted_resume_rejects_resource_drift_without_replacing_the_checkpoint() 
 }
 
 #[test]
+fn interrupted_bundle_cannot_be_forked_or_replaced() {
+    let bundle_path = crash_checkpoint("fork-interrupted");
+    let checkpoint = std::fs::read(&bundle_path).unwrap();
+    let result = improve(
+        BitVecDomain::unary_u8(),
+        make_request(
+            BundlePlan::Fork {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            },
+            nested_seed(),
+            Direction::Minimize,
+            1,
+        ),
+        |_| ControlFlow::Continue(()),
+    );
+
+    assert!(
+        matches!(result, Err(reflex::SessionError::IncompatibleBundle))
+            && std::fs::read(&bundle_path).unwrap() == checkpoint,
+        "Fork must not silently abandon an interrupted restart-complete search tail"
+    );
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
 fn interrupted_resume_rejects_goal_and_seed_scope_drift() {
     let bundle_path = crash_checkpoint("semantic-drift");
     let checkpoint = std::fs::read(&bundle_path).unwrap();
@@ -441,7 +467,7 @@ fn cohort_request(bundle: BundlePlan) -> ImprovementRequest<BitVecDomain> {
     let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
     let preference =
         Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
-    let seeds = (225..=228).map(multi_choice_seed);
+    let seeds = (225..=232).map(multi_choice_seed);
     ImprovementRequest::new(
         GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
         SeedScope::new(NonEmpty::try_from_iter(seeds).unwrap()),
