@@ -1,6 +1,6 @@
 # Reflex
 
-Reflex is an entirely Rust-implemented, domain-independent system for improving verifiable artifacts through learned, locally executed CPU search.
+Reflex is a Rust-implemented, domain-independent system for improving verifiable artifacts through learned, locally executed CPU search. An installed Domain Definition may delegate Verification to a pinned local domain-native authority when that authority cannot be safely embedded in Rust; the Reflex Runtime, search, learning, resource control, persistence, and public interface remain Rust.
 
 ## Language
 

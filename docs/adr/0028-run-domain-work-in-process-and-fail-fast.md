@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0048
+---
+
 # Run domain work in-process and fail fast
 
 Domain Operators and Verification Kernels execute in the Reflex process without a worker-process isolation layer. Fatal domain failures terminate the Runtime, which recovers from its durable state on restart; this accepts a larger failure boundary in exchange for the lowest dispatch overhead and simplest high-performance memory access.

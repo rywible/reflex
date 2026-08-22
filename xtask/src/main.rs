@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
 use reflex::{
-    BundlePlan, Completion, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
+    BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
     NonZeroDuration, Objective, OptimizationGoal, Preference, ResourceEnvelope, StructuralProtocol,
     improve,
 };
@@ -16,6 +17,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod causal;
+mod harness;
+
+use harness::{
+    AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_json,
+    hex, require_absent, require_clean, require_release,
+};
 
 const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v7";
 const CORPUS_NAME: &str = "unary-u8-full-ops-development-v2";
@@ -27,8 +34,6 @@ const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
 const DURABLE_BYTES: u64 = 256 * 1024 * 1024;
 const TIME_SECONDS: u64 = 120;
 const VERIFICATION_REQUESTS: u64 = 100_000;
-
-type AnyError = Box<dyn std::error::Error>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Assignment {
@@ -89,18 +94,6 @@ struct Protocol {
 }
 
 #[derive(Debug, Serialize)]
-struct Environment {
-    git_revision: String,
-    git_dirty: bool,
-    rustc: String,
-    cargo: String,
-    target_arch: &'static str,
-    target_os: &'static str,
-    cpu_description: String,
-    available_parallelism: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct Summary {
     worker_threads: usize,
     storage: String,
@@ -119,7 +112,7 @@ struct Report {
     schema: &'static str,
     protocol_sha256: String,
     protocol: Protocol,
-    environment: Environment,
+    environment: HostEnvironment,
     protocol_deviations: Vec<String>,
     semantic_outcome_sha256: Option<String>,
     summaries: Vec<Summary>,
@@ -183,9 +176,7 @@ fn parse_output(arguments: &[String]) -> Result<PathBuf, AnyError> {
     reason = "the baseline controller keeps the frozen assignment and reporting protocol auditable"
 )]
 fn run_baseline(output: &Path) -> Result<(), AnyError> {
-    if cfg!(debug_assertions) {
-        return Err("the baseline harness must run with --release".into());
-    }
+    require_release("baseline")?;
     let available = std::thread::available_parallelism()?.get();
     let worker_treatments = [1, 2, 4, 8]
         .into_iter()
@@ -210,16 +201,8 @@ fn run_baseline(output: &Path) -> Result<(), AnyError> {
     };
     let protocol_sha256 = hash_json(&protocol)?;
     let environment = environment()?;
-    if environment.git_dirty {
-        return Err("baseline execution requires a clean committed worktree".into());
-    }
-    if output.exists() {
-        return Err(format!(
-            "refusing to replace an existing baseline report: {}",
-            output.display()
-        )
-        .into());
-    }
+    require_clean(&environment, "baseline")?;
+    require_absent(output, "baseline report")?;
     let filesystem_root = std::env::current_dir()?.join("target/reflex-baseline-work");
     std::fs::create_dir_all(&filesystem_root)?;
     let ramfs_root =
@@ -322,27 +305,27 @@ fn run_assignment(
     assignment: Assignment,
     target: &Path,
 ) -> Result<RecordedRun, AnyError> {
-    let output = Command::new(executable)
-        .arg("baseline-child")
-        .arg("--workers")
-        .arg(assignment.worker_threads.to_string())
-        .arg("--storage")
-        .arg(&assignment.storage)
-        .arg("--replicate")
-        .arg(assignment.replicate.to_string())
-        .arg("--warmup")
-        .arg(if assignment.warmup { "true" } else { "false" })
-        .arg("--target")
-        .arg(target)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let (result, failure) = parse_child_output(output.status.success(), &stdout, &stderr);
+    let arguments = [
+        OsString::from("baseline-child"),
+        OsString::from("--workers"),
+        OsString::from(assignment.worker_threads.to_string()),
+        OsString::from("--storage"),
+        OsString::from(&assignment.storage),
+        OsString::from("--replicate"),
+        OsString::from(assignment.replicate.to_string()),
+        OsString::from("--warmup"),
+        OsString::from(if assignment.warmup { "true" } else { "false" }),
+        OsString::from("--target"),
+        target.as_os_str().to_owned(),
+    ];
+    let capture = capture_child(executable, &arguments, target, None)?;
+    let (result, failure) =
+        parse_child_output(capture.status.success(), &capture.stdout, &capture.stderr);
     Ok(RecordedRun {
         assignment,
-        exit_code: output.status.code(),
-        stdout,
-        stderr,
+        exit_code: capture.status.code(),
+        stdout: capture.stdout,
+        stderr: capture.stderr,
         result,
         failure,
     })
@@ -624,86 +607,6 @@ fn quantile(mut values: Vec<u64>, percentile: usize) -> u64 {
     values.sort_unstable();
     let index = (values.len() - 1).saturating_mul(percentile).div_ceil(100);
     values[index.min(values.len() - 1)]
-}
-
-fn environment() -> Result<Environment, AnyError> {
-    let git_revision = command_output("git", &["rev-parse", "HEAD"])?;
-    let git_dirty = !command_output("git", &["status", "--porcelain"])?.is_empty();
-    Ok(Environment {
-        git_revision,
-        git_dirty,
-        rustc: command_output("rustc", &["-Vv"])?,
-        cargo: command_output("cargo", &["-Vv"])?,
-        target_arch: std::env::consts::ARCH,
-        target_os: std::env::consts::OS,
-        cpu_description: cpu_description(),
-        available_parallelism: std::thread::available_parallelism()?.get(),
-    })
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> Result<String, AnyError> {
-    let output = Command::new(program).args(arguments).output()?;
-    if !output.status.success() {
-        return Err(format!("{program} failed with {}", output.status).into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
-fn cpu_description() -> String {
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|cpuinfo| {
-            let fields = cpuinfo
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .map(|(name, value)| (name.trim(), value.trim()))
-                .collect::<BTreeMap<_, _>>();
-            [
-                "model name",
-                "Hardware",
-                "Processor",
-                "CPU implementer",
-                "CPU architecture",
-                "CPU part",
-                "CPU variant",
-                "CPU revision",
-            ]
-            .into_iter()
-            .filter_map(|name| fields.get(name).map(|value| format!("{name}={value}")))
-            .reduce(|mut description, field| {
-                description.push_str("; ");
-                description.push_str(&field);
-                description
-            })
-        })
-        .unwrap_or_else(|| "unavailable".into())
-}
-
-fn hash_json(value: &impl Serialize) -> Result<String, serde_json::Error> {
-    Ok(hex(&Sha256::digest(serde_json::to_vec(value)?)))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        output.push(char::from(DIGITS[(byte >> 4) as usize]));
-        output.push(char::from(DIGITS[(byte & 0x0f) as usize]));
-    }
-    output
-}
-
-fn duration_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn completion_name(completion: Completion) -> &'static str {
-    match completion {
-        Completion::ResourceEnvelopeExhausted => "resource-envelope-exhausted",
-        Completion::SuccessConditionsSatisfied => "success-conditions-satisfied",
-        Completion::StoppedByObserver => "stopped-by-observer",
-        Completion::NoEligibleWork => "no-eligible-work",
-    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ Build Reflex **entirely in stable Rust**.
 
 - Keep the public API, Runtime Controller, search state, provenance, persistence, learned models, and optimized kernels in stable Rust.
 - Write a safe, portable Rust reference implementation for every hot kernel.
-- Optimize through Rust data layout, LLVM autovectorization, stable Neon intrinsics, LTO, PGO, and narrowly isolated Rust `unsafe` only when measurement justifies it. Do not use C/C++, assembly, foreign runtimes, or native-library FFI to close performance gaps.
+- Optimize through Rust data layout, LLVM autovectorization, host-native code generation, LTO, and PGO while keeping Reflex-owned source under `unsafe_code = "forbid"`. Do not use C/C++, assembly, foreign runtimes, or native-library FFI to close performance gaps.
 - Do not make a general tensor framework foundational. Start with purpose-built FP32 online linear/ranking models and a tiny fused MLP challenger behind a versioned model interface. Evaluate only Rust-native framework implementations for possible adoption.
 - Use a hybrid search portfolio: exact enumerative/best-first search, stochastic mutation, and bounded equality-saturation/consolidation components. Learned components rank batched Opportunities, select Operators, forecast structured Potential, and allocate search; they never replace Verification or the deterministic controller.
 
@@ -196,9 +196,8 @@ Implement the same packed `u8` evaluator/verifier in:
 
 1. safe scalar Rust;
 2. safe Rust written for LLVM autovectorization;
-3. stable Rust Neon intrinsics;
-4. host-tuned stable Rust;
-5. a portable x86-64 Rust counterpart.
+3. host-tuned safe Rust;
+4. a portable x86-64 safe Rust counterpart.
 
 Vary AST encoding, arity, expression depth, batch size, data layout, and cache working-set size. Record Candidates/s, verified semantic lanes/s, cycles, instructions, branches/misses, L1/L2/L3 misses, memory bandwidth, peak RSS, and energy if exposed. Inspect compiler vectorization remarks and generated machine code. Test cold and warm caches. An optimized Rust kernel earns adoption only if its end-to-end Campaign gain exceeds its complexity and maintenance cost.
 
@@ -261,7 +260,7 @@ Rejected because the initial models are small, structured, and continuously upda
 
 ### Nightly Rust for explicit SVE
 
-Rejected for the production foundation. Stable Rust can autovectorize, use stable Neon, and detect target features. Reflex will revisit explicit SVE only when stable Rust exposes it rather than pinning the product to nightly compiler internals.
+Rejected for the production foundation. Stable Rust can autovectorize and detect target features. Reflex will revisit explicit SIMD only through a future architectural decision if safe Rust cannot meet an observed end-to-end requirement.
 
 ### One learned policy or one search algorithm
 

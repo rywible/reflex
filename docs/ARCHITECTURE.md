@@ -22,12 +22,13 @@ reflex/
 ├── Cargo.toml
 ├── crates/
 │   ├── reflex/          # Published library and deep Runtime Module
-│   └── reflex-bitvec/   # Production u8 Reference Domain Adapter
+│   ├── reflex-bitvec/   # Production u8 Reference Domain Adapter
+│   └── reflex-bundle/   # Unpublished canonical Domain Bundle framing
 ├── xtask/               # Unpublished Rust repository commands
 └── docs/
 ```
 
-There is no `reflex-core`, `reflex-types`, `reflex-runtime`, `reflex-model`, or `reflex-storage` crate. Those divisions would create shallow cross-crate interfaces and expose implementation coupling. The `reflex` crate owns them as private Modules.
+There is no `reflex-core`, `reflex-types`, `reflex-runtime`, `reflex-model`, or `reflex-storage` crate. Those divisions would create shallow cross-crate interfaces and expose implementation coupling. The `reflex` crate owns them as private Modules. `reflex-bundle` is a deliberately narrow exception: it is unpublished and owns only canonical data framing shared by the production Runtime and internal Experimental Harness, preventing either adapter from carrying a second format implementation.
 
 The initial `reflex` crate exposes only domain construction, goals, session execution, Measurements, verified results, and Domain Bundle handles:
 
@@ -216,6 +217,8 @@ impl ResourceEnvelope {
 ```
 
 The Runtime stops scheduling before any one budget would be exceeded. Protected Allocations are private policy within these totals; callers grant resources but do not orchestrate their distribution.
+
+Internally, the Resource Envelope Guard receives typed resident reservations that distinguish retained live inventory, scoped transient overlap, and bytes awaiting durability publication. It alone applies resident, durable, verification, elapsed, and CPU limits and records peak usage; Runtime phases describe a reservation but do not interpret limits independently.
 
 ### Bundle plan
 
@@ -572,7 +575,7 @@ All five capability Modules obey these rules:
 - Input borrows do not escape the call.
 - Output is written into Runtime-owned reusable writers.
 - Temporary mutable state lives in per-worker scratch.
-- Adapters do not spawn threads or retain a separate worker pool.
+- Adapters do not spawn threads or retain a separate worker pool. A Verification Kernel may instead own pinned local domain-native worker processes under ADR 0048; each batch receives a Runtime allowance and reports external resource usage.
 - Identical inputs and declared environment produce identical semantic outputs; empirical Measurements carry environment provenance.
 - Panics are not caught. A panic or hang is a process failure, and restart recovers from durable state.
 - A batch-level returned error terminates the Session with a typed error; item-level rejection is represented in output.
@@ -684,7 +687,7 @@ The private record binds the domain Artifact to its Seed, Correctness Claim, ass
 
 Every Runtime-owned allocation is charged before growth against the Resource Envelope. Arena segments, hash tables, queues, verification caches, model state, scratch buffers, checkpoint staging, and observer exports are included.
 
-Because domain work executes in-process, a Domain Definition can violate its contract by allocating or running beyond the requested batch. Reflex can hard-limit scheduling and all Runtime-owned memory, but cannot forcibly preempt or account arbitrary Adapter internals without process isolation. Installed domain code is trusted to obey batch and scratch limits.
+Domain work executes in-process by default. A Domain Definition can violate its contract by allocating or running beyond the requested batch, so installed in-process code remains trusted to obey batch and scratch limits. A Verification Kernel using the ADR 0048 process exception receives an explicit remaining allowance; the Runtime reserves its declared overlap before dispatch and charges measured child CPU and peak resident memory afterward. Exceeding the allowance terminates that worker and becomes a Session failure recoverable from durable state.
 
 ## Parallel execution
 
@@ -700,13 +703,17 @@ Workers prefer local LIFO work for cache locality and steal batches when idle. R
 
 The Runtime Controller serializes epochs, Admission, Pareto changes, revision publication, and observer calls. It does not execute Candidate-scale work.
 
-Search, Verification, training, and Knowledge Consolidation share the same worker set and obey Protected Allocations. No learned or domain Module owns another pool.
+Each admission epoch is represented by an internal `EpochTransition`. Artifact, Search Frontier, and Experience Ledger consequence mutations remain staged until the restart-complete checkpoint is durable and observer export is admissible. Dropping an uncommitted transition structurally restores the prior state, so refusal paths cannot omit rollback work.
+
+Search, Verification, training, and Knowledge Consolidation share the same compute-lane budget and obey Protected Allocations. No learned or domain Module owns another pool. Pinned Verification workers authorized by ADR 0048 consume lanes from that same budget rather than creating nested parallelism.
 
 Production scheduling may be nondeterministic. The internal Experimental Harness uses fixed partitions, predetermined random streams, and deterministic reductions through the private Scheduler and ResourceMeter seams while exercising the same Improvement Session implementation.
 
 ## Revisions and learning
 
 Each Campaign holds immutable references to exactly one Knowledge Revision and one Model Revision. Campaign execution never observes hot-swapped learned state or indexes.
+
+The private Goal Evaluator is the one operational interpreter of a Goal Set. Validation, stable Goal IDs, Constraint eligibility, tiered Preference ordering, per-Goal Pareto membership, affected-Goal reporting, Success Conditions, and canonical checkpoint encoding cross this seam. It does not scalarize Preference and does not use Pareto membership as Search Frontier investment policy.
 
 The Bootstrap Revision is a valid DecisionModel implementation using deterministic structural cost, novelty, frontier age, and exploration rules. It runs through the same prediction and allocation path as learned revisions.
 
@@ -749,6 +756,10 @@ A Domain Bundle contains:
 - recovery state required to resume autonomous improvement.
 
 It is data-only and never contains executable Rust code.
+
+Bundle ownership is split by depth, not duplicated by caller. The unpublished canonical-format Module owns magic, versions, segment ordering, framing, and checksums. The private restart-complete codec owns the semantic mapping between Runtime state and those segments, including recovery validation and revision identity. The Runtime Controller asks that codec only to recover or seal; the Experimental Harness may replace data segments for ablation through the same canonical framing without gaining access to Runtime orchestration.
+
+The Experience Ledger owns immutable attempt observations, delayed consequences, Measurement observations, canonical encoding, resident accounting, and reproducible projections for Model Revision learning and Knowledge Consolidation. Runtime phases do not maintain parallel representations of an attempt.
 
 Hardware-specific packed weights, hash-table capacity, pointer values, worker queues, and transient indexes are rebuildable caches and do not enter the portable canonical state.
 
@@ -843,9 +854,9 @@ The early steps form a runnable vertical spine, but the production Reference Dom
 
 ## Performance gates before expansion
 
-Before adding binary arity, Wrela, a tensor framework, reduced precision, or a custom scheduler, measure:
+Before adding binary arity, Lean, Wrela, a tensor framework, reduced precision, or a custom scheduler, measure:
 
-- safe scalar versus autovectorized versus stable-Neon Rust evaluation;
+- safe scalar versus autovectorized portable and host-native Rust evaluation;
 - AST/DAG representations and hot-field layouts;
 - batch sizes across L1/L2/L3 working sets;
 - ordinary allocation versus per-worker arenas;

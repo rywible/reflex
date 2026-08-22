@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
@@ -13,11 +12,14 @@ use reflex::{
     ResourceEnvelope, StructuralProtocol, SuccessCondition, ThresholdRelation, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-type AnyError = Box<dyn std::error::Error>;
-type BundleSegment = (u8, u32, Vec<u8>);
+use super::harness::{
+    AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_file,
+    hash_json, hex, require_absent, require_clean, require_release,
+};
 
 const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v5";
 const EXPECTED_SPEC_SHA256: &str =
@@ -283,23 +285,11 @@ struct Contrast {
 }
 
 #[derive(Debug, Serialize)]
-struct Environment {
-    git_revision: String,
-    git_dirty: bool,
-    rustc: String,
-    cargo: String,
-    target_arch: &'static str,
-    target_os: &'static str,
-    cpu_description: String,
-    available_parallelism: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct Report {
     schema: &'static str,
     specification_sha256: String,
     specification: ExperimentSpec,
-    environment: Environment,
+    environment: HostEnvironment,
     audit_corpus_sha256: String,
     audit_corpora: Vec<Vec<CorpusRecord>>,
     training_bundle_sha256: String,
@@ -434,9 +424,7 @@ fn persist_audit_corpora(work: &Path, audit_corpora: &[Vec<CorpusRecord>]) -> Re
 }
 
 pub(super) fn materialize_audit(arguments: &[String]) -> Result<(), AnyError> {
-    if cfg!(debug_assertions) {
-        return Err("audit materialization must run with --release".into());
-    }
+    require_release("audit materialization")?;
     let output = match arguments {
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-materialize-audit requires --output PATH".into()),
@@ -445,17 +433,9 @@ pub(super) fn materialize_audit(arguments: &[String]) -> Result<(), AnyError> {
     if specification_sha256 != EXPECTED_SPEC_SHA256 {
         return Err("cannot materialize an audit corpus for a modified specification".into());
     }
-    if environment()?.git_dirty {
-        return Err("audit materialization requires a clean committed worktree".into());
-    }
+    require_clean(&environment()?, "audit materialization")?;
     validate_bootstrap_comparator()?;
-    if output.exists() {
-        return Err(format!(
-            "refusing to replace an existing audit artifact: {}",
-            output.display()
-        )
-        .into());
-    }
+    require_absent(&output, "audit artifact")?;
     let audit_corpora = generate_audit_corpora()?;
     let artifact = AuditCorpusArtifact {
         schema: "reflex-consumed-audit-corpus-v1",
@@ -485,15 +465,14 @@ fn persist_raw_run(work: &Path, run: &RecordedRun) -> Result<(), AnyError> {
 
 fn confirm_configuration(
     arguments: &[String],
-) -> Result<(PathBuf, ExperimentSpec, String, Environment), AnyError> {
-    if cfg!(debug_assertions) {
-        return Err("the causal harness must run with --release".into());
-    }
+) -> Result<(PathBuf, ExperimentSpec, String, HostEnvironment), AnyError> {
+    require_release("causal")?;
     let output = match arguments {
         [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v5.json"),
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-confirm accepts only an optional --output PATH".into()),
     };
+    require_absent(&output, "confirmatory report")?;
     let specification = specification();
     let specification_sha256 = hash_json(&specification)?;
     if specification_sha256 != EXPECTED_SPEC_SHA256 {
@@ -503,9 +482,7 @@ fn confirm_configuration(
         .into());
     }
     let environment = environment()?;
-    if environment.git_dirty {
-        return Err("confirmatory execution requires a clean worktree".into());
-    }
+    require_clean(&environment, "confirmatory")?;
     validate_bootstrap_comparator()?;
     Ok((output, specification, specification_sha256, environment))
 }
@@ -579,7 +556,7 @@ pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
     let result = ChildResult {
         replicate,
         treatment,
-        completion: completion(outcome.completion()).into(),
+        completion: completion_name(outcome.completion()).into(),
         wall_ns,
         process_cpu_ns,
         reported_elapsed_ns: duration_ns(usage.elapsed_time),
@@ -647,7 +624,7 @@ fn validate_evaluation(outcome: &reflex::SessionOutcome<BitVecDomain>) -> Result
     }
     Err(format!(
         "evaluation did not consume the exact verifier/thread envelope: completion={}, requests={}, workers={}",
-        completion(outcome.completion()),
+        completion_name(outcome.completion()),
         usage.verification_requests,
         usage.worker_threads
     )
@@ -1231,48 +1208,32 @@ fn run_assignment(
     corpus: &Path,
     target: &Path,
 ) -> Result<RecordedRun, AnyError> {
-    let stdout_path = target.with_extension("child.stdout");
-    let stderr_path = target.with_extension("child.stderr");
-    let stdout_file = std::fs::File::create(&stdout_path)?;
-    let stderr_file = std::fs::File::create(&stderr_path)?;
-    let mut child = Command::new(executable)
-        .arg("causal-child")
-        .arg("--replicate")
-        .arg(replicate.to_string())
-        .arg("--treatment")
-        .arg(treatment.as_str())
-        .arg("--corpus")
-        .arg(corpus)
-        .arg("--target")
-        .arg(target)
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()?;
-    let started = Instant::now();
-    let timed_out = loop {
-        if child.try_wait()?.is_some() {
-            break false;
-        }
-        if started.elapsed() >= Duration::from_secs(CHILD_TIMEOUT_SECONDS) {
-            child.kill()?;
-            break true;
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-    let status = child.wait()?;
-    let stdout = std::fs::read_to_string(&stdout_path)?;
-    let stderr = std::fs::read_to_string(&stderr_path)?;
-    std::fs::remove_file(stdout_path)?;
-    std::fs::remove_file(stderr_path)?;
-    let (result, failure) = if timed_out {
+    let arguments = [
+        OsString::from("causal-child"),
+        OsString::from("--replicate"),
+        OsString::from(replicate.to_string()),
+        OsString::from("--treatment"),
+        OsString::from(treatment.as_str()),
+        OsString::from("--corpus"),
+        corpus.as_os_str().to_owned(),
+        OsString::from("--target"),
+        target.as_os_str().to_owned(),
+    ];
+    let capture = capture_child(
+        executable,
+        &arguments,
+        target,
+        Some(Duration::from_secs(CHILD_TIMEOUT_SECONDS)),
+    )?;
+    let (result, failure) = if capture.timed_out {
         (
             None,
             Some(format!(
                 "child exceeded the {CHILD_TIMEOUT_SECONDS}-second process timeout"
             )),
         )
-    } else if status.success() {
-        match serde_json::from_str::<ChildResult>(stdout.trim()) {
+    } else if capture.status.success() {
+        match serde_json::from_str::<ChildResult>(capture.stdout.trim()) {
             Ok(result) if result.replicate == replicate && result.treatment == treatment => {
                 let failure = if !result.evaluation_valid {
                     Some(format!(
@@ -1296,15 +1257,15 @@ fn run_assignment(
             Err(error) => (None, Some(format!("malformed child output: {error}"))),
         }
     } else {
-        (None, Some(format!("child failed: {stderr}")))
+        (None, Some(format!("child failed: {}", capture.stderr)))
     };
     Ok(RecordedRun {
         replicate,
         treatment,
         order,
-        exit_code: status.code(),
-        stdout,
-        stderr,
+        exit_code: capture.status.code(),
+        stdout: capture.stdout,
+        stderr: capture.stderr,
         result,
         failure,
     })
@@ -1418,19 +1379,10 @@ fn ablate_bundle(
     model_template: Option<&Path>,
     derived: bool,
 ) -> Result<(), AnyError> {
-    let bytes = std::fs::read(source)?;
-    let (identity, mut segments) = decode_bundle(&bytes)?;
-    let revisions_index = segments
-        .iter()
-        .position(|(kind, _, _)| *kind == 2)
-        .ok_or("missing Revisions")?;
-    let artifacts = segments
-        .iter()
-        .find(|(kind, _, _)| *kind == 3)
-        .ok_or("missing Artifacts")?
-        .2
-        .clone();
-    let revisions = &segments[revisions_index].2;
+    let mut bundle = CanonicalBundle::decode(&std::fs::read(source)?)?;
+    let identity = bundle.identity().to_vec();
+    let artifacts = bundle.segment(SegmentKind::Artifacts).to_vec();
+    let revisions = bundle.segment(SegmentKind::Revisions);
     let mut input = &revisions[64..];
     let mut knowledge = take_sized(&mut input)?.to_vec();
     let mut learning = take_sized(&mut input)?.to_vec();
@@ -1439,12 +1391,8 @@ fn ablate_bundle(
     }
     let mut model_id: [u8; 32] = revisions[32..64].try_into()?;
     if let Some(template) = model_template {
-        let (_, template_segments) = decode_bundle(&std::fs::read(template)?)?;
-        let template_revisions = &template_segments
-            .iter()
-            .find(|(kind, _, _)| *kind == 2)
-            .ok_or("missing template Revisions")?
-            .2;
+        let template_bundle = CanonicalBundle::decode(&std::fs::read(template)?)?;
+        let template_revisions = template_bundle.segment(SegmentKind::Revisions);
         model_id = template_revisions[32..64].try_into()?;
         let mut template_input = &template_revisions[64..];
         take_sized(&mut template_input)?;
@@ -1461,8 +1409,8 @@ fn ablate_bundle(
     payload.extend_from_slice(&model_id);
     push_sized(&mut payload, &knowledge);
     push_sized(&mut payload, &learning);
-    segments[revisions_index].2 = payload;
-    std::fs::write(target, seal_bundle(&identity, &segments))?;
+    bundle.replace_segment(SegmentKind::Revisions, payload);
+    std::fs::write(target, bundle.encode())?;
     Ok(())
 }
 
@@ -1557,86 +1505,9 @@ fn knowledge_revision_id(
 }
 
 fn revision_ids(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), AnyError> {
-    let (_, segments) = decode_bundle(bytes)?;
-    let revisions = &segments
-        .iter()
-        .find(|(kind, _, _)| *kind == 2)
-        .ok_or("missing Revisions")?
-        .2;
+    let bundle = CanonicalBundle::decode(bytes)?;
+    let revisions = bundle.segment(SegmentKind::Revisions);
     Ok((revisions[..32].try_into()?, revisions[32..64].try_into()?))
-}
-
-fn decode_bundle(bytes: &[u8]) -> Result<(Vec<u8>, Vec<BundleSegment>), AnyError> {
-    if bytes.len() < 32
-        || Sha256::digest(&bytes[..bytes.len() - 32])[..] != bytes[bytes.len() - 32..]
-    {
-        return Err("invalid bundle checksum".into());
-    }
-    let mut input = &bytes[..bytes.len() - 32];
-    if take(&mut input, 8)? != b"REFLEX\0\x03" {
-        return Err("invalid bundle magic".into());
-    }
-    let identity = take_sized(&mut input)?.to_vec();
-    let count = u32::from_le_bytes(take(&mut input, 4)?.try_into()?);
-    let mut segments = Vec::new();
-    for _ in 0..count {
-        let kind = take(&mut input, 1)?[0];
-        let version = u32::from_le_bytes(take(&mut input, 4)?.try_into()?);
-        let payload = take_sized(&mut input)?.to_vec();
-        if Sha256::digest(&payload)[..] != *take(&mut input, 32)? {
-            return Err("invalid segment checksum".into());
-        }
-        segments.push((kind, version, payload));
-    }
-    Ok((identity, segments))
-}
-
-fn seal_bundle(identity: &[u8], segments: &[BundleSegment]) -> Vec<u8> {
-    let mut output = b"REFLEX\0\x03".to_vec();
-    push_sized(&mut output, identity);
-    output.extend_from_slice(
-        &u32::try_from(segments.len())
-            .expect("bundle segment count fits the format")
-            .to_le_bytes(),
-    );
-    for (kind, version, payload) in segments {
-        output.push(*kind);
-        output.extend_from_slice(&version.to_le_bytes());
-        push_sized(&mut output, payload);
-        output.extend_from_slice(&Sha256::digest(payload));
-    }
-    let checksum = Sha256::digest(&output);
-    output.extend_from_slice(&checksum);
-    output
-}
-
-fn environment() -> Result<Environment, AnyError> {
-    Ok(Environment {
-        git_revision: command_output("git", &["rev-parse", "HEAD"])?,
-        git_dirty: !command_output("git", &["status", "--porcelain"])?.is_empty(),
-        rustc: command_output("rustc", &["-Vv"])?,
-        cargo: command_output("cargo", &["-Vv"])?,
-        target_arch: std::env::consts::ARCH,
-        target_os: std::env::consts::OS,
-        cpu_description: super::cpu_description(),
-        available_parallelism: std::thread::available_parallelism()?.get(),
-    })
-}
-
-fn command_output(program: &str, arguments: &[&str]) -> Result<String, AnyError> {
-    let output = Command::new(program).args(arguments).output()?;
-    if !output.status.success() {
-        return Err(format!("{program} failed with {}", output.status).into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
-fn hash_json(value: &impl Serialize) -> Result<String, AnyError> {
-    Ok(hex(&Sha256::digest(serde_json::to_vec(value)?)))
-}
-
-fn hash_file(path: &Path) -> Result<String, AnyError> {
-    Ok(hex(&Sha256::digest(std::fs::read(path)?)))
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32], AnyError> {
@@ -1671,29 +1542,6 @@ fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], AnyError> {
     let (value, remainder) = input.split_at(count);
     *input = remainder;
     Ok(value)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn duration_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-const fn completion(value: Completion) -> &'static str {
-    match value {
-        Completion::ResourceEnvelopeExhausted => "resource-envelope-exhausted",
-        Completion::SuccessConditionsSatisfied => "success-conditions-satisfied",
-        Completion::StoppedByObserver => "stopped-by-observer",
-        Completion::NoEligibleWork => "no-eligible-work",
-    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0049
+---
+
 # Permit justified, isolated `unsafe` kernels
 
 Reflex exposes a safe Rust API while permitting narrowly isolated internal Rust `unsafe` kernels when benchmarks demonstrate material performance value. Each such kernel requires documented invariants, a safe Rust reference implementation, differential and fuzz testing, and Miri-compatible coverage where applicable.

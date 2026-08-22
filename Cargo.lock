@@ -238,6 +238,7 @@ dependencies = [
  "atomic-write-file",
  "cpu-time",
  "rayon",
+ "reflex-bundle",
  "sha2",
 ]
 
@@ -247,6 +248,13 @@ version = "0.1.0"
 dependencies = [
  "rayon",
  "reflex",
+ "sha2",
+]
+
+[[package]]
+name = "reflex-bundle"
+version = "0.1.0"
+dependencies = [
  "sha2",
 ]
 
@@ -356,6 +364,7 @@ dependencies = [
  "cpu-time",
  "reflex",
  "reflex-bitvec",
+ "reflex-bundle",
  "serde",
  "serde_json",
  "sha2",

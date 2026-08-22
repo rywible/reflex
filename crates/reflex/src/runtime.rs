@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 use sha2::{Digest, Sha256};
 
 use crate::bundle::DomainBundle;
@@ -15,21 +16,31 @@ use crate::domain::{
     VerificationBatch, VerificationKernel, VerificationRecord, VerificationReplayBatch,
     VerificationReplayRequest, VerificationRequest,
 };
-use crate::durability::{self, Segment, SegmentKind};
-use crate::goal::{Direction, GoalSet, OptimizationGoal, ThresholdRelation};
+use crate::durability;
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
-    LearningState, PotentialForecast, VerdictTarget, derive_targets,
+    LearningState, PotentialForecast, derive_targets,
 };
-use crate::measurement::{
-    Measurement, MeasurementSpace, MeasurementWriter, MetricOrdering, VerifiedBatch,
-};
-use crate::resource::ProductionResourceMeter;
+use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
+use crate::resource::{ResidentReservation, ResourceEnvelopeGuard};
 use crate::session::{
     ArtifactKey, Completion, GoalId, ImprovementRequest, ParetoSnapshot, ParetoUpdate,
     ResourceUsage, SessionError, SessionOutcome, VerifiedArtifact, VerifiedArtifactRecord,
 };
+
+mod bundle;
+mod epoch;
+mod experience;
+mod goals;
+
+use bundle::RestartBundleCodec;
+use epoch::EpochTransition;
+use experience::{
+    EncodedMeasurement, ExperienceEntry, ExperienceLedger, ExperienceVerdict,
+    MeasurementObservation,
+};
+use goals::GoalEvaluator;
 
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
@@ -42,13 +53,11 @@ type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize, [u8; 32]);
 struct RecoveredBundle<D: DomainDefinition> {
     artifacts: Vec<StoredArtifact<D>>,
     pareto_keys: Vec<ArtifactKey>,
-    experience: Vec<ExperienceEntry>,
+    ledger: ExperienceLedger,
     revisions: Option<RevisionIds>,
     interrupted_usage: Option<ResourceUsage>,
     knowledge: KnowledgeState,
     learning: LearningState,
-    consequences: Vec<ConsequenceObservation>,
-    measurements: Vec<MeasurementObservation>,
 }
 
 impl<D: DomainDefinition> Default for RecoveredBundle<D> {
@@ -56,13 +65,11 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
         Self {
             artifacts: Vec::new(),
             pareto_keys: Vec::new(),
-            experience: Vec::new(),
+            ledger: ExperienceLedger::default(),
             revisions: None,
             interrupted_usage: None,
             knowledge: KnowledgeState::default(),
             learning: LearningState::default(),
-            consequences: Vec::new(),
-            measurements: Vec::new(),
         }
     }
 }
@@ -71,41 +78,6 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
 struct RevisionIds {
     knowledge: [u8; 32],
     model: [u8; 32],
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ExperienceVerdict {
-    Accepted = 1,
-    Refuted = 2,
-    Unknown = 3,
-}
-
-#[derive(Clone, PartialEq)]
-struct ExperienceEntry {
-    attempt_id: [u8; 32],
-    candidate_key: ArtifactKey,
-    claim_digest: [u8; 32],
-    origin_key: ArtifactKey,
-    parent_key: ArtifactKey,
-    canonical_candidate: Vec<u8>,
-    verdict: ExperienceVerdict,
-    operator_symbol: Vec<u8>,
-    features: Features,
-    verification_requests: u32,
-    epoch: u64,
-}
-
-#[derive(Clone, PartialEq)]
-struct EncodedMeasurement {
-    metric_symbol: Vec<u8>,
-    observation: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq)]
-struct MeasurementObservation {
-    subject: [u8; 32],
-    environment: Vec<u8>,
-    values: Vec<EncodedMeasurement>,
 }
 
 struct VerificationOutcome<D: DomainDefinition> {
@@ -149,11 +121,11 @@ where
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()> + Send,
 {
     let resource_meter =
-        ProductionResourceMeter::start(&request.resources).map_err(|()| SessionError::Resource)?;
+        ResourceEnvelopeGuard::start(&request.resources).map_err(|()| SessionError::Resource)?;
     let worker_resident_bytes = (request.resources.worker_threads.get() as u64)
         .saturating_mul(WORKER_STACK_BYTES as u64)
         .saturating_add(DURABILITY_STACK_BYTES as u64);
-    if !resource_meter.observe_resident(worker_resident_bytes) {
+    if !resource_meter.reserve(ResidentReservation::live(worker_resident_bytes)) {
         return Err(SessionError::Resource);
     }
     let pool = rayon::ThreadPoolBuilder::new()
@@ -181,34 +153,24 @@ fn improve_on_workers<D, O>(
     domain: &D,
     request: &ImprovementRequest<D>,
     mut observer: O,
-    resource_meter: &ProductionResourceMeter,
+    resource_meter: &ResourceEnvelopeGuard,
     worker_resident_bytes: u64,
 ) -> Result<SessionOutcome<D>, SessionError<D::Error>>
 where
     D: DomainDefinition,
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
 {
-    validate_goals(domain, request)?;
-    let goal_ids = goal_ids(domain, &request.goals)?;
+    let goal_evaluator = GoalEvaluator::new(domain, &request.goals)?;
+    let bundle_codec = RestartBundleCodec::new(domain, request);
     let recovered_bundle = request
         .bundle
         .source()
-        .map(|source| {
-            decode_bundle(
-                domain,
-                request,
-                source,
-                resource_meter,
-                worker_resident_bytes,
-            )
-        })
+        .map(|source| bundle_codec.recover(source, resource_meter, worker_resident_bytes))
         .transpose()?
         .unwrap_or_default();
     let recovered_keys = recovered_bundle.pareto_keys;
     let recovered_stored = recovered_bundle.artifacts;
-    let mut experience = recovered_bundle.experience;
-    let mut consequences = recovered_bundle.consequences;
-    let mut measurement_observations = recovered_bundle.measurements;
+    let mut ledger = recovered_bundle.ledger;
     let mut knowledge = recovered_bundle.knowledge;
     let pinned_knowledge = knowledge.pinned_revision().clone();
     let mut learning = recovered_bundle.learning;
@@ -221,11 +183,11 @@ where
             .map_err(|()| SessionError::Resource)?;
     }
     let recovered_replays = recovered_stored.len();
-    let verification_budget = request.resources.verification_requests.get();
+    let verification_budget = resource_meter.verification_limit();
     let replay_budget = verification_budget
         .checked_sub(prior_usage.verification_requests)
         .and_then(|remaining| remaining.checked_sub(u64::try_from(recovered_replays).ok()?))
-        .and_then(|remaining| remaining.checked_sub(u64::try_from(experience.len()).ok()?))
+        .and_then(|remaining| remaining.checked_sub(u64::try_from(ledger.len()).ok()?))
         .ok_or(SessionError::Resource)?;
     let ReadSeeds {
         mut seeds,
@@ -237,7 +199,7 @@ where
     }
     let required_replays = recovered_replays
         .checked_add(seed_replays)
-        .and_then(|count| count.checked_add(experience.len()))
+        .and_then(|count| count.checked_add(ledger.len()))
         .and_then(|count| u64::try_from(count).ok())
         .ok_or(SessionError::Resource)?;
     let mut verification_requests = prior_usage
@@ -263,7 +225,7 @@ where
     replay_seeds(domain, &seeds)?;
     let environment = crate::MeasurementEnvironment::local_process();
     let recovered = materialize(domain, recovered_stored, &environment)?;
-    replay_experience(domain, &recovered, &experience)?;
+    replay_experience(domain, &recovered, ledger.entries())?;
     if recovered_revisions.is_some_and(|revisions| {
         let expected = revision_ids(
             domain.semantic_identity().as_str(),
@@ -303,28 +265,24 @@ where
         })
         .collect::<Vec<_>>();
     let roots = materialize(domain, seed_stored, &environment)?;
-    let recovered_goal_frontiers = goal_frontiers(domain, &request.goals, &recovered);
+    let recovered_goal_frontiers = goal_evaluator.frontiers(&recovered);
     let mut known = recovered.clone();
     extend_unique(&mut known, roots.iter().cloned());
-    let initial_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
-    let mut pareto = pareto_union(domain, &request.goals, &known);
+    let initial_goal_frontiers = goal_evaluator.frontiers(&known);
+    let mut pareto = goal_evaluator.pareto(&known);
     let initial_usage = resource_meter
         .usage(verification_requests, 0)
         .map_err(|()| SessionError::Resource)?;
-    let mut checkpoint = encode_bundle(
-        domain,
-        request,
+    let mut checkpoint = bundle_codec.seal(
         &seed_cursor,
         &known,
         &pareto,
-        &experience,
-        &consequences,
-        &measurement_observations,
+        &ledger,
         &knowledge,
         &learning,
         SessionSeal::Interrupted(initial_usage),
     )?;
-    if checkpoint.len() as u64 > request.resources.durable_bytes.get() {
+    if !resource_meter.checkpoint_fits(checkpoint.len() as u64) {
         return Err(SessionError::Resource);
     }
     let mut frontier = roots
@@ -360,15 +318,13 @@ where
         &recovered_keys,
         &operators,
         &checkpoint,
-        &experience,
-        &consequences,
-        &measurement_observations,
+        &ledger,
         &knowledge,
         &learning,
     ));
-    if !resource_meter
-        .observe_resident(initial_resident.saturating_add(checkpoint.capacity() as u64))
-    {
+    if !resource_meter.reserve(
+        ResidentReservation::live(initial_resident).with_transient(checkpoint.capacity() as u64),
+    ) {
         return Err(SessionError::Resource);
     }
     let mut durability = durability::CheckpointWriter::start(request.bundle.target().to_path_buf())
@@ -383,17 +339,13 @@ where
         &mut sequence,
         &recovered_keys,
         &pareto,
-        &affected_goal_ids(
-            &goal_ids,
-            &recovered_goal_frontiers,
-            &initial_goal_frontiers,
-        ),
+        &goal_evaluator.affected(&recovered_goal_frontiers, &initial_goal_frontiers),
         resource_meter,
         initial_resident,
     );
     let mut stopped_by_observer = initial_delivery.stopped();
     let mut success_conditions_satisfied =
-        all_success_conditions_satisfied(domain, &request.goals, &initial_goal_frontiers);
+        goal_evaluator.success_satisfied(&initial_goal_frontiers);
     let mut time_exhausted = resource_meter
         .search_time_exhausted()
         .map_err(|()| SessionError::Resource)?;
@@ -417,9 +369,7 @@ where
                 &recovered_keys,
                 &operators,
                 &checkpoint,
-                &experience,
-                &consequences,
-                &measurement_observations,
+                &ledger,
                 &knowledge,
                 &learning,
             ))
@@ -429,7 +379,7 @@ where
             .saturating_add(
                 (frontier.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
             );
-        if !resource_meter.observe_resident(resident_before_epoch) {
+        if !resource_meter.reserve(ResidentReservation::live(resident_before_epoch)) {
             resident_budget_exhausted = true;
             break;
         }
@@ -449,11 +399,7 @@ where
         let mut candidates = Vec::new();
         let mut application_bytes = 0_u64;
         let mut choice_window_exhausted = false;
-        let available_resident = request
-            .resources
-            .resident_bytes
-            .get()
-            .saturating_sub(resident_before_epoch);
+        let available_resident = resource_meter.available_resident(resident_before_epoch);
         let generation_limit = usize::try_from(
             remaining_verifications
                 .saturating_mul(CHOICES_PER_VERIFICATION)
@@ -573,11 +519,16 @@ where
             time_exhausted = true;
             break;
         }
-        candidates =
-            retain_novel_candidates(domain, &known, &experience, &roots, &frontier, candidates)?;
-        order_by_learned_potential(
+        candidates = retain_novel_candidates(
             domain,
-            &request.goals,
+            &known,
+            ledger.entries(),
+            &roots,
+            &frontier,
+            candidates,
+        )?;
+        order_by_learned_potential(
+            &goal_evaluator,
             &frontier,
             pinned_model.as_ref(),
             &mut candidates,
@@ -586,11 +537,12 @@ where
             resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
-        let transient_resident = resident_before_epoch
-            .saturating_add(application_bytes)
+        let transient_bytes = application_bytes
             .saturating_add(vector_bytes(&candidates))
             .saturating_add(candidate_pipeline_reserve(domain, &candidates));
-        if !resource_meter.observe_resident(transient_resident) {
+        if !resource_meter.reserve(
+            ResidentReservation::live(resident_before_epoch).with_transient(transient_bytes),
+        ) {
             resident_budget_exhausted = true;
             break;
         }
@@ -617,52 +569,44 @@ where
             .collect::<Vec<_>>();
         let verification = verify_candidates(domain, &roots, &origins, &parent_keys, candidates)?;
         test_fault_point("verdict-recorded");
-        let prior_experience_len = experience.len();
-        let prior_experience_capacity = experience.capacity();
-        extend_unique_experience(&mut experience, verification.experience);
+        let experience_checkpoint_state = ledger.checkpoint_entries();
+        ledger.append_entries(verification.experience);
         test_fault_point("experience-appended");
         let checkpoint_usage = resource_meter
             .usage(verification_requests, checkpoint.len() as u64)
             .map_err(|()| SessionError::Resource)?;
-        let experience_checkpoint = encode_bundle(
-            domain,
-            request,
+        let experience_checkpoint = bundle_codec.seal(
             &seed_cursor,
             &known,
             &pareto,
-            &experience,
-            &consequences,
-            &measurement_observations,
+            &ledger,
             &knowledge,
             &learning,
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
-        if experience_checkpoint.len() as u64 > request.resources.durable_bytes.get() {
-            experience.truncate(prior_experience_len);
-            experience.shrink_to(prior_experience_capacity);
+        if !resource_meter.checkpoint_fits(experience_checkpoint.len() as u64) {
+            ledger.rollback_entries(experience_checkpoint_state);
             durable_budget_exhausted = true;
             break;
         }
-        let experience_resident = worker_resident_bytes
-            .saturating_add(resident_state_bytes(
-                &known,
-                &roots,
-                &pareto,
-                &frontier,
-                &recovered_keys,
-                &operators,
-                &experience_checkpoint,
-                &experience,
-                &consequences,
-                &measurement_observations,
-                &knowledge,
-                &learning,
-            ))
-            .saturating_add(experience_checkpoint.capacity() as u64)
-            .saturating_add(durability.pending_bytes());
-        if !resource_meter.observe_resident(experience_resident) {
-            experience.truncate(prior_experience_len);
-            experience.shrink_to(prior_experience_capacity);
+        let experience_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &experience_checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ));
+        if !resource_meter.reserve(
+            ResidentReservation::live(experience_live)
+                .with_transient(experience_checkpoint.capacity() as u64)
+                .with_pending_durability(durability.pending_bytes()),
+        ) {
+            ledger.rollback_entries(experience_checkpoint_state);
             resident_budget_exhausted = true;
             break;
         }
@@ -697,21 +641,12 @@ where
             &environment,
         )?;
         for (artifact, attempt_id) in accepted.iter().zip(&accepted_attempts) {
-            append_measurement_observation(
-                domain,
-                artifact,
-                *attempt_id,
-                &mut measurement_observations,
-            )?;
+            ledger.append_measurement(domain, artifact, *attempt_id)?;
         }
         test_fault_point("measurement-completed");
-        let previous_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
-        let prior_known_len = known.len();
-        let prior_known_capacity = known.capacity();
-        let prior_consequence_len = consequences.len();
-        let prior_consequence_capacity = consequences.capacity();
+        let previous_goal_frontiers = goal_evaluator.frontiers(&known);
         let mut admitted_attempts = Vec::new();
-        frontier.clear();
+        let mut admitted = Vec::new();
         for ((artifact, origin), attempt_id) in accepted
             .into_iter()
             .zip(accepted_origins)
@@ -719,76 +654,64 @@ where
         {
             if !known.iter().any(|known| known.key() == artifact.key()) {
                 admitted_attempts.push((artifact.clone(), attempt_id));
-                frontier.push((artifact.clone(), origin));
-                known.push(artifact);
+                admitted.push((artifact, origin));
             }
         }
         test_fault_point("admission-completed");
-        if frontier.is_empty() {
+        if admitted.is_empty() {
+            frontier.clear();
             resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
+        let mut epoch = EpochTransition::begin(&mut known, &mut frontier, &mut ledger);
+        for (artifact, origin) in admitted {
+            epoch.admit(artifact, origin);
+        }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
-        let proposed_pareto = pareto_union(domain, &request.goals, &known);
-        let proposed_goal_frontiers = goal_frontiers(domain, &request.goals, &known);
+        let proposed_pareto = goal_evaluator.pareto(epoch.known());
+        let proposed_goal_frontiers = goal_evaluator.frontiers(epoch.known());
+        let (staged_known, staged_entries, staged_consequences) = epoch.admission_state();
         record_admission_consequences(
-            domain,
-            &request.goals,
-            &known,
+            &goal_evaluator,
+            staged_known,
             &proposed_pareto,
             &previous_keys,
-            &experience,
+            staged_entries,
             &admitted_attempts,
-            &mut consequences,
+            staged_consequences,
         );
         let checkpoint_usage = resource_meter
             .usage(verification_requests, checkpoint.len() as u64)
             .map_err(|()| SessionError::Resource)?;
-        let proposed_checkpoint = encode_bundle(
-            domain,
-            request,
+        let proposed_checkpoint = bundle_codec.seal(
             &seed_cursor,
-            &known,
+            epoch.known(),
             &proposed_pareto,
-            &experience,
-            &consequences,
-            &measurement_observations,
+            epoch.ledger(),
             &knowledge,
             &learning,
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
-        if proposed_checkpoint.len() as u64 > request.resources.durable_bytes.get() {
-            known.truncate(prior_known_len);
-            known.shrink_to(prior_known_capacity);
-            consequences.truncate(prior_consequence_len);
-            consequences.shrink_to(prior_consequence_capacity);
-            frontier.clear();
+        if !resource_meter.checkpoint_fits(proposed_checkpoint.len() as u64) {
             durable_budget_exhausted = true;
             break;
         }
-        let proposed_resident = worker_resident_bytes
-            .saturating_add(resident_state_bytes(
-                &known,
-                &roots,
-                &proposed_pareto,
-                &frontier,
-                &recovered_keys,
-                &operators,
-                &proposed_checkpoint,
-                &experience,
-                &consequences,
-                &measurement_observations,
-                &knowledge,
-                &learning,
-            ))
-            .saturating_add(proposed_checkpoint.capacity() as u64)
-            .saturating_add(durability.pending_bytes());
-        if !resource_meter.observe_resident(proposed_resident) {
-            known.truncate(prior_known_len);
-            known.shrink_to(prior_known_capacity);
-            consequences.truncate(prior_consequence_len);
-            consequences.shrink_to(prior_consequence_capacity);
-            frontier.clear();
+        let proposed_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+            epoch.known(),
+            &roots,
+            &proposed_pareto,
+            epoch.frontier(),
+            &recovered_keys,
+            &operators,
+            &proposed_checkpoint,
+            epoch.ledger(),
+            &knowledge,
+            &learning,
+        ));
+        let proposed_reservation = ResidentReservation::live(proposed_live)
+            .with_transient(proposed_checkpoint.capacity() as u64)
+            .with_pending_durability(durability.pending_bytes());
+        if !resource_meter.reserve(proposed_reservation) {
             resident_budget_exhausted = true;
             break;
         }
@@ -802,31 +725,20 @@ where
             &mut sequence,
             &previous_keys,
             &proposed_pareto,
-            &affected_goal_ids(
-                &goal_ids,
-                &previous_goal_frontiers,
-                &proposed_goal_frontiers,
-            ),
+            &goal_evaluator.affected(&previous_goal_frontiers, &proposed_goal_frontiers),
             resource_meter,
-            proposed_resident,
+            proposed_reservation.peak_bytes(),
         );
         if delivery.resource_exhausted() {
-            known.truncate(prior_known_len);
-            known.shrink_to(prior_known_capacity);
-            consequences.truncate(prior_consequence_len);
-            consequences.shrink_to(prior_consequence_capacity);
-            frontier.clear();
             resident_budget_exhausted = true;
             break;
         }
+        epoch.commit();
         pareto = proposed_pareto;
         checkpoint = proposed_checkpoint;
         stopped_by_observer = delivery.stopped();
-        success_conditions_satisfied = all_success_conditions_satisfied(
-            domain,
-            &request.goals,
-            &goal_frontiers(domain, &request.goals, &known),
-        );
+        success_conditions_satisfied =
+            goal_evaluator.success_satisfied(&goal_evaluator.frontiers(&known));
         time_exhausted = resource_meter
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?;
@@ -862,34 +774,33 @@ where
     {
         completion = Completion::ResourceEnvelopeExhausted;
     }
-    let consolidation_resident = worker_resident_bytes
-        .saturating_add(resident_state_bytes(
-            &known,
-            &roots,
-            &pareto,
-            &frontier,
-            &recovered_keys,
-            &operators,
-            &checkpoint,
-            &experience,
-            &consequences,
-            &measurement_observations,
-            &knowledge,
-            &learning,
-        ))
-        .saturating_add(durability.pending_bytes())
-        .saturating_add((experience.len() as u64).saturating_mul(
-            (std::mem::size_of::<DerivationObservation>() as u64).saturating_add(512),
-        ))
+    let consolidation_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+        &known,
+        &roots,
+        &pareto,
+        &frontier,
+        &recovered_keys,
+        &operators,
+        &checkpoint,
+        &ledger,
+        &knowledge,
+        &learning,
+    ));
+    let consolidation_transient = (ledger.len() as u64)
+        .saturating_mul((std::mem::size_of::<DerivationObservation>() as u64).saturating_add(512))
         .saturating_add(4_096 * 64)
-        .saturating_add(experience.iter().fold(0_u64, |bytes, entry| {
+        .saturating_add(ledger.entries().iter().fold(0_u64, |bytes, entry| {
             bytes.saturating_add((entry.operator_symbol.capacity() as u64).saturating_mul(2))
         }));
     let can_consolidate = completion != Completion::StoppedByObserver
         && !resource_meter
             .time_exhausted()
             .map_err(|()| SessionError::Resource)?
-        && resource_meter.observe_resident(consolidation_resident);
+        && resource_meter.reserve(
+            ResidentReservation::live(consolidation_live)
+                .with_transient(consolidation_transient)
+                .with_pending_durability(durability.pending_bytes()),
+        );
     if can_consolidate {
         let primitive_symbols = domain
             .operators()
@@ -897,8 +808,7 @@ where
             .iter()
             .map(|descriptor| descriptor.symbol().as_str().as_bytes().to_vec())
             .collect::<BTreeSet<_>>();
-        let observations =
-            derivation_observations(&experience, &pinned_knowledge, &primitive_symbols)?;
+        let observations = ledger.derivations(&pinned_knowledge, &primitive_symbols)?;
         let prior_operators = knowledge
             .pinned_revision()
             .operators()
@@ -918,7 +828,7 @@ where
             .filter(|operator| !prior_operators.contains(&operator.id()))
             .flat_map(|operator| operator.support().iter().copied())
             .collect::<Vec<_>>();
-        let mut proposed_consequences = consequences.clone();
+        let mut proposed_consequences = ledger.consequences().to_vec();
         for subject in compressed_attempts {
             let consequence = ConsequenceObservation {
                 subject,
@@ -928,7 +838,7 @@ where
                 proposed_consequences.push(consequence);
             }
         }
-        let promoted_resident = worker_resident_bytes
+        let promoted_live = worker_resident_bytes
             .saturating_add(resident_state_bytes(
                 &known,
                 &roots,
@@ -937,85 +847,63 @@ where
                 &recovered_keys,
                 &operators,
                 &checkpoint,
-                &experience,
-                &proposed_consequences,
-                &measurement_observations,
+                &ledger,
                 &proposed_knowledge,
                 &learning,
             ))
-            .saturating_add(knowledge.resident_bytes())
-            .saturating_add(durability.pending_bytes())
-            .saturating_add(
-                (observations.len() as u64)
-                    .saturating_mul(std::mem::size_of::<DerivationObservation>() as u64),
-            );
-        if resource_meter.observe_resident(promoted_resident) {
+            .saturating_sub(ledger.resident_bytes())
+            .saturating_add(ledger.resident_bytes_with_consequences(&proposed_consequences))
+            .saturating_add(knowledge.resident_bytes());
+        let promoted_transient = (observations.len() as u64)
+            .saturating_mul(std::mem::size_of::<DerivationObservation>() as u64);
+        if resource_meter.reserve(
+            ResidentReservation::live(promoted_live)
+                .with_transient(promoted_transient)
+                .with_pending_durability(durability.pending_bytes()),
+        ) {
             knowledge = proposed_knowledge;
-            consequences = proposed_consequences;
+            ledger.replace_consequences(proposed_consequences);
         } else {
             completion = Completion::ResourceEnvelopeExhausted;
         }
     } else if completion != Completion::StoppedByObserver {
         completion = Completion::ResourceEnvelopeExhausted;
     }
-    let learning_resident = worker_resident_bytes
-        .saturating_add(resident_state_bytes(
-            &known,
-            &roots,
-            &pareto,
-            &frontier,
-            &recovered_keys,
-            &operators,
-            &checkpoint,
-            &experience,
-            &consequences,
-            &measurement_observations,
-            &knowledge,
-            &learning,
-        ))
-        .saturating_add(durability.pending_bytes())
-        .saturating_add(
-            (experience.len() as u64)
-                .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64),
-        )
-        .saturating_add(LearningState::training_scratch_bytes(experience.len()));
+    let learning_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+        &known,
+        &roots,
+        &pareto,
+        &frontier,
+        &recovered_keys,
+        &operators,
+        &checkpoint,
+        &ledger,
+        &knowledge,
+        &learning,
+    ));
+    let learning_transient = (ledger.len() as u64)
+        .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64)
+        .saturating_add(LearningState::training_scratch_bytes(ledger.len()));
     let can_train = !resource_meter
         .time_exhausted()
         .map_err(|()| SessionError::Resource)?
-        && resource_meter.observe_resident(learning_resident);
+        && resource_meter.reserve(
+            ResidentReservation::live(learning_live)
+                .with_transient(learning_transient)
+                .with_pending_durability(durability.pending_bytes()),
+        );
     if can_train {
-        let attempts = experience
-            .iter()
-            .map(|entry| AttemptObservation {
-                id: entry.attempt_id,
-                artifact: entry.candidate_key.0,
-                claim: entry.claim_digest,
-                parent: entry.parent_key.0,
-                features: entry.features,
-                verdict: match entry.verdict {
-                    ExperienceVerdict::Accepted => VerdictTarget::Accepted,
-                    ExperienceVerdict::Refuted => VerdictTarget::Refuted,
-                    ExperienceVerdict::Unknown => VerdictTarget::Unknown,
-                },
-                verification_cost: f32::from(
-                    u16::try_from(entry.verification_requests).unwrap_or(u16::MAX),
-                ),
-            })
-            .collect::<Vec<_>>();
-        let mut examples = derive_targets(&attempts, &consequences);
+        let attempts = ledger.attempts();
+        let mut examples = derive_targets(&attempts, ledger.consequences());
         let _promotion = learning.learn(&mut examples);
     } else {
         completion = Completion::ResourceEnvelopeExhausted;
     }
-    let provisional_checkpoint = encode_bundle(
-        domain,
-        request,
+    let provisional_checkpoint = bundle_codec.seal(
         &seed_cursor,
         &known,
         &pareto,
-        &experience,
-        &consequences,
-        &measurement_observations,
+        &ledger,
         &knowledge,
         &learning,
         SessionSeal::Completed(completion, provisional_usage),
@@ -1023,40 +911,35 @@ where
     let usage = resource_meter
         .usage(verification_requests, provisional_checkpoint.len() as u64)
         .map_err(|()| SessionError::Resource)?;
-    checkpoint = encode_bundle(
-        domain,
-        request,
+    checkpoint = bundle_codec.seal(
         &seed_cursor,
         &known,
         &pareto,
-        &experience,
-        &consequences,
-        &measurement_observations,
+        &ledger,
         &knowledge,
         &learning,
         SessionSeal::Completed(completion, usage),
     )?;
-    if checkpoint.len() as u64 > request.resources.durable_bytes.get() {
+    if !resource_meter.checkpoint_fits(checkpoint.len() as u64) {
         return Err(SessionError::Resource);
     }
-    let final_resident = worker_resident_bytes
-        .saturating_add(resident_state_bytes(
-            &known,
-            &roots,
-            &pareto,
-            &frontier,
-            &recovered_keys,
-            &operators,
-            &checkpoint,
-            &experience,
-            &consequences,
-            &measurement_observations,
-            &knowledge,
-            &learning,
-        ))
-        .saturating_add(checkpoint.capacity() as u64)
-        .saturating_add(durability.pending_bytes());
-    if !resource_meter.observe_resident(final_resident) {
+    let final_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+        &known,
+        &roots,
+        &pareto,
+        &frontier,
+        &recovered_keys,
+        &operators,
+        &checkpoint,
+        &ledger,
+        &knowledge,
+        &learning,
+    ));
+    if !resource_meter.reserve(
+        ResidentReservation::live(final_live)
+            .with_transient(checkpoint.capacity() as u64)
+            .with_pending_durability(durability.pending_bytes()),
+    ) {
         return Err(SessionError::Resource);
     }
     durability
@@ -1084,9 +967,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
     recovered_keys: &Vec<ArtifactKey>,
     operators: &Vec<O>,
     checkpoint: &Vec<u8>,
-    experience: &Vec<ExperienceEntry>,
-    consequences: &Vec<ConsequenceObservation>,
-    measurements: &Vec<MeasurementObservation>,
+    ledger: &ExperienceLedger,
     knowledge: &KnowledgeState,
     learning: &LearningState,
 ) -> u64 {
@@ -1097,23 +978,6 @@ fn resident_state_bytes<D: DomainDefinition, O>(
             .saturating_add(artifact.inner.provenance.capacity() as u64)
             .saturating_add(vector_bytes(&artifact.inner.measurements))
     });
-    let experience_payloads = experience.iter().fold(0_u64, |bytes, entry| {
-        bytes
-            .saturating_add(entry.canonical_candidate.capacity() as u64)
-            .saturating_add(entry.operator_symbol.capacity() as u64)
-    });
-    let measurement_payloads = measurements.iter().fold(0_u64, |bytes, observation| {
-        observation.values.iter().fold(
-            bytes
-                .saturating_add(observation.environment.capacity() as u64)
-                .saturating_add(vector_bytes(&observation.values)),
-            |bytes, value| {
-                bytes
-                    .saturating_add(value.metric_symbol.capacity() as u64)
-                    .saturating_add(value.observation.capacity() as u64)
-            },
-        )
-    });
     records
         .saturating_add(vector_bytes(known))
         .saturating_add(vector_bytes(roots))
@@ -1122,11 +986,7 @@ fn resident_state_bytes<D: DomainDefinition, O>(
         .saturating_add(vector_bytes(recovered_keys))
         .saturating_add(vector_bytes(operators))
         .saturating_add(vector_bytes(checkpoint))
-        .saturating_add(vector_bytes(experience))
-        .saturating_add(experience_payloads)
-        .saturating_add(vector_bytes(consequences))
-        .saturating_add(vector_bytes(measurements))
-        .saturating_add(measurement_payloads)
+        .saturating_add(ledger.resident_bytes())
         .saturating_add(knowledge.resident_bytes())
         .saturating_add(learning.resident_bytes())
 }
@@ -1301,8 +1161,7 @@ fn append_derived_candidates<D: DomainDefinition>(
 }
 
 fn order_by_learned_potential<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
+    goals: &GoalEvaluator<'_, D>,
     frontier: &[(VerifiedArtifact<D>, usize)],
     model: Option<&FtrlModel>,
     candidates: &mut Vec<ProposedCandidate<D>>,
@@ -1312,7 +1171,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
             .into_iter()
             .partition(|candidate| candidate.protected_derived);
         let compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
-            compare_parent_preferences(domain, goals, frontier, left, right).then_with(|| {
+            goals.compare_parents(frontier, left, right).then_with(|| {
                 left.operator_symbol
                     .cmp(&right.operator_symbol)
                     .then_with(|| {
@@ -1355,7 +1214,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
             .map_or(Ordering::Equal, |(left, right)| {
                 compare_forecasts(left, right)
             })
-            .then_with(|| compare_parent_preferences(domain, goals, frontier, left, right))
+            .then_with(|| goals.compare_parents(frontier, left, right))
             .then_with(|| {
                 left.operator_symbol
                     .cmp(&right.operator_symbol)
@@ -1380,135 +1239,6 @@ fn order_by_learned_potential<D: DomainDefinition>(
             break;
         }
     }
-}
-
-fn compare_parent_preferences<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
-    frontier: &[(VerifiedArtifact<D>, usize)],
-    left: &ProposedCandidate<D>,
-    right: &ProposedCandidate<D>,
-) -> Ordering {
-    let Some(left_parent) = frontier
-        .get(left.candidate.source_index)
-        .map(|parent| &parent.0)
-    else {
-        return Ordering::Equal;
-    };
-    let Some(right_parent) = frontier
-        .get(right.candidate.source_index)
-        .map(|parent| &parent.0)
-    else {
-        return Ordering::Equal;
-    };
-    let mut left_better = false;
-    let mut right_better = false;
-    for goal in goals.goals.iter() {
-        match compare_for_goal_preference(domain, goal, left_parent, right_parent) {
-            Ordering::Less => left_better = true,
-            Ordering::Greater => right_better = true,
-            Ordering::Equal => {}
-        }
-    }
-    match (left_better, right_better) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => Ordering::Equal,
-    }
-}
-
-fn compare_for_goal_preference<D: DomainDefinition>(
-    domain: &D,
-    goal: &OptimizationGoal<D>,
-    left: &VerifiedArtifact<D>,
-    right: &VerifiedArtifact<D>,
-) -> Ordering {
-    if !goal
-        .constraints
-        .iter()
-        .all(|constraint| threshold_satisfied(domain, left, constraint))
-        || !goal
-            .constraints
-            .iter()
-            .all(|constraint| threshold_satisfied(domain, right, constraint))
-    {
-        return Ordering::Equal;
-    }
-    for tier in goal.preference.priority_tiers.iter() {
-        let mut left_better = false;
-        let mut right_better = false;
-        for metric in tier.iter() {
-            let Some(objective) = goal
-                .objectives
-                .iter()
-                .find(|objective| objective.metric == *metric)
-            else {
-                return Ordering::Equal;
-            };
-            let Some(left_measurement) = left
-                .inner
-                .measurements
-                .iter()
-                .find(|measurement| measurement.metric == *metric)
-            else {
-                return Ordering::Equal;
-            };
-            let Some(right_measurement) = right
-                .inner
-                .measurements
-                .iter()
-                .find(|measurement| measurement.metric == *metric)
-            else {
-                return Ordering::Equal;
-            };
-            if !domain.measurements().environments_compatible(
-                *metric,
-                &left.inner.environment,
-                &right.inner.environment,
-            ) {
-                return Ordering::Equal;
-            }
-            if let Some(tolerance) = goal
-                .preference
-                .tolerances
-                .iter()
-                .find(|tolerance| tolerance.metric == *metric)
-                && domain
-                    .measurements()
-                    .within_tolerance(
-                        *metric,
-                        &left_measurement.observation,
-                        &right_measurement.observation,
-                        &tolerance.amount,
-                    )
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-            let Ok(ordering) = domain.measurements().compare(
-                *metric,
-                &left_measurement.observation,
-                &right_measurement.observation,
-            ) else {
-                return Ordering::Equal;
-            };
-            let ordering = match (objective.direction, ordering) {
-                (Direction::Minimize, ordering) => ordering,
-                (Direction::Maximize, MetricOrdering::Equal) => MetricOrdering::Equal,
-                (Direction::Maximize, MetricOrdering::Less) => MetricOrdering::Greater,
-                (Direction::Maximize, MetricOrdering::Greater) => MetricOrdering::Less,
-            };
-            left_better |= ordering == MetricOrdering::Less;
-            right_better |= ordering == MetricOrdering::Greater;
-        }
-        match (left_better, right_better) {
-            (true, false) => return Ordering::Less,
-            (false, true) => return Ordering::Greater,
-            (true, true) => return Ordering::Equal,
-            (false, false) => {}
-        }
-    }
-    Ordering::Equal
 }
 
 fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Ordering {
@@ -1537,35 +1267,6 @@ fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Order
         }
     }
     Ordering::Equal
-}
-
-fn derivation_observations<E>(
-    experience: &[ExperienceEntry],
-    knowledge: &KnowledgeRevision,
-    primitive_symbols: &BTreeSet<Vec<u8>>,
-) -> Result<Vec<DerivationObservation>, SessionError<E>> {
-    experience
-        .iter()
-        .map(|entry| {
-            let operator_steps = if primitive_symbols.contains(&entry.operator_symbol) {
-                vec![entry.operator_symbol.clone()]
-            } else {
-                knowledge
-                    .resolve_operator(&entry.operator_symbol)
-                    .map(|operator| operator.steps().to_vec())
-                    .ok_or(SessionError::CorruptBundle)?
-            };
-            Ok(DerivationObservation {
-                id: entry.attempt_id,
-                artifact: entry.candidate_key.0,
-                parent: entry.parent_key.0,
-                claim: entry.claim_digest,
-                operator_identity: entry.operator_symbol.clone(),
-                operator_steps,
-                accepted: entry.verdict == ExperienceVerdict::Accepted,
-            })
-        })
-        .collect()
 }
 
 fn claim_digest<D: DomainDefinition>(
@@ -1722,91 +1423,8 @@ fn extend_unique<D: DomainDefinition>(
     }
 }
 
-fn extend_unique_experience(
-    experience: &mut Vec<ExperienceEntry>,
-    entries: impl IntoIterator<Item = ExperienceEntry>,
-) {
-    for entry in entries {
-        if let Some(existing) = experience
-            .iter()
-            .find(|existing| existing.attempt_id == entry.attempt_id)
-        {
-            assert!(
-                existing == &entry,
-                "a stable attempt identity must name exactly one immutable observation"
-            );
-        } else {
-            experience.push(entry);
-        }
-    }
-}
-
-fn goal_frontiers<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
-    known: &[VerifiedArtifact<D>],
-) -> Vec<Vec<VerifiedArtifact<D>>> {
-    goals
-        .goals
-        .iter()
-        .map(|goal| retain_pareto(domain, goal, known.to_vec()))
-        .collect()
-}
-
-fn pareto_union<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
-    known: &[VerifiedArtifact<D>],
-) -> Vec<VerifiedArtifact<D>> {
-    let mut pareto = Vec::new();
-    for frontier in goal_frontiers(domain, goals, known) {
-        extend_unique(&mut pareto, frontier);
-    }
-    pareto
-}
-
-fn affected_goal_ids<D: DomainDefinition>(
-    ids: &[GoalId],
-    previous: &[Vec<VerifiedArtifact<D>>],
-    current: &[Vec<VerifiedArtifact<D>>],
-) -> Vec<GoalId> {
-    ids.iter()
-        .zip(previous.iter().zip(current))
-        .filter_map(|(id, (previous, current))| {
-            let changed = previous.len() != current.len()
-                || previous
-                    .iter()
-                    .any(|artifact| !current.iter().any(|item| item.key() == artifact.key()));
-            changed.then_some(*id)
-        })
-        .collect()
-}
-
-fn goal_ids<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
-) -> Result<Vec<GoalId>, SessionError<D::Error>> {
-    goals
-        .goals
-        .iter()
-        .map(|goal| {
-            let mut encoded = Vec::new();
-            encode_goal(domain, goal, &mut encoded)?;
-            let mut digest = Sha256::new();
-            digest.update(b"reflex-goal-v1\0");
-            digest.update(encoded);
-            Ok(GoalId(digest.finalize().into()))
-        })
-        .collect()
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "consequence derivation explicitly names every immutable observation source"
-)]
 fn record_admission_consequences<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
+    goals: &GoalEvaluator<'_, D>,
     known: &[VerifiedArtifact<D>],
     proposed_pareto: &[VerifiedArtifact<D>],
     previous_pareto_keys: &[ArtifactKey],
@@ -1814,7 +1432,7 @@ fn record_admission_consequences<D: DomainDefinition>(
     admitted: &[(VerifiedArtifact<D>, [u8; 32])],
     consequences: &mut Vec<ConsequenceObservation>,
 ) {
-    let per_goal = goal_frontiers(domain, goals, known);
+    let per_goal = goals.frontiers(known);
     for (artifact, attempt_id) in admitted {
         append_unique_consequence(
             consequences,
@@ -1878,49 +1496,6 @@ fn append_unique_consequence(
     }
 }
 
-fn append_measurement_observation<D: DomainDefinition>(
-    domain: &D,
-    artifact: &VerifiedArtifact<D>,
-    subject: [u8; 32],
-    observations: &mut Vec<MeasurementObservation>,
-) -> Result<(), SessionError<D::Error>> {
-    if observations
-        .iter()
-        .any(|observation| observation.subject == subject)
-    {
-        return Ok(());
-    }
-    let mut values = Vec::with_capacity(artifact.inner.measurements.len());
-    for measurement in &artifact.inner.measurements {
-        let descriptor = domain
-            .measurements()
-            .schema()
-            .iter()
-            .find(|descriptor| descriptor.metric() == measurement.metric)
-            .ok_or(SessionError::InvalidGoal(crate::GoalError::UnknownMetric))?;
-        let mut observation = Vec::new();
-        domain
-            .measurements()
-            .encode_observation(
-                measurement.metric,
-                &measurement.observation,
-                &mut observation,
-            )
-            .map_err(SessionError::Domain)?;
-        values.push(EncodedMeasurement {
-            metric_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
-            observation,
-        });
-    }
-    values.sort_unstable_by(|left, right| left.metric_symbol.cmp(&right.metric_symbol));
-    observations.push(MeasurementObservation {
-        subject,
-        environment: artifact.inner.environment.identity().as_bytes().to_vec(),
-        values,
-    });
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum DeltaDelivery {
     NoChange,
@@ -1944,7 +1519,7 @@ fn deliver_delta<D, O>(
     previous: &[ArtifactKey],
     current: &[VerifiedArtifact<D>],
     affected_goals: &[GoalId],
-    resource_meter: &ProductionResourceMeter,
+    resource_meter: &ResourceEnvelopeGuard,
     resident_state: u64,
 ) -> DeltaDelivery
 where
@@ -1964,11 +1539,12 @@ where
     if added.is_empty() && removed.is_empty() {
         return DeltaDelivery::NoChange;
     }
-    let resident_with_export = resident_state
-        .saturating_add(vector_bytes(&added))
+    let export_bytes = vector_bytes(&added)
         .saturating_add(vector_bytes(&removed))
         .saturating_add(std::mem::size_of_val(affected_goals) as u64);
-    if !resource_meter.observe_resident(resident_with_export) {
+    if !resource_meter
+        .reserve(ResidentReservation::live(resident_state).with_transient(export_bytes))
+    {
         return DeltaDelivery::ResourceExhausted;
     }
     *sequence += 1;
@@ -1982,24 +1558,6 @@ where
     DeltaDelivery::Delivered { stopped }
 }
 
-fn all_success_conditions_satisfied<D: DomainDefinition>(
-    domain: &D,
-    goals: &GoalSet<D>,
-    frontiers: &[Vec<VerifiedArtifact<D>>],
-) -> bool {
-    goals.goals.iter().zip(frontiers).all(|(goal, frontier)| {
-        let Some(success) = goal.success.as_ref() else {
-            return false;
-        };
-        frontier.iter().any(|artifact| {
-            success
-                .thresholds
-                .iter()
-                .all(|threshold| threshold_satisfied(domain, artifact, threshold))
-        })
-    })
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "the canonical v3 import keeps segment cross-validation in one audit path"
@@ -2008,15 +1566,17 @@ fn decode_bundle<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
     source: &std::path::Path,
-    resource_meter: &ProductionResourceMeter,
+    resource_meter: &ResourceEnvelopeGuard,
     resident_before_bundle: u64,
 ) -> Result<RecoveredBundle<D>, SessionError<D::Error>> {
     let bundle_bytes = std::fs::metadata(source)
         .map_err(SessionError::Durability)?
         .len();
-    if bundle_bytes > request.resources.durable_bytes.get()
-        || !resource_meter
-            .observe_resident(resident_before_bundle.saturating_add(bundle_bytes.saturating_mul(4)))
+    if !resource_meter.checkpoint_fits(bundle_bytes)
+        || !resource_meter.reserve(
+            ResidentReservation::live(resident_before_bundle)
+                .with_transient(bundle_bytes.saturating_mul(4)),
+        )
     {
         return Err(SessionError::Resource);
     }
@@ -2024,21 +1584,14 @@ fn decode_bundle<D: DomainDefinition>(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != bundle_bytes {
         return Err(SessionError::Resource);
     }
-    let decoded = durability::decode(&bytes).map_err(|_| SessionError::CorruptBundle)?;
+    let decoded = CanonicalBundle::decode(&bytes).map_err(|_| SessionError::CorruptBundle)?;
     drop(bytes);
-    if decoded.identity != domain.semantic_identity().as_str().as_bytes() {
+    if decoded.identity() != domain.semantic_identity().as_str().as_bytes() {
         return Err(SessionError::IncompatibleBundle);
     }
-    let interrupted_usage = validate_session(
-        domain,
-        request,
-        decoded
-            .segment(SegmentKind::Session)
-            .map_err(|_| SessionError::CorruptBundle)?,
-    )?;
-    let encoded_revisions = decoded
-        .segment(SegmentKind::Revisions)
-        .map_err(|_| SessionError::CorruptBundle)?;
+    let interrupted_usage =
+        validate_session(domain, request, decoded.segment(SegmentKind::Session))?;
+    let encoded_revisions = decoded.segment(SegmentKind::Revisions);
     if encoded_revisions.len() < 80 {
         return Err(SessionError::CorruptBundle);
     }
@@ -2061,9 +1614,7 @@ fn decode_bundle<D: DomainDefinition>(
         return Err(SessionError::CorruptBundle);
     }
     let identity = domain.semantic_identity();
-    let mut input = decoded
-        .segment(SegmentKind::Artifacts)
-        .map_err(|_| SessionError::CorruptBundle)?;
+    let mut input = decoded.segment(SegmentKind::Artifacts);
     let count =
         usize::try_from(read_bundle_u64(&mut input)?).map_err(|_| SessionError::CorruptBundle)?;
     let minimum_record_bytes = 32_usize;
@@ -2132,9 +1683,7 @@ fn decode_bundle<D: DomainDefinition>(
         return Err(SessionError::CorruptBundle);
     }
 
-    let mut recovery = decoded
-        .segment(SegmentKind::Recovery)
-        .map_err(|_| SessionError::CorruptBundle)?;
+    let mut recovery = decoded.segment(SegmentKind::Recovery);
     let pareto_count = usize::try_from(read_bundle_u64(&mut recovery)?)
         .map_err(|_| SessionError::CorruptBundle)?;
     if pareto_count > recovery.len().saturating_div(32) {
@@ -2155,9 +1704,7 @@ fn decode_bundle<D: DomainDefinition>(
     if !recovery.is_empty() {
         return Err(SessionError::CorruptBundle);
     }
-    let mut encoded_experience = decoded
-        .segment(SegmentKind::Experience)
-        .map_err(|_| SessionError::CorruptBundle)?;
+    let mut encoded_experience = decoded.segment(SegmentKind::Experience);
     let experience_count = usize::try_from(read_bundle_u64(&mut encoded_experience)?)
         .map_err(|_| SessionError::CorruptBundle)?;
     if experience_count > encoded_experience.len().saturating_div(181) {
@@ -2362,7 +1909,9 @@ fn decode_bundle<D: DomainDefinition>(
             values,
         });
     }
-    let corpus_assignments = experience
+    let ledger = ExperienceLedger::from_parts(experience, consequences, measurements);
+    let corpus_assignments = ledger
+        .entries()
         .iter()
         .map(|entry| (entry.attempt_id, entry.claim_digest))
         .collect::<Vec<_>>();
@@ -2376,8 +1925,7 @@ fn decode_bundle<D: DomainDefinition>(
         .iter()
         .map(|descriptor| descriptor.symbol().as_str().as_bytes().to_vec())
         .collect::<BTreeSet<_>>();
-    let derivations =
-        derivation_observations(&experience, knowledge.pinned_revision(), &primitive_symbols)?;
+    let derivations = ledger.derivations(knowledge.pinned_revision(), &primitive_symbols)?;
     if !encoded_experience.is_empty()
         || !learning.corpus_is_valid(&corpus_assignments)
         || !knowledge.validate(&artifact_keys, &derivations, &primitive_symbols)
@@ -2387,13 +1935,11 @@ fn decode_bundle<D: DomainDefinition>(
     Ok(RecoveredBundle {
         artifacts: recovered,
         pareto_keys,
-        experience,
+        ledger,
         revisions: Some(revisions),
         interrupted_usage,
         knowledge,
         learning,
-        consequences,
-        measurements,
     })
 }
 
@@ -2651,134 +2197,11 @@ fn take_sized<'a, E>(input: &mut &'a [u8]) -> Result<&'a [u8], SessionError<E>> 
     take_bundle(input, length)
 }
 
-fn validate_goals<D: DomainDefinition>(
-    domain: &D,
-    request: &ImprovementRequest<D>,
-) -> Result<(), SessionError<D::Error>> {
-    let known = domain.measurements().schema();
-    for goal in request.goals.goals.iter() {
-        for metric in goal
-            .objectives
-            .iter()
-            .map(|objective| objective.metric)
-            .chain(goal.constraints.iter().map(|constraint| constraint.metric))
-            .chain(
-                goal.preference
-                    .tolerances
-                    .iter()
-                    .map(|tolerance| tolerance.metric),
-            )
-            .chain(
-                goal.success
-                    .iter()
-                    .flat_map(|success| success.thresholds.iter())
-                    .map(|threshold| threshold.metric),
-            )
-        {
-            if !known.iter().any(|descriptor| descriptor.metric() == metric) {
-                return Err(SessionError::InvalidGoal(crate::GoalError::UnknownMetric));
-            }
-        }
-        for constraint in goal.constraints.iter().chain(
-            goal.success
-                .iter()
-                .flat_map(|success| success.thresholds.iter()),
-        ) {
-            validate_goal_observation(domain, constraint.metric, &constraint.threshold)?;
-        }
-        for tolerance in &goal.preference.tolerances {
-            validate_goal_observation(domain, tolerance.metric, &tolerance.amount)?;
-            domain
-                .measurements()
-                .within_tolerance(
-                    tolerance.metric,
-                    &tolerance.amount,
-                    &tolerance.amount,
-                    &tolerance.amount,
-                )
-                .map_err(|_| SessionError::InvalidGoal(crate::GoalError::InvalidObservation))?;
-        }
-        let thresholds = goal
-            .constraints
-            .iter()
-            .map(|threshold| (threshold, false))
-            .chain(
-                goal.success
-                    .iter()
-                    .flat_map(|success| success.thresholds.iter())
-                    .map(|threshold| (threshold, true)),
-            )
-            .collect::<Vec<_>>();
-        for (index, (left, left_is_success)) in thresholds.iter().enumerate() {
-            for (right, right_is_success) in &thresholds[index + 1..] {
-                if left.metric != right.metric || left.relation == right.relation {
-                    continue;
-                }
-                let ordering = domain
-                    .measurements()
-                    .compare(left.metric, &left.threshold, &right.threshold)
-                    .map_err(|_| SessionError::InvalidGoal(crate::GoalError::InvalidObservation))?;
-                let incompatible = matches!(
-                    (left.relation, right.relation, ordering),
-                    (
-                        ThresholdRelation::AtMost,
-                        ThresholdRelation::AtLeast,
-                        MetricOrdering::Less
-                    ) | (
-                        ThresholdRelation::AtLeast,
-                        ThresholdRelation::AtMost,
-                        MetricOrdering::Greater
-                    )
-                );
-                if incompatible {
-                    return Err(SessionError::InvalidGoal(
-                        if *left_is_success || *right_is_success {
-                            crate::GoalError::IncompatibleSuccessCondition
-                        } else {
-                            crate::GoalError::IncompatibleConstraints
-                        },
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_goal_observation<D: DomainDefinition>(
-    domain: &D,
-    metric: D::Metric,
-    observation: &D::Observation,
-) -> Result<(), SessionError<D::Error>> {
-    let mut encoded = Vec::new();
-    domain
-        .measurements()
-        .encode_observation(metric, observation, &mut encoded)
-        .map_err(SessionError::Domain)?;
-    let decoded = domain
-        .measurements()
-        .decode_observation(metric, &encoded)
-        .map_err(SessionError::Domain)?;
-    let mut canonical = Vec::new();
-    domain
-        .measurements()
-        .encode_observation(metric, &decoded, &mut canonical)
-        .map_err(SessionError::Domain)?;
-    if encoded != canonical
-        || domain.measurements().compare(metric, observation, &decoded) != Ok(MetricOrdering::Equal)
-    {
-        return Err(SessionError::InvalidGoal(
-            crate::GoalError::InvalidObservation,
-        ));
-    }
-    Ok(())
-}
-
 fn read_seeds<D: DomainDefinition>(
     domain: &D,
     scope: &D::SeedScope,
     maximum: u64,
-    resource_meter: &ProductionResourceMeter,
+    resource_meter: &ResourceEnvelopeGuard,
 ) -> Result<ReadSeeds<D>, SessionError<D::Error>> {
     let mut cursor = domain.seeds().open(scope).map_err(SessionError::Domain)?;
     let mut scratch = <D::Seeds as SeedSource<D>>::Scratch::default();
@@ -2994,138 +2417,8 @@ fn verify_candidates<D: DomainDefinition>(
     })
 }
 
-fn retain_pareto<D: DomainDefinition>(
-    domain: &D,
-    goal: &OptimizationGoal<D>,
-    artifacts: Vec<VerifiedArtifact<D>>,
-) -> Vec<VerifiedArtifact<D>> {
-    let artifacts = artifacts
-        .into_iter()
-        .filter(|artifact| {
-            goal.constraints
-                .iter()
-                .all(|constraint| threshold_satisfied(domain, artifact, constraint))
-        })
-        .collect::<Vec<_>>();
-    let dominated = (0..artifacts.len())
-        .map(|right| {
-            (0..artifacts.len()).any(|left| {
-                left != right && dominates(domain, goal, &artifacts[left], &artifacts[right])
-            })
-        })
-        .collect::<Vec<_>>();
-    artifacts
-        .into_iter()
-        .zip(dominated)
-        .filter_map(|(artifact, dominated)| (!dominated).then_some(artifact))
-        .collect()
-}
-
-fn threshold_satisfied<D: DomainDefinition>(
-    domain: &D,
-    artifact: &VerifiedArtifact<D>,
-    threshold: &crate::MeasurementConstraint<D>,
-) -> bool {
-    let Some(measurement) = artifact
-        .inner
-        .measurements
-        .iter()
-        .find(|measurement| measurement.metric == threshold.metric)
-    else {
-        return false;
-    };
-    let Ok(ordering) = domain.measurements().compare(
-        threshold.metric,
-        &measurement.observation,
-        &threshold.threshold,
-    ) else {
-        return false;
-    };
-    matches!(
-        (threshold.relation, ordering),
-        (
-            ThresholdRelation::AtMost,
-            MetricOrdering::Less | MetricOrdering::Equal
-        ) | (
-            ThresholdRelation::AtLeast,
-            MetricOrdering::Greater | MetricOrdering::Equal
-        )
-    )
-}
-
-fn dominates<D: DomainDefinition>(
-    domain: &D,
-    goal: &OptimizationGoal<D>,
-    left: &VerifiedArtifact<D>,
-    right: &VerifiedArtifact<D>,
-) -> bool {
-    if !same_correctness_claim(domain, left, right) {
-        return false;
-    }
-    let mut strictly_better = false;
-    for objective in goal.objectives.iter() {
-        let Some(left_value) = left
-            .inner
-            .measurements
-            .iter()
-            .find(|measurement| measurement.metric == objective.metric)
-        else {
-            return false;
-        };
-        let Some(right_value) = right
-            .inner
-            .measurements
-            .iter()
-            .find(|measurement| measurement.metric == objective.metric)
-        else {
-            return false;
-        };
-        let Ok(ordering) = domain.measurements().compare(
-            objective.metric,
-            &left_value.observation,
-            &right_value.observation,
-        ) else {
-            return false;
-        };
-        let better = matches!(
-            (objective.direction, ordering),
-            (Direction::Minimize, MetricOrdering::Less)
-                | (Direction::Maximize, MetricOrdering::Greater)
-        );
-        let worse = matches!(
-            (objective.direction, ordering),
-            (Direction::Minimize, MetricOrdering::Greater)
-                | (Direction::Maximize, MetricOrdering::Less)
-        );
-        if worse {
-            return false;
-        }
-        strictly_better |= better;
-    }
-    strictly_better
-}
-
-fn same_correctness_claim<D: DomainDefinition>(
-    domain: &D,
-    left: &VerifiedArtifact<D>,
-    right: &VerifiedArtifact<D>,
-) -> bool {
-    let mut left_claim = Vec::new();
-    let mut right_claim = Vec::new();
-    domain
-        .kernel()
-        .encode_claim(&left.inner.verification.claim, &mut left_claim)
-        .is_ok()
-        && domain
-            .kernel()
-            .encode_claim(&right.inner.verification.claim, &mut right_claim)
-            .is_ok()
-        && left_claim == right_claim
-}
-
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the canonical bundle encoder explicitly receives every restart-complete state segment"
 )]
 fn encode_bundle<D: DomainDefinition>(
@@ -3134,9 +2427,7 @@ fn encode_bundle<D: DomainDefinition>(
     seed_cursor: &[u8],
     artifacts: &[VerifiedArtifact<D>],
     pareto: &[VerifiedArtifact<D>],
-    experience: &[ExperienceEntry],
-    consequences: &[ConsequenceObservation],
-    measurements: &[MeasurementObservation],
+    ledger: &ExperienceLedger,
     knowledge: &KnowledgeState,
     learning: &LearningState,
     session_seal: SessionSeal,
@@ -3198,73 +2489,17 @@ fn encode_bundle<D: DomainDefinition>(
     for artifact in pareto {
         recovery.extend_from_slice(artifact.key().as_bytes());
     }
-    let mut encoded_experience = Vec::with_capacity(8 + experience.len() * 97);
-    push_u64(&mut encoded_experience, experience.len() as u64);
-    for entry in experience {
-        encoded_experience.extend_from_slice(&entry.attempt_id);
-        encoded_experience.extend_from_slice(entry.candidate_key.as_bytes());
-        encoded_experience.extend_from_slice(&entry.claim_digest);
-        encoded_experience.extend_from_slice(entry.origin_key.as_bytes());
-        encoded_experience.extend_from_slice(entry.parent_key.as_bytes());
-        push_bytes(
-            &mut encoded_experience,
-            entry.canonical_candidate.as_slice(),
-        );
-        encoded_experience.push(entry.verdict as u8);
-        push_bytes(&mut encoded_experience, &entry.operator_symbol);
-        for feature in entry.features.0 {
-            encoded_experience.extend_from_slice(&feature.to_bits().to_le_bytes());
-        }
-        encoded_experience.extend_from_slice(&entry.verification_requests.to_le_bytes());
-        encoded_experience.extend_from_slice(&entry.epoch.to_le_bytes());
-    }
-    push_u64(&mut encoded_experience, consequences.len() as u64);
-    for consequence in consequences {
-        encoded_experience.extend_from_slice(&consequence.subject);
-        encoded_experience.push(match consequence.kind {
-            ConsequenceKind::Admitted => 1,
-            ConsequenceKind::ParetoImprovement => 2,
-            ConsequenceKind::CrossGoalUse => 3,
-            ConsequenceKind::Compression => 4,
-        });
-    }
-    push_u64(&mut encoded_experience, measurements.len() as u64);
-    for measurement in measurements {
-        encoded_experience.extend_from_slice(&measurement.subject);
-        push_bytes(&mut encoded_experience, &measurement.environment);
-        push_u64(&mut encoded_experience, measurement.values.len() as u64);
-        for value in &measurement.values {
-            push_bytes(&mut encoded_experience, &value.metric_symbol);
-            push_bytes(&mut encoded_experience, &value.observation);
-        }
-    }
+    let encoded_experience = ledger.encode();
     let session = encode_session(domain, request, seed_cursor, session_seal)?;
-    let bundle = durability::seal(
-        identity.as_str().as_bytes(),
-        &[
-            Segment {
-                kind: SegmentKind::Session,
-                payload: session,
-            },
-            Segment {
-                kind: SegmentKind::Revisions,
-                payload: revisions,
-            },
-            Segment {
-                kind: SegmentKind::Artifacts,
-                payload: artifact_payload,
-            },
-            Segment {
-                kind: SegmentKind::Experience,
-                payload: encoded_experience,
-            },
-            Segment {
-                kind: SegmentKind::Recovery,
-                payload: recovery,
-            },
-        ],
+    let bundle = CanonicalBundle::new(
+        identity.as_str().as_bytes().to_vec(),
+        session,
+        revisions,
+        artifact_payload,
+        encoded_experience,
+        recovery,
     )
-    .map_err(|_| SessionError::Resource)?;
+    .encode();
     test_fault_point("manifest-sealed");
     Ok(bundle)
 }
@@ -3301,76 +2536,6 @@ fn revision_ids<D: DomainDefinition>(
     }
 }
 
-fn encode_goal<D: DomainDefinition>(
-    domain: &D,
-    goal: &OptimizationGoal<D>,
-    output: &mut Vec<u8>,
-) -> Result<(), SessionError<D::Error>> {
-    push_u64(output, goal.constraints.len() as u64);
-    for constraint in &goal.constraints {
-        encode_metric(domain, constraint.metric, output)?;
-        output.push(match constraint.relation {
-            ThresholdRelation::AtMost => 0,
-            ThresholdRelation::AtLeast => 1,
-        });
-        let mut observation = Vec::new();
-        domain
-            .measurements()
-            .encode_observation(constraint.metric, &constraint.threshold, &mut observation)
-            .map_err(SessionError::Domain)?;
-        push_bytes(output, &observation);
-    }
-    push_u64(output, goal.objectives.as_slice().len() as u64);
-    for objective in goal.objectives.iter() {
-        encode_metric(domain, objective.metric, output)?;
-        output.push(match objective.direction {
-            Direction::Minimize => 0,
-            Direction::Maximize => 1,
-        });
-    }
-    push_u64(
-        output,
-        goal.preference.priority_tiers.as_slice().len() as u64,
-    );
-    for tier in goal.preference.priority_tiers.iter() {
-        push_u64(output, tier.as_slice().len() as u64);
-        for metric in tier.iter() {
-            encode_metric(domain, *metric, output)?;
-        }
-    }
-    push_u64(output, goal.preference.tolerances.len() as u64);
-    for tolerance in &goal.preference.tolerances {
-        encode_metric(domain, tolerance.metric, output)?;
-        let mut observation = Vec::new();
-        domain
-            .measurements()
-            .encode_observation(tolerance.metric, &tolerance.amount, &mut observation)
-            .map_err(SessionError::Domain)?;
-        push_bytes(output, &observation);
-    }
-    match &goal.success {
-        Some(success) => {
-            output.push(1);
-            push_u64(output, success.thresholds.as_slice().len() as u64);
-            for threshold in success.thresholds.iter() {
-                encode_metric(domain, threshold.metric, output)?;
-                output.push(match threshold.relation {
-                    ThresholdRelation::AtMost => 0,
-                    ThresholdRelation::AtLeast => 1,
-                });
-                let mut observation = Vec::new();
-                domain
-                    .measurements()
-                    .encode_observation(threshold.metric, &threshold.threshold, &mut observation)
-                    .map_err(SessionError::Domain)?;
-                push_bytes(output, &observation);
-            }
-        }
-        None => output.push(0),
-    }
-    Ok(())
-}
-
 fn encode_session<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
@@ -3382,11 +2547,7 @@ fn encode_session<D: DomainDefinition>(
         .seeds()
         .encode_scope(&request.seeds, &mut scope)
         .map_err(SessionError::Domain)?;
-    let mut goals = Vec::new();
-    push_u64(&mut goals, request.goals.goals.as_slice().len() as u64);
-    for goal in request.goals.goals.iter() {
-        encode_goal(domain, goal, &mut goals)?;
-    }
+    let goals = GoalEvaluator::encode_set(domain, &request.goals)?;
     let mut payload = Vec::new();
     payload.push(u8::from(matches!(session_seal, SessionSeal::Completed(..))));
     payload.extend_from_slice(&Sha256::digest(&goals));
@@ -3425,21 +2586,6 @@ fn encode_session<D: DomainDefinition>(
     push_duration(&mut payload, usage.elapsed_time);
     push_duration(&mut payload, usage.cpu_time);
     Ok(payload)
-}
-
-fn encode_metric<D: DomainDefinition>(
-    domain: &D,
-    metric: D::Metric,
-    output: &mut Vec<u8>,
-) -> Result<(), SessionError<D::Error>> {
-    let descriptor = domain
-        .measurements()
-        .schema()
-        .iter()
-        .find(|descriptor| descriptor.metric() == metric)
-        .ok_or(SessionError::InvalidGoal(crate::GoalError::UnknownMetric))?;
-    push_bytes(output, descriptor.symbol().as_str().as_bytes());
-    Ok(())
 }
 
 fn push_duration(output: &mut Vec<u8>, duration: std::time::Duration) {
