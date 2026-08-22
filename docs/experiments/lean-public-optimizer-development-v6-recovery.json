@@ -1,0 +1,206 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v6",
+  "status": "development-only; no 2026 exposure",
+  "training_artifacts": 4,
+  "heldout_artifacts": 4,
+  "primary_proof_node_limit": 100000,
+  "primary_selection": "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; held-out names are absent from September and held-out statement fingerprints are disjoint from selected training; development opportunity corpus, not confirmation sampling",
+  "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+  "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398",
+  "selected_artifacts": [
+    {
+      "role": "training",
+      "declaration": "Nat.bitwise.eq_1",
+      "statement_hash": 2256915014,
+      "proof_nodes": 8602
+    },
+    {
+      "role": "training",
+      "declaration": "Filter.EventuallyLE.refl",
+      "statement_hash": 1635510259,
+      "proof_nodes": 39
+    },
+    {
+      "role": "training",
+      "declaration": "exists_eq_ciSup_of_not_isSuccPrelimit'",
+      "statement_hash": 2671693606,
+      "proof_nodes": 133
+    },
+    {
+      "role": "training",
+      "declaration": "LinearMap.map_coprod_prod",
+      "statement_hash": 3404489442,
+      "proof_nodes": 31189
+    },
+    {
+      "role": "heldout",
+      "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "statement_hash": 733579311,
+      "proof_nodes": 401
+    },
+    {
+      "role": "heldout",
+      "declaration": "Matrix.det_updateCol_eq_zero",
+      "statement_hash": 2750634327,
+      "proof_nodes": 599
+    },
+    {
+      "role": "heldout",
+      "declaration": "hfdifferential_apply",
+      "statement_hash": 1999279568,
+      "proof_nodes": 8167
+    },
+    {
+      "role": "heldout",
+      "declaration": "Matrix.fromCols_mul_fromRows",
+      "statement_hash": 3909116777,
+      "proof_nodes": 3759
+    },
+    {
+      "role": "training-library",
+      "declaration": "exists_eq_ciSup_of_not_isSuccLimit'",
+      "statement_hash": 2671693606,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "LinearMap.coprod_map_prod",
+      "statement_hash": 3404489442,
+      "proof_nodes": 17573
+    },
+    {
+      "role": "training-library",
+      "declaration": "Filter.EventuallyLE.rfl",
+      "statement_hash": 1635510259,
+      "proof_nodes": 27
+    },
+    {
+      "role": "training-library",
+      "declaration": "Nat.bitwise.eq_def",
+      "statement_hash": 2256915014,
+      "proof_nodes": 17
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "apply_hfdifferential",
+      "statement_hash": 1999279568,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFounded",
+      "statement_hash": 733579311,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "Matrix.det_updateColumn_eq_zero",
+      "statement_hash": 2750634327,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "Matrix.fromColumns_mul_fromRows",
+      "statement_hash": 3909116777,
+      "proof_nodes": 1
+    }
+  ],
+  "training_usage": {
+    "worker_threads": 6,
+    "resident_bytes": 17956065669,
+    "verification_requests": 146,
+    "durable_bytes": 3866295,
+    "elapsed_ns": 55006702174,
+    "cpu_ns": 55210293411
+  },
+  "full": {
+    "treatment": "full",
+    "completion": "NoEligibleWork",
+    "heldout_pareto_artifacts": 8,
+    "strict_proof_node_improvements": 4,
+    "proof_nodes_removed": 12922,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18477268665,
+      "verification_requests": 254,
+      "durable_bytes": 8901806,
+      "elapsed_ns": 87352784844,
+      "cpu_ns": 87786104730
+    },
+    "bundle_sha256": "ed873b8e9f1874962a878db917ce8a117999ad8de212c74b5ed1f9135904140b"
+  },
+  "no_model": {
+    "treatment": "no-model",
+    "completion": "NoEligibleWork",
+    "heldout_pareto_artifacts": 8,
+    "strict_proof_node_improvements": 4,
+    "proof_nodes_removed": 12922,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18477266685,
+      "verification_requests": 254,
+      "durable_bytes": 8901806,
+      "elapsed_ns": 86614606746,
+      "cpu_ns": 87047118451
+    },
+    "bundle_sha256": "544ceeae6adaf33d971306e719f29cc968ec4a5fbaa9e52305308a5064d43f45"
+  },
+  "no_derived": {
+    "treatment": "no-derived",
+    "completion": "NoEligibleWork",
+    "heldout_pareto_artifacts": 8,
+    "strict_proof_node_improvements": 4,
+    "proof_nodes_removed": 12922,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18477268665,
+      "verification_requests": 254,
+      "durable_bytes": 8901806,
+      "elapsed_ns": 86380934056,
+      "cpu_ns": 86814238938
+    },
+    "bundle_sha256": "ae80ba1e15c92c926f789d3c9955fea9d7b29beb3a86d1cc2b7372e78a8b4636"
+  },
+  "bootstrap": {
+    "treatment": "bootstrap",
+    "completion": "NoEligibleWork",
+    "heldout_pareto_artifacts": 8,
+    "strict_proof_node_improvements": 4,
+    "proof_nodes_removed": 12922,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 17915194055,
+      "verification_requests": 242,
+      "durable_bytes": 5035213,
+      "elapsed_ns": 84770385588,
+      "cpu_ns": 85188750642
+    },
+    "bundle_sha256": "5026cbddde5f598033a4fd93c6f4bade8864c5be28ad36ee22d60d1e9f7810e8"
+  },
+  "full_has_more_improvements": false,
+  "full_uses_less_cpu_per_improvement": false,
+  "host": {
+    "git_revision": "977df22f178674941ebe3182fc9d4e388f2c8245",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "total_memory_bytes": 67306029056,
+    "available_memory_bytes": 63824064512,
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "content_sha256": "71e2a81636e088e92b97311e77dfd27d6c90241588156b42113b12323b9ce982"
+}
