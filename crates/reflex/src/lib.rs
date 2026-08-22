@@ -13,6 +13,7 @@ mod instrumentation;
 pub mod internal_experiments;
 mod knowledge;
 mod learning;
+mod policy;
 mod resource;
 mod runtime;
 

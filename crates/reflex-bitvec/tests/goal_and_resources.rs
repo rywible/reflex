@@ -278,7 +278,7 @@ fn observer_time_counts_against_the_elapsed_deadline() {
             NonZeroUsize::new(1).unwrap(),
             NonZeroU64::new(16 * 1024 * 1024).unwrap(),
             NonZeroU64::new(16 * 1024 * 1024).unwrap(),
-            NonZeroDuration::new(Duration::from_millis(1)).unwrap(),
+            NonZeroDuration::new(Duration::from_millis(20)).unwrap(),
             NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
             NonZeroU64::new(10_000).unwrap(),
         ),
@@ -289,7 +289,7 @@ fn observer_time_counts_against_the_elapsed_deadline() {
     .unwrap();
 
     let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(30));
         ControlFlow::Continue(())
     })
     .unwrap();
@@ -300,7 +300,7 @@ fn observer_time_counts_against_the_elapsed_deadline() {
             && outcome.usage().worker_threads == 1
             && outcome.usage().resident_bytes > 0
             && outcome.usage().durable_bytes > 0
-            && outcome.usage().elapsed_time >= Duration::from_millis(5),
+            && outcome.usage().elapsed_time >= Duration::from_millis(30),
         "serialized observer execution belongs to the Session's elapsed usage"
     );
     std::fs::remove_file(bundle_path).ok();

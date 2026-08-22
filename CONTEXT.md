@@ -228,6 +228,14 @@ _Avoid_: Artifact, solution
 A bounded, domain-supplied advisory description of how an Operator formed a Candidate. Proposal Features may guide learned search but never establish correctness.
 _Avoid_: Verification evidence, reward, opaque metadata
 
+**Candidate Fate**:
+An immutable Experience Ledger observation of how one generated Candidate progressed through novelty filtering, Allocation, Verification, and Admission. A Candidate Fate records what happened under a bounded Runtime policy; it is not a Training Target or correctness evidence.
+_Avoid_: event log, label, Verification Record
+
+**Allocation Queue**:
+The deterministic Runtime policy source that selected a Candidate for Verification, such as protected claim exploration, protected Derived Operator exploration, learned ranking, or Bootstrap ranking.
+_Avoid_: Training Target, objective weight, verifier lane
+
 **Verified Candidate**:
 A Candidate that has passed Verification but has not necessarily earned retention.
 _Avoid_: Artifact

@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
+use crate::policy::{AllocationQueue, OperationalPartition, operational_ranked_selections};
+
 pub(crate) const BASE_FEATURE_COUNT: usize = 16;
 pub(crate) const FEATURE_COUNT: usize = BASE_FEATURE_COUNT + crate::domain::PROPOSAL_FEATURE_COUNT;
 pub(crate) const HEAD_COUNT: usize = 7;
@@ -48,6 +50,8 @@ pub(crate) struct AttemptObservation {
     pub(crate) features: Features,
     pub(crate) verdict: VerdictTarget,
     pub(crate) verification_cost: f32,
+    pub(crate) allocation_queue: AllocationQueue,
+    pub(crate) bootstrap_rank: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +80,8 @@ pub(crate) struct TrainingExample {
     pub(crate) corpus_key: [u8; 32],
     behavior_rank: u32,
     behavior_sequence: u32,
+    allocation_queue: AllocationQueue,
+    bootstrap_rank: u32,
     pub(crate) features: Features,
     active_features: u32,
     pub(crate) targets: Targets,
@@ -101,7 +107,7 @@ pub(crate) enum PromotionDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OperationalPolicyComparison {
+enum ObservedPolicyComparison {
     InsufficientEvidence,
     ChallengerWins,
     IncumbentWins,
@@ -193,7 +199,7 @@ impl LearningState {
         if let Some(champion) = &self.champion {
             let predecessor_wins = if self.predecessor_is_bootstrap {
                 compare_bootstrap_policy(champion, &selection)
-                    == OperationalPolicyComparison::IncumbentWins
+                    == ObservedPolicyComparison::IncumbentWins
             } else {
                 self.predecessor.as_ref().is_some_and(|predecessor| {
                     compare_learned_revisions(champion, predecessor, &selection)
@@ -219,7 +225,7 @@ impl LearningState {
             let calibration = compare_models(&FtrlModel::zero(), &challenger, &selection);
             if calibration == PromotionDecision::Promote
                 && compare_bootstrap_policy(&challenger, &selection)
-                    == OperationalPolicyComparison::ChallengerWins
+                    == ObservedPolicyComparison::ChallengerWins
             {
                 PromotionDecision::Promote
             } else {
@@ -294,11 +300,9 @@ impl LearningState {
         let baseline_loss = losses(&baseline_model, &baseline_selection);
         let structural_loss = losses(&structural_model, &structural_selection);
         let balanced_structural_loss = losses(&balanced_structural_model, &structural_selection);
-        let baseline_ranking = accepted_ranking(&baseline_model, baseline_attempts, &self.roles);
-        let structural_ranking =
-            accepted_ranking(&structural_model, structural_attempts, &self.roles);
-        let balanced_structural_ranking =
-            accepted_ranking(&balanced_structural_model, structural_attempts, &self.roles);
+        let baseline_ranking = accepted_ranking(&baseline_model, &baseline);
+        let structural_ranking = accepted_ranking(&structural_model, &structural);
+        let balanced_structural_ranking = accepted_ranking(&balanced_structural_model, &structural);
         if !rankings_are_paired(
             &baseline_ranking,
             &structural_ranking,
@@ -600,93 +604,58 @@ fn rankings_are_paired(
 }
 
 #[cfg(feature = "internal-experiments")]
-fn accepted_ranking(
-    model: &FtrlModel,
-    attempts: &[AttemptObservation],
-    roles: &BTreeMap<[u8; 32], CorpusRole>,
-) -> AcceptedRanking {
-    let selected_attempts = attempts
+fn accepted_ranking(model: &FtrlModel, examples: &[TrainingExample]) -> AcceptedRanking {
+    let selected_examples = examples
         .iter()
-        .filter(|attempt| {
-            matches!(
-                roles.get(&attempt.claim),
-                Some(CorpusRole::Selection { .. })
-            )
-        })
+        .filter(|example| matches!(example.role, CorpusRole::Selection { .. }))
         .collect::<Vec<_>>();
-    let mut groups = BTreeMap::<[u8; 32], Vec<&AttemptObservation>>::new();
-    for attempt in &selected_attempts {
-        groups.entry(attempt.claim).or_default().push(attempt);
+    let mut groups = BTreeMap::<[u8; 32], Vec<&TrainingExample>>::new();
+    for example in &selected_examples {
+        groups.entry(example.corpus_key).or_default().push(example);
     }
     let mut bootstrap_accepted_at_k = [0_usize; 7];
     let mut accepted_at_k = [0_usize; 7];
     let mut evaluated_at_k = [0_usize; 7];
     let mut total_accepted = 0_usize;
-    for attempts in groups.values() {
-        let mut learned = attempts
-            .iter()
-            .enumerate()
-            .map(|(index, attempt)| (index, model.forecast(attempt.features)))
-            .collect::<Vec<_>>();
-        learned.sort_unstable_by(|(left, left_forecast), (right, right_forecast)| {
-            compare_forecasts(*left_forecast, *right_forecast)
-                .then_with(|| attempts[*left].id.cmp(&attempts[*right].id))
-        });
-        let learned = learned
-            .into_iter()
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let bootstrap = (0..attempts.len()).collect::<Vec<_>>();
-        let operational = cooperative_ranked_indices(&bootstrap, &learned, attempts.len());
+    for examples in groups.values() {
+        let bootstrap = observed_policy_examples(None, examples);
+        let operational = observed_policy_examples(Some(model), examples);
         total_accepted = total_accepted.saturating_add(
-            attempts
+            examples
                 .iter()
-                .filter(|attempt| attempt.verdict == VerdictTarget::Accepted)
+                .filter(|example| example.targets.0[4] > 0.0)
                 .count(),
         );
         for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
-            let count = attempts.len().min(budget);
+            let count = examples.len().min(budget);
             evaluated_at_k[index] = evaluated_at_k[index].saturating_add(count);
             bootstrap_accepted_at_k[index] = bootstrap_accepted_at_k[index].saturating_add(
-                attempts[..count]
+                bootstrap[..count]
                     .iter()
-                    .filter(|attempt| attempt.verdict == VerdictTarget::Accepted)
+                    .filter(|example| example.targets.0[4] > 0.0)
                     .count(),
             );
             accepted_at_k[index] = accepted_at_k[index].saturating_add(
                 operational[..count]
                     .iter()
-                    .filter(|candidate| attempts[**candidate].verdict == VerdictTarget::Accepted)
+                    .filter(|example| example.targets.0[4] > 0.0)
                     .count(),
             );
         }
     }
-    let global_bootstrap = (0..selected_attempts.len()).collect::<Vec<_>>();
-    let global_forecasts = selected_attempts
-        .iter()
-        .map(|attempt| model.forecast(attempt.features))
-        .collect::<Vec<_>>();
-    let mut global_learned = (0..selected_attempts.len()).collect::<Vec<_>>();
-    global_learned.sort_unstable_by(|left, right| {
-        compare_forecasts(global_forecasts[*left], global_forecasts[*right]).then_with(|| {
-            selected_attempts[*left]
-                .id
-                .cmp(&selected_attempts[*right].id)
-        })
-    });
-    let global_operational =
-        cooperative_ranked_indices(&global_bootstrap, &global_learned, selected_attempts.len());
+    let global_bootstrap = observed_policy_examples(None, &selected_examples);
+    let global_operational = observed_policy_examples(Some(model), &selected_examples);
     let mut global_bootstrap_accepted_at_k = [0_usize; 7];
     let mut global_accepted_at_k = [0_usize; 7];
     for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
-        let count = selected_attempts.len().min(budget);
+        let count = selected_examples.len().min(budget);
         global_bootstrap_accepted_at_k[index] = global_bootstrap[..count]
             .iter()
-            .filter(|candidate| selected_attempts[**candidate].verdict == VerdictTarget::Accepted)
+            .filter(|example| example.targets.0[4] > 0.0)
             .count();
         global_accepted_at_k[index] = global_operational[..count]
             .iter()
-            .filter(|candidate| selected_attempts[**candidate].verdict == VerdictTarget::Accepted)
+            .filter(|example| example.targets.0[4] > 0.0)
             .count();
     }
     AcceptedRanking {
@@ -1002,6 +971,8 @@ pub(crate) fn derive_targets(
                 corpus_key: attempt.claim,
                 behavior_rank: current_behavior_rank,
                 behavior_sequence: u32::try_from(sequence).unwrap_or(u32::MAX),
+                allocation_queue: attempt.allocation_queue,
+                bootstrap_rank: attempt.bootstrap_rank,
                 features: attempt.features,
                 targets: Targets([
                     f32::from(immediate),
@@ -1086,8 +1057,8 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&Trainin
 fn compare_bootstrap_policy(
     challenger: &FtrlModel,
     selection: &[&TrainingExample],
-) -> OperationalPolicyComparison {
-    compare_learned_policies(&FtrlModel::zero(), challenger, selection)
+) -> ObservedPolicyComparison {
+    compare_observed_policy_prefixes(None, challenger, selection)
 }
 
 fn compare_learned_revisions(
@@ -1097,8 +1068,8 @@ fn compare_learned_revisions(
 ) -> PromotionDecision {
     match compare_models(incumbent, challenger, selection) {
         PromotionDecision::Promote
-            if compare_learned_policies(incumbent, challenger, selection)
-                == OperationalPolicyComparison::ChallengerWins =>
+            if compare_observed_policy_prefixes(Some(incumbent), challenger, selection)
+                == ObservedPolicyComparison::ChallengerWins =>
         {
             PromotionDecision::Promote
         }
@@ -1109,15 +1080,18 @@ fn compare_learned_revisions(
     }
 }
 
-fn compare_learned_policies(
-    incumbent: &FtrlModel,
+fn compare_observed_policy_prefixes(
+    incumbent: Option<&FtrlModel>,
     challenger: &FtrlModel,
     selection: &[&TrainingExample],
-) -> OperationalPolicyComparison {
-    let Some(incumbent) = operational_discoveries(incumbent, selection) else {
-        return OperationalPolicyComparison::InsufficientEvidence;
+) -> ObservedPolicyComparison {
+    // This gate composes the real scheduler over the historically labeled
+    // subset. It is a conservative operational diagnostic, not an on-policy
+    // causal estimate: deferred Candidates have no verifier outcome.
+    let Some(incumbent) = observed_discovery_prefixes(incumbent, selection) else {
+        return ObservedPolicyComparison::InsufficientEvidence;
     };
-    let challenger = operational_discoveries(challenger, selection)
+    let challenger = observed_discovery_prefixes(Some(challenger), selection)
         .expect("the same selection must produce the same evidence sufficiency");
     let within_claim_noninferior = challenger
         .within_claim
@@ -1143,9 +1117,9 @@ fn compare_learned_policies(
         && global_noninferior
         && (within_claim_strictly_better || global_strictly_better)
     {
-        OperationalPolicyComparison::ChallengerWins
+        ObservedPolicyComparison::ChallengerWins
     } else {
-        OperationalPolicyComparison::IncumbentWins
+        ObservedPolicyComparison::IncumbentWins
     }
 }
 
@@ -1154,8 +1128,8 @@ struct DiscoveryPrefixes {
     global: [usize; 7],
 }
 
-fn operational_discoveries(
-    model: &FtrlModel,
+fn observed_discovery_prefixes(
+    model: Option<&FtrlModel>,
     selection: &[&TrainingExample],
 ) -> Option<DiscoveryPrefixes> {
     let mut groups = BTreeMap::<[u8; 32], Vec<&TrainingExample>>::new();
@@ -1167,61 +1141,23 @@ fn operational_discoveries(
     }
     let mut within_claim = [0_usize; 7];
     for examples in groups.values_mut() {
-        examples.sort_unstable_by_key(|example| (example.behavior_rank, example.key));
-        let mut learned = examples
-            .iter()
-            .enumerate()
-            .map(|(index, example)| (index, model.forecast(example.features)))
-            .collect::<Vec<_>>();
-        learned.sort_unstable_by(|(left, left_forecast), (right, right_forecast)| {
-            compare_forecasts(*left_forecast, *right_forecast)
-                .then_with(|| {
-                    examples[*left]
-                        .behavior_rank
-                        .cmp(&examples[*right].behavior_rank)
-                })
-                .then_with(|| examples[*left].key.cmp(&examples[*right].key))
-        });
-        let learned = learned
-            .into_iter()
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let bootstrap = (0..examples.len()).collect::<Vec<_>>();
-        let operational = cooperative_ranked_indices(&bootstrap, &learned, examples.len());
+        let operational = observed_policy_examples(model, examples);
         for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
             within_claim[index] = within_claim[index].saturating_add(
                 operational[..operational.len().min(budget)]
                     .iter()
-                    .filter(|candidate| examples[**candidate].targets.0[0] > 0.0)
+                    .filter(|candidate| candidate.targets.0[0] > 0.0)
                     .count(),
             );
         }
     }
-    let mut global_bootstrap = (0..selection.len()).collect::<Vec<_>>();
-    global_bootstrap
-        .sort_unstable_by_key(|index| (selection[*index].behavior_sequence, selection[*index].key));
-    let mut global_learned = (0..selection.len()).collect::<Vec<_>>();
-    let global_forecasts = selection
-        .iter()
-        .map(|example| model.forecast(example.features))
-        .collect::<Vec<_>>();
-    global_learned.sort_unstable_by(|left, right| {
-        compare_forecasts(global_forecasts[*left], global_forecasts[*right])
-            .then_with(|| {
-                selection[*left]
-                    .behavior_sequence
-                    .cmp(&selection[*right].behavior_sequence)
-            })
-            .then_with(|| selection[*left].key.cmp(&selection[*right].key))
-    });
-    let global_operational =
-        cooperative_ranked_indices(&global_bootstrap, &global_learned, selection.len());
+    let global_operational = observed_policy_examples(model, selection);
     let mut global = [0_usize; 7];
     for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
         let count = selection.len().min(budget);
         global[index] = global_operational[..count]
             .iter()
-            .filter(|candidate| selection[**candidate].targets.0[0] > 0.0)
+            .filter(|candidate| candidate.targets.0[0] > 0.0)
             .count();
     }
     Some(DiscoveryPrefixes {
@@ -1230,67 +1166,79 @@ fn operational_discoveries(
     })
 }
 
-pub(crate) fn cooperative_ranked_indices(
-    bootstrap: &[usize],
-    learned: &[usize],
-    limit: usize,
-) -> Vec<usize> {
-    assert_eq!(
-        bootstrap.len(),
-        learned.len(),
-        "cooperative policy rankings must cover the same candidates"
-    );
-    let candidate_count = bootstrap.len();
-    debug_assert!({
-        let mut bootstrap_seen = vec![false; candidate_count];
-        let mut learned_seen = vec![false; candidate_count];
-        bootstrap.iter().all(|index| {
-            *index < candidate_count && !std::mem::replace(&mut bootstrap_seen[*index], true)
-        }) && learned.iter().all(|index| {
-            *index < candidate_count && !std::mem::replace(&mut learned_seen[*index], true)
-        })
-    });
-    let limit = limit.min(candidate_count);
-    let mut selected = vec![false; candidate_count];
-    let mut output = Vec::with_capacity(limit);
-    let mut bootstrap_cursor = 0;
-    let mut learned_cursor = 0;
-    let take_unique = |ranking: &[usize],
-                       cursor: &mut usize,
-                       count: usize,
-                       output: &mut Vec<usize>,
-                       selected: &mut [bool]| {
-        let target = output.len().saturating_add(count);
-        while output.len() < target && *cursor < ranking.len() {
-            let index = ranking[*cursor];
-            *cursor += 1;
-            if !selected[index] {
-                selected[index] = true;
-                output.push(index);
-            }
-        }
+fn observed_policy_examples<'a>(
+    model: Option<&FtrlModel>,
+    examples: &[&'a TrainingExample],
+) -> Vec<&'a TrainingExample> {
+    let behavior_key = |example: &&TrainingExample| {
+        (
+            example.behavior_sequence,
+            example.behavior_rank,
+            example.key,
+        )
     };
-    while output.len() < limit {
-        let before = output.len();
-        take_unique(
-            learned,
-            &mut learned_cursor,
-            usize::from(output.len() < limit),
-            &mut output,
-            &mut selected,
-        );
-        take_unique(
-            bootstrap,
-            &mut bootstrap_cursor,
-            usize::from(output.len() < limit),
-            &mut output,
-            &mut selected,
-        );
-        if output.len() == before {
-            break;
-        }
-    }
-    output
+    let mut origin = examples
+        .iter()
+        .copied()
+        .filter(|example| example.allocation_queue == AllocationQueue::ProtectedOrigin)
+        .collect::<Vec<_>>();
+    let mut derived = examples
+        .iter()
+        .copied()
+        .filter(|example| example.allocation_queue == AllocationQueue::ProtectedDerived)
+        .collect::<Vec<_>>();
+    let unprotected = examples
+        .iter()
+        .copied()
+        .filter(|example| {
+            matches!(
+                example.allocation_queue,
+                AllocationQueue::Learned | AllocationQueue::Bootstrap
+            )
+        })
+        .collect::<Vec<_>>();
+    origin.sort_unstable_by_key(behavior_key);
+    derived.sort_unstable_by_key(behavior_key);
+    let mut bootstrap = (0..unprotected.len()).collect::<Vec<_>>();
+    bootstrap.sort_unstable_by_key(|index| {
+        let example = unprotected[*index];
+        (
+            example.bootstrap_rank,
+            example.behavior_sequence,
+            example.key,
+        )
+    });
+    let learned = model.map(|model| {
+        let forecasts = unprotected
+            .iter()
+            .map(|example| model.forecast(example.features))
+            .collect::<Vec<_>>();
+        let mut learned = (0..unprotected.len()).collect::<Vec<_>>();
+        learned.sort_unstable_by(|left, right| {
+            compare_forecasts(forecasts[*left], forecasts[*right])
+                .then_with(|| {
+                    unprotected[*left]
+                        .bootstrap_rank
+                        .cmp(&unprotected[*right].bootstrap_rank)
+                })
+                .then_with(|| unprotected[*left].key.cmp(&unprotected[*right].key))
+        });
+        learned
+    });
+    operational_ranked_selections(
+        origin.len(),
+        derived.len(),
+        &bootstrap,
+        learned.as_deref(),
+        examples.len(),
+    )
+    .into_iter()
+    .map(|selection| match selection.partition {
+        OperationalPartition::ProtectedOrigin => origin[selection.index],
+        OperationalPartition::ProtectedDerived => derived[selection.index],
+        OperationalPartition::Unprotected => unprotected[selection.index],
+    })
+    .collect()
 }
 
 #[cfg(feature = "internal-experiments")]
@@ -1657,6 +1605,8 @@ mod tests {
             corpus_key: [key; 32],
             behavior_rank: 0,
             behavior_sequence: u32::from(key),
+            allocation_queue: AllocationQueue::Bootstrap,
+            bootstrap_rank: u32::from(key),
             features: features(bucket),
             active_features: active_feature_mask(features(bucket)),
             targets: Targets(targets),
@@ -1692,6 +1642,31 @@ mod tests {
         let mut incompatible = model.encode();
         incompatible[5..9].copy_from_slice(&FEATURE_REVISION.saturating_add(1).to_le_bytes());
         assert!(FtrlModel::decode(&incompatible).is_err());
+    }
+
+    #[test]
+    fn zero_ftrl_preserves_the_bootstrap_candidate_prefix() {
+        let mut examples = (0..8_u8)
+            .map(|key| example(key, usize::from(key % 2), key % 3 == 0, CorpusRole::Replay))
+            .collect::<Vec<_>>();
+        examples[0].allocation_queue = AllocationQueue::ProtectedOrigin;
+        examples[1].allocation_queue = AllocationQueue::ProtectedOrigin;
+        examples[2].allocation_queue = AllocationQueue::ProtectedDerived;
+        examples[3].allocation_queue = AllocationQueue::ProtectedDerived;
+        let frozen = examples.iter().collect::<Vec<_>>();
+        let bootstrap = observed_policy_examples(None, &frozen)
+            .into_iter()
+            .map(|example| example.key)
+            .collect::<Vec<_>>();
+        let zero = observed_policy_examples(Some(&FtrlModel::zero()), &frozen)
+            .into_iter()
+            .map(|example| example.key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            zero, bootstrap,
+            "zero information preserves Candidate order; the Policy module separately locks its distinct cooperative queue attribution"
+        );
     }
 
     #[test]
@@ -1843,6 +1818,8 @@ mod tests {
             features: features(0),
             verdict: VerdictTarget::Accepted,
             verification_cost: 1.0,
+            allocation_queue: AllocationQueue::Bootstrap,
+            bootstrap_rank: 0,
         };
         let child = AttemptObservation {
             id: [2; 32],
@@ -1852,6 +1829,8 @@ mod tests {
             features: features(0),
             verdict: VerdictTarget::Accepted,
             verification_cost: 1.0,
+            allocation_queue: AllocationQueue::Bootstrap,
+            bootstrap_rank: 1,
         };
         let before = derive_targets(std::slice::from_ref(&parent), &[]);
         let after = derive_targets(
@@ -1958,23 +1937,8 @@ mod tests {
 
         assert_eq!(
             compare_bootstrap_policy(&challenger, &selection),
-            OperationalPolicyComparison::IncumbentWins,
+            ObservedPolicyComparison::IncumbentWins,
             "better pointwise loss cannot replace Bootstrap without a better selected prefix"
-        );
-    }
-
-    #[test]
-    fn cooperative_selection_protects_bootstrap_and_deduplicates_candidates() {
-        let baseline = (0..10).collect::<Vec<_>>();
-        let learned = (0..10).rev().collect::<Vec<_>>();
-
-        assert_eq!(
-            cooperative_ranked_indices(&baseline, &learned, 10),
-            vec![9, 0, 8, 1, 7, 2, 6, 3, 5, 4]
-        );
-        assert_eq!(
-            cooperative_ranked_indices(&baseline, &learned, 6),
-            vec![9, 0, 8, 1, 7, 2]
         );
     }
 
@@ -2005,7 +1969,7 @@ mod tests {
 
         assert_eq!(
             compare_bootstrap_policy(&challenger, &selection),
-            OperationalPolicyComparison::ChallengerWins,
+            ObservedPolicyComparison::ChallengerWins,
             "the executed cooperative policy must retain its learned top-1 gain while protecting later Bootstrap work"
         );
     }
@@ -2059,8 +2023,8 @@ mod tests {
             PromotionDecision::Promote
         );
         assert_eq!(
-            compare_learned_policies(&champion, &challenger, &selection),
-            OperationalPolicyComparison::IncumbentWins
+            compare_observed_policy_prefixes(Some(&champion), &challenger, &selection),
+            ObservedPolicyComparison::IncumbentWins
         );
     }
 

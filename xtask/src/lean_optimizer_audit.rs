@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reflex::internal_experiments::{
-    ExperienceVerdictInspection, compare_candidate_features, inspect_experience_segment,
+    CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
+    CandidateNoveltyFilterReasonInspection, ExperienceVerdictInspection,
+    compare_candidate_features, inspect_experience_segment,
 };
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
@@ -25,7 +27,7 @@ use crate::harness::{
     require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v7";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v8";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -94,8 +96,18 @@ struct TreatmentResult {
     strict_proof_node_improvements: usize,
     proof_nodes_removed: usize,
     strict_improvements: Vec<StrictImprovement>,
+    candidate_verification_curve: Vec<VerificationCurvePoint>,
     usage: Usage,
     bundle_sha256: String,
+}
+
+#[derive(Serialize)]
+struct VerificationCurvePoint {
+    request_budget: usize,
+    reached: bool,
+    observed_requests: usize,
+    strict_discoveries: usize,
+    cpu_ns_through_completed_batch: u64,
 }
 
 #[derive(Serialize)]
@@ -125,10 +137,39 @@ struct BundleSummary {
     accepted_experience: u64,
     refuted_experience: u64,
     unknown_experience: u64,
+    candidate_fates: usize,
+    novelty_filtered_candidates: usize,
+    policy_deferred_candidates: usize,
+    verification_interrupted_candidates: usize,
+    verified_by_queue: [usize; 4],
+    admitted_candidates: usize,
+    candidate_fate_trace: Vec<CandidateFateSummary>,
     learning: LearningSummary,
     knowledge_revision: String,
     model_revision: String,
     segment_logical_bytes: Vec<SegmentLogicalBytes>,
+}
+
+#[derive(Serialize)]
+struct CandidateFateSummary {
+    candidate_key: String,
+    claim_digest: String,
+    parent_key: String,
+    operator_digest: String,
+    epoch: u64,
+    generation_rank: u32,
+    proposal_limit: u32,
+    policy_rank: Option<u32>,
+    verification_batch_cpu_ns: Option<u64>,
+    verification_batch_size: Option<u32>,
+    outcome: &'static str,
+    novelty_filter_reason: Option<&'static str>,
+    allocation_queue: Option<&'static str>,
+    bootstrap_rank: Option<u32>,
+    learned_rank: Option<u32>,
+    verdict: Option<&'static str>,
+    admitted: bool,
+    strict_improvement: bool,
 }
 
 #[derive(Serialize)]
@@ -185,6 +226,13 @@ struct ExperienceSummary {
     claims: usize,
     accepted_claims: usize,
     verdicts: [u64; 3],
+    candidate_fates: usize,
+    novelty_filtered: usize,
+    policy_deferred: usize,
+    verification_interrupted: usize,
+    verified_by_queue: [usize; 4],
+    admitted: usize,
+    candidate_fate_trace: Vec<CandidateFateSummary>,
 }
 
 #[derive(Serialize)]
@@ -208,6 +256,7 @@ struct Report {
     bootstrap: TreatmentResult,
     full_has_more_improvements: bool,
     full_uses_less_cpu_per_improvement: bool,
+    full_noninferior_after_16_requests: bool,
     host: HostEnvironment,
     host_isolation: HostIsolation,
     content_sha256: String,
@@ -337,6 +386,13 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
         accepted_experience: experience.verdicts[0],
         refuted_experience: experience.verdicts[1],
         unknown_experience: experience.verdicts[2],
+        candidate_fates: experience.candidate_fates,
+        novelty_filtered_candidates: experience.novelty_filtered,
+        policy_deferred_candidates: experience.policy_deferred,
+        verification_interrupted_candidates: experience.verification_interrupted,
+        verified_by_queue: experience.verified_by_queue,
+        admitted_candidates: experience.admitted,
+        candidate_fate_trace: experience.candidate_fate_trace,
         learning,
         knowledge_revision: hex(&revisions[..32]),
         model_revision: hex(&revisions[32..64]),
@@ -635,6 +691,16 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
     let full_uses_less_cpu_per_improvement = cpu_per_improvement(&full)
         .zip(cpu_per_improvement(&bootstrap))
         .is_some_and(|(full, bootstrap)| full < bootstrap);
+    let comparable_prefixes = full
+        .candidate_verification_curve
+        .iter()
+        .zip(&bootstrap.candidate_verification_curve)
+        .filter(|(full, bootstrap)| full.request_budget >= 16 && full.reached && bootstrap.reached)
+        .collect::<Vec<_>>();
+    let full_noninferior_after_16_requests = !comparable_prefixes.is_empty()
+        && comparable_prefixes
+            .iter()
+            .all(|(full, bootstrap)| full.strict_discoveries >= bootstrap.strict_discoveries);
     let mut report = Report {
         schema: DEVELOPMENT_SCHEMA,
         status: "development-only; no 2026 exposure",
@@ -655,6 +721,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         bootstrap,
         full_has_more_improvements,
         full_uses_less_cpu_per_improvement,
+        full_noninferior_after_16_requests,
         host,
         host_isolation,
         content_sha256: String::new(),
@@ -1100,7 +1167,7 @@ fn run_fresh_treatment(
             ControlFlow::Continue(())
         },
     )?;
-    finish_treatment(name, outcome, seed_nodes, strict_improvements, target)
+    finish_treatment(name, outcome, seed_nodes, strict_improvements, target, 0)
 }
 
 #[expect(
@@ -1117,6 +1184,7 @@ fn run_resumed_treatment(
     target: &Path,
     seed_nodes: &HashMap<String, usize>,
 ) -> Result<TreatmentResult, AnyError> {
+    let fate_offset = bundle_candidate_fate_count(source)?;
     let mut strict_improvements = Vec::new();
     let outcome = improve(
         LeanDomain::new(config.clone(), corpus.clone())?,
@@ -1136,7 +1204,14 @@ fn run_resumed_treatment(
             ControlFlow::Continue(())
         },
     )?;
-    finish_treatment(name, outcome, seed_nodes, strict_improvements, target)
+    finish_treatment(
+        name,
+        outcome,
+        seed_nodes,
+        strict_improvements,
+        target,
+        fate_offset,
+    )
 }
 
 fn finish_training(outcome: reflex::SessionOutcome<LeanDomain>) -> Usage {
@@ -1151,6 +1226,7 @@ fn finish_treatment(
     seed_nodes: &HashMap<String, usize>,
     strict_improvements: Vec<StrictImprovement>,
     bundle: &Path,
+    fate_offset: usize,
 ) -> Result<TreatmentResult, AnyError> {
     let heldout = outcome
         .pareto()
@@ -1176,11 +1252,109 @@ fn finish_treatment(
             .map(|(seed, artifact)| seed.saturating_sub(*artifact))
             .sum(),
         strict_improvements,
+        candidate_verification_curve: candidate_verification_curve(bundle, fate_offset)?,
         usage: usage(outcome.usage()),
         bundle_sha256: hash_file(bundle)?,
     };
     drop(outcome);
     Ok(summary)
+}
+
+fn bundle_candidate_fate_count(bundle: &Path) -> Result<usize, AnyError> {
+    let bytes = std::fs::read(bundle)?;
+    let decoded = CanonicalBundle::decode(&bytes, RUNTIME_RESIDENT_BYTES)?;
+    Ok(
+        inspect_experience_segment(decoded.segment(SegmentKind::Experience))
+            .map_err(|_| "Lean Bundle has malformed Experience framing")?
+            .candidate_fates
+            .len(),
+    )
+}
+
+fn candidate_verification_curve(
+    bundle: &Path,
+    fate_offset: usize,
+) -> Result<Vec<VerificationCurvePoint>, AnyError> {
+    let bytes = std::fs::read(bundle)?;
+    let decoded = CanonicalBundle::decode(&bytes, RUNTIME_RESIDENT_BYTES)?;
+    let experience = inspect_experience_segment(decoded.segment(SegmentKind::Experience))
+        .map_err(|_| "Lean Bundle has malformed Experience framing")?;
+    let fates = experience
+        .candidate_fates
+        .get(fate_offset..)
+        .ok_or("Lean treatment Candidate Fate offset exceeds retained Experience")?;
+    verification_curve(fates)
+}
+
+fn verification_curve(
+    fates: &[CandidateFateInspection],
+) -> Result<Vec<VerificationCurvePoint>, AnyError> {
+    const BUDGETS: [usize; 7] = [1, 4, 8, 16, 32, 64, 128];
+
+    let mut batches = BTreeMap::<u64, Vec<&CandidateFateInspection>>::new();
+    for fate in fates {
+        if matches!(
+            fate.outcome,
+            CandidateFateOutcomeInspection::Verified { .. }
+        ) {
+            batches.entry(fate.epoch).or_default().push(fate);
+        }
+    }
+    let mut reached = [None; BUDGETS.len()];
+    let mut requests = 0_usize;
+    let mut strict_discoveries = 0_usize;
+    let mut cpu_ns = 0_u64;
+    for batch in batches.values_mut() {
+        batch.sort_unstable_by_key(|fate| {
+            fate.policy_rank
+                .expect("Verified Candidate Fate has a policy rank")
+        });
+        let batch_size = batch[0]
+            .verification_batch_size
+            .ok_or("Verified Candidate Fate is missing its Verification batch size")?;
+        if usize::try_from(batch_size)? != batch.len()
+            || batch.iter().any(|fate| {
+                fate.verification_batch_size != Some(batch_size)
+                    || fate.verification_batch_cpu_ns != batch[0].verification_batch_cpu_ns
+            })
+        {
+            return Err("Lean Candidate Fates disagree about their Verification batch".into());
+        }
+        cpu_ns = cpu_ns.saturating_add(
+            batch[0]
+                .verification_batch_cpu_ns
+                .ok_or("Verified Candidate Fate is missing Verification batch CPU")?,
+        );
+        for fate in batch {
+            requests += 1;
+            if matches!(
+                fate.outcome,
+                CandidateFateOutcomeInspection::Verified {
+                    strict_improvement: true,
+                    ..
+                }
+            ) {
+                strict_discoveries += 1;
+            }
+            if let Some(index) = BUDGETS.iter().position(|budget| *budget == requests) {
+                reached[index] = Some((strict_discoveries, cpu_ns));
+            }
+        }
+    }
+    Ok(BUDGETS
+        .into_iter()
+        .enumerate()
+        .map(|(index, request_budget)| {
+            let point = reached[index];
+            VerificationCurvePoint {
+                request_budget,
+                reached: point.is_some(),
+                observed_requests: requests.min(request_budget),
+                strict_discoveries: point.map_or(strict_discoveries, |value| value.0),
+                cpu_ns_through_completed_batch: point.map_or(cpu_ns, |value| value.1),
+            }
+        })
+        .collect())
 }
 
 fn record_strict_improvements(
@@ -1247,6 +1421,40 @@ fn experience_summary(experience: &[u8]) -> Result<ExperienceSummary, AnyError> 
     let mut verdicts = [0_u64; 3];
     let mut claims = HashSet::new();
     let mut accepted_claims = HashSet::new();
+    let candidate_fates = experience.candidate_fates.len();
+    let mut novelty_filtered = 0_usize;
+    let mut policy_deferred = 0_usize;
+    let mut verification_interrupted = 0_usize;
+    let mut verified_by_queue = [0_usize; 4];
+    let mut admitted = 0_usize;
+    let queue_index = |queue| match queue {
+        CandidateAllocationQueueInspection::ProtectedOrigin => 0,
+        CandidateAllocationQueueInspection::ProtectedDerived => 1,
+        CandidateAllocationQueueInspection::Learned => 2,
+        CandidateAllocationQueueInspection::Bootstrap => 3,
+    };
+    for fate in &experience.candidate_fates {
+        match fate.outcome {
+            CandidateFateOutcomeInspection::NoveltyFiltered { .. } => novelty_filtered += 1,
+            CandidateFateOutcomeInspection::PolicyDeferred { .. } => policy_deferred += 1,
+            CandidateFateOutcomeInspection::VerificationInterrupted { .. } => {
+                verification_interrupted += 1;
+            }
+            CandidateFateOutcomeInspection::Verified {
+                allocation_queue,
+                admitted: was_admitted,
+                ..
+            } => {
+                verified_by_queue[queue_index(allocation_queue)] += 1;
+                admitted += usize::from(was_admitted);
+            }
+        }
+    }
+    let candidate_fate_trace = experience
+        .candidate_fates
+        .iter()
+        .map(candidate_fate_summary)
+        .collect();
     for attempt in experience.attempts {
         claims.insert(attempt.claim_digest);
         let index = match attempt.verdict {
@@ -1264,7 +1472,93 @@ fn experience_summary(experience: &[u8]) -> Result<ExperienceSummary, AnyError> 
         claims: claims.len(),
         accepted_claims: accepted_claims.len(),
         verdicts,
+        candidate_fates,
+        novelty_filtered,
+        policy_deferred,
+        verification_interrupted,
+        verified_by_queue,
+        admitted,
+        candidate_fate_trace,
     })
+}
+
+fn candidate_fate_summary(fate: &CandidateFateInspection) -> CandidateFateSummary {
+    let mut summary = CandidateFateSummary {
+        candidate_key: hex(&fate.candidate_key),
+        claim_digest: hex(&fate.claim_digest),
+        parent_key: hex(&fate.parent_key),
+        operator_digest: hex(&fate.operator_digest),
+        epoch: fate.epoch,
+        generation_rank: fate.generation_rank,
+        proposal_limit: fate.proposal_limit,
+        policy_rank: fate.policy_rank,
+        verification_batch_cpu_ns: fate.verification_batch_cpu_ns,
+        verification_batch_size: fate.verification_batch_size,
+        outcome: "novelty-filtered",
+        novelty_filter_reason: None,
+        allocation_queue: None,
+        bootstrap_rank: None,
+        learned_rank: None,
+        verdict: None,
+        admitted: false,
+        strict_improvement: false,
+    };
+    let queue_name = |queue| match queue {
+        CandidateAllocationQueueInspection::ProtectedOrigin => "protected-origin",
+        CandidateAllocationQueueInspection::ProtectedDerived => "protected-derived",
+        CandidateAllocationQueueInspection::Learned => "learned",
+        CandidateAllocationQueueInspection::Bootstrap => "bootstrap",
+    };
+    match fate.outcome {
+        CandidateFateOutcomeInspection::NoveltyFiltered { reason } => {
+            summary.novelty_filter_reason = Some(match reason {
+                CandidateNoveltyFilterReasonInspection::KnownArtifact => "known-artifact",
+                CandidateNoveltyFilterReasonInspection::DuplicateCandidate => "duplicate-candidate",
+                CandidateNoveltyFilterReasonInspection::PriorNegativeExperience => {
+                    "prior-negative-experience"
+                }
+            });
+        }
+        CandidateFateOutcomeInspection::PolicyDeferred {
+            bootstrap_rank,
+            learned_rank,
+        } => {
+            summary.outcome = "policy-deferred";
+            summary.bootstrap_rank = bootstrap_rank;
+            summary.learned_rank = learned_rank;
+        }
+        CandidateFateOutcomeInspection::VerificationInterrupted {
+            allocation_queue,
+            bootstrap_rank,
+            learned_rank,
+        } => {
+            summary.outcome = "verification-interrupted";
+            summary.allocation_queue = Some(queue_name(allocation_queue));
+            summary.bootstrap_rank = bootstrap_rank;
+            summary.learned_rank = learned_rank;
+        }
+        CandidateFateOutcomeInspection::Verified {
+            verdict,
+            allocation_queue,
+            bootstrap_rank,
+            learned_rank,
+            admitted,
+            strict_improvement,
+        } => {
+            summary.outcome = "verified";
+            summary.allocation_queue = Some(queue_name(allocation_queue));
+            summary.bootstrap_rank = bootstrap_rank;
+            summary.learned_rank = learned_rank;
+            summary.verdict = Some(match verdict {
+                ExperienceVerdictInspection::Accepted => "accepted",
+                ExperienceVerdictInspection::Refuted => "refuted",
+                ExperienceVerdictInspection::Unknown => "unknown",
+            });
+            summary.admitted = admitted;
+            summary.strict_improvement = strict_improvement;
+        }
+    }
+    summary
 }
 
 fn learning_header(learning: &[u8]) -> Result<LearningSummary, AnyError> {
@@ -1365,6 +1659,44 @@ mod tests {
             features: Vec::new(),
             targets: [0.0; POTENTIAL_HEADS],
         }
+    }
+
+    #[test]
+    fn verification_curve_reports_registered_prefixes_with_accounted_batch_cpu() {
+        let fates = (0..4_u32)
+            .map(|rank| CandidateFateInspection {
+                candidate_key: [u8::try_from(rank).unwrap(); 32],
+                claim_digest: [1; 32],
+                parent_key: [2; 32],
+                operator_digest: [3; 32],
+                epoch: 7,
+                generation_rank: rank,
+                proposal_limit: 8,
+                policy_rank: Some(rank),
+                verification_batch_cpu_ns: Some(1_000),
+                verification_batch_size: Some(4),
+                outcome: CandidateFateOutcomeInspection::Verified {
+                    verdict: ExperienceVerdictInspection::Accepted,
+                    allocation_queue: CandidateAllocationQueueInspection::Bootstrap,
+                    bootstrap_rank: Some(rank),
+                    learned_rank: None,
+                    admitted: rank == 1,
+                    strict_improvement: rank == 1,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let curve = verification_curve(&fates).unwrap();
+
+        assert!(
+            curve[0].reached
+                && curve[0].observed_requests == 1
+                && curve[0].strict_discoveries == 0
+                && curve[0].cpu_ns_through_completed_batch == 1_000
+                && curve[1].reached
+                && curve[1].strict_discoveries == 1
+                && !curve[2].reached
+        );
     }
 
     #[test]

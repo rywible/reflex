@@ -209,7 +209,7 @@ impl ResourceEnvelopeGuard {
         })
     }
 
-    fn current_cpu(&self) -> Result<Duration, ()> {
+    pub(crate) fn current_cpu(&self) -> Result<Duration, ()> {
         Ok(self
             .cpu_before
             .get()

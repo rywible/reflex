@@ -2,11 +2,13 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
+use reflex::internal_experiments::inspect_experience_segment;
 use reflex::{
     BundlePlan, Completion, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration,
     Objective, OptimizationGoal, Preference, ResourceEnvelope, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 
 #[test]
 fn session_reinvests_in_a_verified_intermediate_artifact() {
@@ -250,9 +252,17 @@ fn candidate_dedup_is_scoped_to_the_seed_relative_correctness_claim() {
     })
     .unwrap();
 
-    assert_eq!(
-        outcome.usage().verification_requests,
-        4,
+    let bytes = std::fs::read(&bundle_path).unwrap();
+    let bundle = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
+    let experience = inspect_experience_segment(bundle.segment(SegmentKind::Experience)).unwrap();
+    assert!(
+        experience.attempts.iter().any(|attempt| {
+            experience.attempts.iter().any(|other| {
+                attempt.canonical_candidate == other.canonical_candidate
+                    && attempt.claim_digest != other.claim_digest
+            })
+        }) && outcome.usage().verification_requests
+            == u64::try_from(experience.attempts.len()).unwrap() + 2,
         "the same Candidate Artifact requires independent verdicts for distinct Correctness Claims"
     );
     std::fs::remove_file(bundle_path).ok();

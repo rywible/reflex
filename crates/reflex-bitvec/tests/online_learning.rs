@@ -4,7 +4,10 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Duration;
 
-use reflex::internal_experiments::{ExperienceVerdictInspection, inspect_experience_segment};
+use reflex::internal_experiments::{
+    CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
+    ExperienceVerdictInspection, inspect_experience_segment,
+};
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, improve,
@@ -43,7 +46,61 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     )
     .unwrap();
     let trained_snapshot = snapshot(&trained);
-    assert!(trained_snapshot.model_generation >= 1);
+    let training_claims = trained_snapshot
+        .attempts
+        .iter()
+        .map(|attempt| attempt.claim_digest)
+        .collect::<BTreeSet<_>>()
+        .len();
+    assert!(
+        trained_snapshot.model_generation >= 1,
+        "training retained {} attempts over {training_claims} claims ({} accepted; queues: origin {} accepted {}, derived {}, learned {}, Bootstrap {} accepted {}) across {} Candidate Fates",
+        trained_snapshot.attempts.len(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted)
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.allocation_queue
+                == CandidateAllocationQueueInspection::ProtectedOrigin)
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted
+                && attempt.allocation_queue == CandidateAllocationQueueInspection::ProtectedOrigin)
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.allocation_queue
+                == CandidateAllocationQueueInspection::ProtectedDerived)
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(
+                |attempt| attempt.allocation_queue == CandidateAllocationQueueInspection::Learned
+            )
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(
+                |attempt| attempt.allocation_queue == CandidateAllocationQueueInspection::Bootstrap
+            )
+            .count(),
+        trained_snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.accepted
+                && attempt.allocation_queue == CandidateAllocationQueueInspection::Bootstrap)
+            .count(),
+        trained_snapshot.candidate_fates.len(),
+    );
 
     std::fs::copy(&trained, &constrained).unwrap();
     std::fs::copy(&trained, &learned_full).unwrap();
@@ -83,10 +140,19 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     let learned_constrained = snapshot(&constrained);
     let bootstrap_constrained = snapshot(&bootstrap_constrained);
     let learned_new = &learned_constrained.attempts[trained_snapshot.attempts.len()..];
+    let learned_fates =
+        &learned_constrained.candidate_fates[trained_snapshot.candidate_fates.len()..];
 
     let learned_accepted = learned_new
         .iter()
         .filter(|attempt| attempt.accepted)
+        .count();
+    let learned_queue_accepted = learned_new
+        .iter()
+        .filter(|attempt| {
+            attempt.accepted
+                && attempt.allocation_queue == CandidateAllocationQueueInspection::Learned
+        })
         .count();
     let bootstrap_accepted = bootstrap_constrained
         .attempts
@@ -95,9 +161,32 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         .count();
     assert!(
         learned_accepted > 0
+            && learned_queue_accepted > 0
             && learned_new.iter().any(|attempt| !attempt.accepted)
             && bootstrap_accepted == 0,
         "the learned allocator must prefer useful work while retaining protected exploration; learned accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
+    );
+    assert_eq!(
+        learned_fates
+            .iter()
+            .filter(|fate| {
+                matches!(
+                    fate.outcome,
+                    CandidateFateOutcomeInspection::Verified { .. }
+                )
+            })
+            .count(),
+        learned_new.len(),
+        "every Verification attempt must have exactly one Candidate Fate"
+    );
+    assert!(
+        learned_fates.iter().any(|fate| {
+            matches!(
+                fate.outcome,
+                CandidateFateOutcomeInspection::PolicyDeferred { .. }
+            )
+        }),
+        "constrained allocation must retain the causal denominator that did not reach Verification"
     );
 
     improve(
@@ -144,27 +233,18 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
 }
 
 fn training_seeds() -> Vec<Expression> {
-    let refuted = (1..=96)
-        .map(|constant| Expression::xor(Expression::input(), Expression::constant(constant)));
-    let useful = (97..=192).map(|constant| {
-        Expression::xor(
-            Expression::xor(Expression::input(), Expression::constant(constant)),
-            Expression::constant(0),
-        )
-    });
-    refuted.chain(useful).collect()
+    (1..=192).map(multi_choice_seed).collect()
 }
 
 fn heldout_seeds() -> Vec<Expression> {
-    let refuted = (193..=224)
-        .map(|constant| Expression::xor(Expression::input(), Expression::constant(constant)));
-    let useful = (225..=255).map(|constant| {
-        Expression::xor(
-            Expression::xor(Expression::input(), Expression::constant(constant)),
-            Expression::constant(0),
-        )
-    });
-    refuted.chain(useful).collect()
+    (193..=224).map(multi_choice_seed).collect()
+}
+
+fn multi_choice_seed(constant: u8) -> Expression {
+    Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(constant)),
+        Expression::constant(1),
+    )
 }
 
 fn request(
@@ -195,11 +275,14 @@ struct Snapshot {
     artifact_count: usize,
     model_generation: u64,
     attempts: Vec<Attempt>,
+    candidate_fates: Vec<CandidateFateInspection>,
 }
 
 struct Attempt {
+    claim_digest: [u8; 32],
     canonical: Vec<u8>,
     accepted: bool,
+    allocation_queue: CandidateAllocationQueueInspection,
 }
 
 fn snapshot(path: &Path) -> Snapshot {
@@ -226,13 +309,16 @@ fn snapshot(path: &Path) -> Snapshot {
         .attempts
         .into_iter()
         .map(|attempt| Attempt {
+            claim_digest: attempt.claim_digest,
             canonical: attempt.canonical_candidate,
             accepted: attempt.verdict == ExperienceVerdictInspection::Accepted,
+            allocation_queue: attempt.allocation_queue,
         })
         .collect();
     Snapshot {
         artifact_count,
         model_generation,
         attempts,
+        candidate_fates: experience.candidate_fates,
     }
 }

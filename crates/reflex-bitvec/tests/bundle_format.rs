@@ -59,9 +59,12 @@ fn v3_bundle_segments_preserve_refuted_experience() {
                 .iter()
                 .map(|(_, version, _)| *version)
                 .eq([1, 4, 3, 3, 1])
-            && experience.attempts.len() == 1
-            && experience.attempts[0].verdict == ExperienceVerdictInspection::Refuted
-            && outcome.usage().verification_requests == 2,
+            && experience
+                .attempts
+                .iter()
+                .any(|attempt| attempt.verdict == ExperienceVerdictInspection::Refuted)
+            && outcome.usage().verification_requests
+                == u64::try_from(experience.attempts.len()).unwrap() + 1,
         "the canonical Experience segment retains an ordinary Refuted verdict"
     );
     std::fs::remove_file(bundle_path).ok();

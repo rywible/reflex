@@ -610,7 +610,7 @@ impl Expression {
             .then(|| Self::constant(values[0]))
     }
 
-    fn probes_zero_from_nonzero_xor_constant(&self) -> bool {
+    fn is_nonzero_xor_probe_target(&self) -> bool {
         let Some(Node::Xor(left, right)) = self.nodes.last().copied() else {
             return false;
         };
@@ -626,10 +626,18 @@ impl Expression {
             PrimitiveOperator::ReassociateConstants => selected.reassociate_constants_root(),
             PrimitiveOperator::NormalizeCommutativeConstant => selected.commute_root(),
             PrimitiveOperator::CollapseConstantFunction => selected.collapse_constant_function(),
-            PrimitiveOperator::ProbeZero if selected.probes_zero_from_nonzero_xor_constant() => {
+            PrimitiveOperator::ProbeZero if selected.is_nonzero_xor_probe_target() => {
                 Some(Self::constant(0))
             }
-            PrimitiveOperator::ProbeZero => None,
+            PrimitiveOperator::ProbeOne if selected.is_nonzero_xor_probe_target() => {
+                Some(Self::constant(1))
+            }
+            PrimitiveOperator::ProbeOnes if selected.is_nonzero_xor_probe_target() => {
+                Some(Self::constant(u8::MAX))
+            }
+            PrimitiveOperator::ProbeZero
+            | PrimitiveOperator::ProbeOne
+            | PrimitiveOperator::ProbeOnes => None,
         }?;
         let candidate = self.replace_subexpression(node, &replacement);
         (candidate != *self).then_some(candidate)
@@ -1192,7 +1200,7 @@ impl DomainDefinition for BitVecDomain {
 
     fn semantic_identity(&self) -> SemanticIdentity {
         SemanticIdentity::new(
-            "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v3",
+            "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v4",
         )
     }
 
@@ -1613,6 +1621,8 @@ pub enum PrimitiveOperator {
     ReassociateConstants,
     CollapseConstantFunction,
     ProbeZero,
+    ProbeOne,
+    ProbeOnes,
 }
 
 #[derive(Clone)]
@@ -1630,6 +1640,8 @@ impl ExpressionOperators {
         Self {
             catalog: vec![
                 OperatorDescriptor::new(PrimitiveOperator::ProbeZero, SymbolId::new("probe-zero")),
+                OperatorDescriptor::new(PrimitiveOperator::ProbeOne, SymbolId::new("probe-one")),
+                OperatorDescriptor::new(PrimitiveOperator::ProbeOnes, SymbolId::new("probe-ones")),
                 OperatorDescriptor::new(
                     PrimitiveOperator::SimplifyKnownIdentity,
                     SymbolId::new("simplify-known-identity"),

@@ -21,9 +21,10 @@ use crate::instrumentation::{Phase, Recorder};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
-    LearningState, compare_forecasts, cooperative_ranked_indices, derive_targets,
+    LearningState, compare_forecasts, derive_targets,
 };
 use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
+use crate::policy::{AllocationQueue, OperationalPartition, operational_ranked_selections};
 use crate::resource::{ResidentReservation, ResourceEnvelopeGuard};
 use crate::session::{
     ArtifactKey, Completion, GoalId, ImprovementRequest, ParetoSnapshot, ParetoUpdate,
@@ -38,7 +39,10 @@ mod scheduler;
 
 use bundle::RestartBundleCodec;
 use epoch::EpochTransition;
-use experience::{ExperienceEntry, ExperienceLedger, ExperienceVerdict};
+use experience::{
+    CandidateFateDisposition, CandidateFateKey, CandidateFateObservation, CandidateRank,
+    ExperienceEntry, ExperienceLedger, ExperienceVerdict, candidate_fate_batches_are_valid,
+};
 use goals::GoalEvaluator;
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
@@ -53,6 +57,7 @@ struct StoredArtifact<D: DomainDefinition> {
     parent_key: Option<ArtifactKey>,
 }
 type OriginatedStoredArtifact<D> = (StoredArtifact<D>, usize, [u8; 32]);
+#[cfg(feature = "internal-experiments")]
 type ClaimedVerdicts<D> = Vec<(ClaimOf<D>, Verdict<EvidenceOf<D>>)>;
 struct RecoveredBundle<D: DomainDefinition> {
     artifacts: Vec<StoredArtifact<D>>,
@@ -96,7 +101,17 @@ struct ProposedCandidate<D: DomainDefinition> {
     operator_symbol: Vec<u8>,
     features: Features,
     epoch: u64,
+    proposal_limit: u32,
     protected_derived: bool,
+    allocation_queue: AllocationQueue,
+    fate_index: usize,
+    bootstrap_rank: CandidateRank,
+    learned_rank: CandidateRank,
+}
+
+struct NovelCandidateBatch<D: DomainDefinition> {
+    candidates: Vec<ProposedCandidate<D>>,
+    fates: Vec<CandidateFateObservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -136,7 +151,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 5;
+const RUNTIME_REVISION: u64 = 6;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -193,31 +208,29 @@ pub(crate) fn inspect_experience_segment(
     bytes: &[u8],
 ) -> Result<crate::internal_experiments::ExperienceInspection, ()> {
     let ledger = ExperienceLedger::decode(bytes)?;
-    Ok(crate::internal_experiments::ExperienceInspection {
-        attempts: ledger
+    let consequence_candidates = |kind| {
+        let attempts = ledger
+            .consequences()
+            .iter()
+            .filter(|consequence| consequence.kind == kind)
+            .map(|consequence| consequence.subject)
+            .collect::<HashSet<_>>();
+        ledger
             .entries()
             .iter()
-            .map(
-                |entry| crate::internal_experiments::ExperienceAttemptInspection {
-                    claim_digest: entry.claim_digest,
-                    canonical_candidate: entry.canonical_candidate.clone(),
-                    operator_symbol: entry.operator_symbol.clone(),
-                    verdict: match entry.verdict {
-                        ExperienceVerdict::Accepted => {
-                            crate::internal_experiments::ExperienceVerdictInspection::Accepted
-                        }
-                        ExperienceVerdict::Refuted => {
-                            crate::internal_experiments::ExperienceVerdictInspection::Refuted
-                        }
-                        ExperienceVerdict::Unknown => {
-                            crate::internal_experiments::ExperienceVerdictInspection::Unknown
-                        }
-                    },
-                    verification_requests: entry.verification_requests,
-                    epoch: entry.epoch,
-                },
-            )
-            .collect(),
+            .filter(|entry| attempts.contains(&entry.attempt_id))
+            .map(ExperienceEntry::candidate_fate_key)
+            .collect::<HashSet<_>>()
+    };
+    let admitted_candidates = consequence_candidates(ConsequenceKind::Admitted);
+    let improved_candidates = consequence_candidates(ConsequenceKind::ParetoImprovement);
+    Ok(crate::internal_experiments::ExperienceInspection {
+        attempts: experience_attempt_inspections(&ledger),
+        candidate_fates: candidate_fate_inspections(
+            &ledger,
+            &admitted_candidates,
+            &improved_candidates,
+        ),
         consequence_count: ledger.consequences().len(),
         measurements: ledger
             .measurements()
@@ -230,6 +243,140 @@ pub(crate) fn inspect_experience_segment(
             )
             .collect(),
     })
+}
+
+#[cfg(feature = "internal-experiments")]
+fn inspect_allocation_queue(
+    queue: AllocationQueue,
+) -> crate::internal_experiments::CandidateAllocationQueueInspection {
+    match queue {
+        AllocationQueue::ProtectedOrigin => {
+            crate::internal_experiments::CandidateAllocationQueueInspection::ProtectedOrigin
+        }
+        AllocationQueue::ProtectedDerived => {
+            crate::internal_experiments::CandidateAllocationQueueInspection::ProtectedDerived
+        }
+        AllocationQueue::Learned => {
+            crate::internal_experiments::CandidateAllocationQueueInspection::Learned
+        }
+        AllocationQueue::Bootstrap => {
+            crate::internal_experiments::CandidateAllocationQueueInspection::Bootstrap
+        }
+    }
+}
+
+#[cfg(feature = "internal-experiments")]
+fn experience_attempt_inspections(
+    ledger: &ExperienceLedger,
+) -> Vec<crate::internal_experiments::ExperienceAttemptInspection> {
+    ledger
+        .entries()
+        .iter()
+        .map(
+            |entry| crate::internal_experiments::ExperienceAttemptInspection {
+                claim_digest: entry.claim_digest,
+                canonical_candidate: entry.canonical_candidate.clone(),
+                operator_symbol: entry.operator_symbol.clone(),
+                verdict: match entry.verdict {
+                    ExperienceVerdict::Accepted => {
+                        crate::internal_experiments::ExperienceVerdictInspection::Accepted
+                    }
+                    ExperienceVerdict::Refuted => {
+                        crate::internal_experiments::ExperienceVerdictInspection::Refuted
+                    }
+                    ExperienceVerdict::Unknown => {
+                        crate::internal_experiments::ExperienceVerdictInspection::Unknown
+                    }
+                },
+                allocation_queue: inspect_allocation_queue(entry.allocation_queue),
+                verification_requests: entry.verification_requests,
+                epoch: entry.epoch,
+            },
+        )
+        .collect()
+}
+
+#[cfg(feature = "internal-experiments")]
+fn candidate_fate_inspections(
+    ledger: &ExperienceLedger,
+    admitted: &HashSet<CandidateFateKey>,
+    improved: &HashSet<CandidateFateKey>,
+) -> Vec<crate::internal_experiments::CandidateFateInspection> {
+    ledger
+        .candidate_fates()
+        .iter()
+        .map(|fate| {
+            let queue = fate.allocation_queue.map(inspect_allocation_queue);
+            let was_admitted = admitted.contains(&fate.key());
+            let was_improved = improved.contains(&fate.key());
+            let verified = |verdict| {
+                crate::internal_experiments::CandidateFateOutcomeInspection::Verified {
+                    verdict,
+                    allocation_queue: queue
+                        .expect("Verified Candidate Fates retain queue attribution"),
+                    bootstrap_rank: fate.bootstrap_rank.value(),
+                    learned_rank: fate.learned_rank.value(),
+                    admitted: was_admitted,
+                    strict_improvement: was_improved,
+                }
+            };
+            let outcome = match fate.disposition {
+                CandidateFateDisposition::KnownArtifact => {
+                    crate::internal_experiments::CandidateFateOutcomeInspection::NoveltyFiltered {
+                        reason: crate::internal_experiments::CandidateNoveltyFilterReasonInspection::KnownArtifact,
+                    }
+                }
+                CandidateFateDisposition::DuplicateCandidate => {
+                    crate::internal_experiments::CandidateFateOutcomeInspection::NoveltyFiltered {
+                        reason: crate::internal_experiments::CandidateNoveltyFilterReasonInspection::DuplicateCandidate,
+                    }
+                }
+                CandidateFateDisposition::PriorNegativeExperience => {
+                    crate::internal_experiments::CandidateFateOutcomeInspection::NoveltyFiltered {
+                        reason: crate::internal_experiments::CandidateNoveltyFilterReasonInspection::PriorNegativeExperience,
+                    }
+                }
+                CandidateFateDisposition::PolicyDeferred => {
+                    crate::internal_experiments::CandidateFateOutcomeInspection::PolicyDeferred {
+                        bootstrap_rank: fate.bootstrap_rank.value(),
+                        learned_rank: fate.learned_rank.value(),
+                    }
+                }
+                CandidateFateDisposition::VerificationInterrupted => {
+                    crate::internal_experiments::CandidateFateOutcomeInspection::VerificationInterrupted {
+                        allocation_queue: queue
+                            .expect("selected Candidate Fates retain queue attribution"),
+                        bootstrap_rank: fate.bootstrap_rank.value(),
+                        learned_rank: fate.learned_rank.value(),
+                    }
+                }
+                CandidateFateDisposition::VerifiedAccepted => {
+                    verified(crate::internal_experiments::ExperienceVerdictInspection::Accepted)
+                }
+                CandidateFateDisposition::VerifiedRefuted => {
+                    verified(crate::internal_experiments::ExperienceVerdictInspection::Refuted)
+                }
+                CandidateFateDisposition::VerifiedUnknown => {
+                    verified(crate::internal_experiments::ExperienceVerdictInspection::Unknown)
+                }
+            };
+            crate::internal_experiments::CandidateFateInspection {
+                candidate_key: fate.candidate_key.0,
+                claim_digest: fate.claim_digest,
+                parent_key: fate.parent_key.0,
+                operator_digest: fate.operator_digest,
+                epoch: fate.epoch,
+                generation_rank: fate.generation_rank,
+                proposal_limit: fate.proposal_limit,
+                policy_rank: fate.policy_rank.value(),
+                verification_batch_cpu_ns: (fate.verification_batch_size != 0)
+                    .then_some(fate.verification_batch_cpu_ns),
+                verification_batch_size: (fate.verification_batch_size != 0)
+                    .then_some(fate.verification_batch_size),
+                outcome,
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "internal-experiments")]
@@ -721,6 +868,14 @@ where
     let mut verification_budget_exhausted = false;
     let mut durable_budget_exhausted = false;
     let mut resident_budget_exhausted = initial_delivery.resource_exhausted();
+    let mut selection_epoch = ledger
+        .entries()
+        .iter()
+        .map(|entry| entry.epoch)
+        .chain(ledger.candidate_fates().iter().map(|fate| fate.epoch))
+        .max()
+        .map_or(Some(0_u64), |epoch| epoch.checked_add(1))
+        .ok_or(SessionError::CorruptBundle)?;
     let mut operator_scratch = <D::Operators as OperatorAlgebra<D>>::Scratch::default();
     instrumentation.finish(Phase::Setup, setup_started);
 
@@ -789,6 +944,10 @@ where
             resident_budget_exhausted = true;
             break;
         }
+        let candidate_epoch = selection_epoch;
+        selection_epoch = selection_epoch
+            .checked_add(1)
+            .ok_or(SessionError::CorruptBundle)?;
         let has_derived = pinned_knowledge
             .operators()
             .iter()
@@ -860,13 +1019,18 @@ where
                         *parent,
                         &candidate.artifact,
                         operator_features,
-                        sequence,
+                        candidate_epoch,
                         candidate.proposal_features,
                     ),
                     candidate,
                     operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
-                    epoch: sequence,
+                    epoch: candidate_epoch,
+                    proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
                     protected_derived: false,
+                    allocation_queue: AllocationQueue::Bootstrap,
+                    fate_index: usize::MAX,
+                    bootstrap_rank: CandidateRank::absent(),
+                    learned_rank: CandidateRank::absent(),
                 });
             }
         }
@@ -886,7 +1050,7 @@ where
             &pinned_knowledge,
             &mut operator_scratch,
             derived_budget,
-            sequence,
+            candidate_epoch,
             &mut candidates,
         )?;
         application_bytes = application_bytes.saturating_add(derived_bytes);
@@ -902,7 +1066,7 @@ where
             break;
         }
         let selection_started = instrumentation.start();
-        candidates = retain_novel_candidates(
+        let novel = retain_novel_candidates(
             domain,
             &known,
             ledger.entries(),
@@ -910,6 +1074,8 @@ where
             &frontier,
             candidates,
         )?;
+        candidates = novel.candidates;
+        let mut candidate_fates = novel.fates;
         let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
         order_by_learned_potential(
             &goal_evaluator,
@@ -917,10 +1083,24 @@ where
             pinned_model.as_ref(),
             remaining,
             &mut candidates,
+            &mut candidate_fates,
         );
+        for (policy_rank, candidate) in candidates.iter().enumerate() {
+            let fate = candidate_fates
+                .get_mut(candidate.fate_index)
+                .expect("selected Candidates retain their Candidate Fate index");
+            fate.disposition = CandidateFateDisposition::VerificationInterrupted;
+            fate.allocation_queue = Some(candidate.allocation_queue);
+            fate.policy_rank = CandidateRank::present(
+                u32::try_from(policy_rank).expect("Candidate policy rank is bounded"),
+            );
+            fate.bootstrap_rank = candidate.bootstrap_rank;
+            fate.learned_rank = candidate.learned_rank;
+        }
         instrumentation.selected(candidates.len());
         instrumentation.finish(Phase::Selection, selection_started);
         if candidates.is_empty() {
+            ledger.append_candidate_fates(candidate_fates);
             resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
@@ -935,6 +1115,7 @@ where
                 .with_transient(checkpoint.capacity() as u64)
                 .with_pending_durability(durability.pending_bytes()),
         ) {
+            ledger.append_candidate_fates(candidate_fates);
             resident_budget_exhausted = true;
             break;
         }
@@ -942,6 +1123,7 @@ where
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?
         {
+            ledger.append_candidate_fates(candidate_fates);
             time_exhausted = true;
             break;
         }
@@ -950,6 +1132,7 @@ where
             verification_budget_exhausted = true;
         }
         if candidates.is_empty() {
+            ledger.append_candidate_fates(candidate_fates);
             break;
         }
         instrumentation.verified(candidates.len());
@@ -971,6 +1154,7 @@ where
             verification_workers,
             verification_resident,
             &mut instrumentation,
+            &mut candidate_fates,
         );
         let verification = match verification_result {
             Ok(verification) => verification,
@@ -996,7 +1180,9 @@ where
         instrumentation.finish(Phase::Verification, verification_started);
         test_fault_point("verdict-recorded");
         let experience_checkpoint_state = ledger.checkpoint_entries();
+        let candidate_fate_checkpoint = ledger.checkpoint_candidate_fates();
         ledger.append_entries(verification.experience);
+        ledger.append_candidate_fates(candidate_fates);
         test_fault_point("experience-appended");
         let checkpoint_usage = resource_meter
             .usage(verification_requests, checkpoint.len() as u64)
@@ -1012,6 +1198,7 @@ where
         )?;
         if !resource_meter.checkpoint_fits(experience_checkpoint.len() as u64) {
             ledger.rollback_entries(experience_checkpoint_state);
+            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
             durable_budget_exhausted = true;
             break;
         }
@@ -1033,6 +1220,7 @@ where
                 .with_pending_durability(durability.pending_bytes()),
         ) {
             ledger.rollback_entries(experience_checkpoint_state);
+            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
             resident_budget_exhausted = true;
             break;
         }
@@ -1607,6 +1795,10 @@ fn operator_feature_values(operator_symbol: &str) -> [f32; 8] {
     values
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Derived Operator expansion keeps its bounded multi-step provenance in one search transaction"
+)]
 fn append_derived_candidates<D: DomainDefinition>(
     domain: &D,
     parents: &[&D::Artifact],
@@ -1712,7 +1904,12 @@ fn append_derived_candidates<D: DomainDefinition>(
                 candidate,
                 operator_symbol: derived.symbol().to_vec(),
                 epoch,
+                proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
                 protected_derived: derived.protected_exploration(),
+                allocation_queue: AllocationQueue::Bootstrap,
+                fate_index: usize::MAX,
+                bootstrap_rank: CandidateRank::absent(),
+                learned_rank: CandidateRank::absent(),
             });
         }
     }
@@ -1725,46 +1922,17 @@ fn order_by_learned_potential<D: DomainDefinition>(
     model: Option<&FtrlModel>,
     limit: usize,
     candidates: &mut Vec<ProposedCandidate<D>>,
+    candidate_fates: &mut [CandidateFateObservation],
 ) {
-    if model.is_none() {
-        let (origin_exploration, remaining) =
-            partition_origin_exploration(frontier, std::mem::take(candidates), limit);
-        let (mut derived, mut ordinary) = partition_derived_exploration(remaining);
-        let compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
-            goals.compare_parents(frontier, left, right).then_with(|| {
-                left.operator_symbol
-                    .cmp(&right.operator_symbol)
-                    .then_with(|| {
-                        left.candidate
-                            .source_index
-                            .cmp(&right.candidate.source_index)
-                    })
-            })
-        };
-        sort_prefix_by(&mut derived, limit, compare);
-        sort_prefix_by(&mut ordinary, limit, compare);
-        candidates.extend(origin_exploration);
-        if candidates.len() >= limit {
-            candidates.truncate(limit);
-            return;
-        }
-        let mut derived = derived.into_iter();
-        let mut ordinary = ordinary.into_iter();
-        loop {
-            let before = candidates.len();
-            candidates.extend(derived.by_ref().take(2));
-            candidates.extend(ordinary.by_ref().take(6));
-            if candidates.len() == before || candidates.len() >= limit {
-                break;
-            }
-        }
-        candidates.truncate(limit);
-        return;
-    }
-    let model = model.expect("the learned ordering branch requires a Model Revision");
-    let (origin_exploration, remaining) =
+    let (mut origin_exploration, remaining) =
         partition_origin_exploration(frontier, std::mem::take(candidates), limit);
-    let (derived_exploration, ordinary) = partition_derived_exploration(remaining);
+    let (mut derived_exploration, mut unprotected) = partition_derived_exploration(remaining);
+    for candidate in &mut origin_exploration {
+        candidate.allocation_queue = AllocationQueue::ProtectedOrigin;
+    }
+    for candidate in &mut derived_exploration {
+        candidate.allocation_queue = AllocationQueue::ProtectedDerived;
+    }
     let bootstrap_compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
         goals.compare_parents(frontier, left, right).then_with(|| {
             left.operator_symbol
@@ -1776,53 +1944,103 @@ fn order_by_learned_potential<D: DomainDefinition>(
                 })
         })
     };
-    let mut bootstrap = (0..ordinary.len()).collect::<Vec<_>>();
-    bootstrap
-        .sort_unstable_by(|left, right| bootstrap_compare(&ordinary[*left], &ordinary[*right]));
-    let ranked_features = ordinary
+    sort_prefix_by(&mut derived_exploration, limit, bootstrap_compare);
+    if model.is_none() {
+        unprotected.sort_unstable_by(bootstrap_compare);
+    }
+    let mut bootstrap = (0..unprotected.len()).collect::<Vec<_>>();
+    if model.is_some() {
+        bootstrap.sort_unstable_by(|left, right| {
+            bootstrap_compare(&unprotected[*left], &unprotected[*right])
+        });
+    }
+    for (rank, candidate) in bootstrap.iter().copied().enumerate() {
+        let rank = CandidateRank::present(
+            u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
+        );
+        unprotected[candidate].bootstrap_rank = rank;
+        candidate_fates[unprotected[candidate].fate_index].bootstrap_rank = rank;
+    }
+    let Some(model) = model else {
+        apply_operational_order(
+            origin_exploration,
+            derived_exploration,
+            unprotected,
+            &bootstrap,
+            None,
+            limit,
+            candidates,
+        );
+        return;
+    };
+    let ranked_features = unprotected
         .iter()
         .map(|candidate| candidate.features)
         .collect::<Vec<_>>();
     let mut forecasts = Vec::with_capacity(ranked_features.len());
     model.forecast_batch(&ranked_features, &mut forecasts);
-    let mut learned = (0..ordinary.len()).collect::<Vec<_>>();
+    let mut learned = (0..unprotected.len()).collect::<Vec<_>>();
     learned.sort_unstable_by(|left, right| {
         compare_forecasts(forecasts[*left], forecasts[*right])
-            .then_with(|| goals.compare_parents(frontier, &ordinary[*left], &ordinary[*right]))
             .then_with(|| {
-                ordinary[*left]
+                goals.compare_parents(frontier, &unprotected[*left], &unprotected[*right])
+            })
+            .then_with(|| {
+                unprotected[*left]
                     .operator_symbol
-                    .cmp(&ordinary[*right].operator_symbol)
+                    .cmp(&unprotected[*right].operator_symbol)
                     .then_with(|| {
-                        ordinary[*left]
+                        unprotected[*left]
                             .candidate
                             .source_index
-                            .cmp(&ordinary[*right].candidate.source_index)
+                            .cmp(&unprotected[*right].candidate.source_index)
                     })
             })
     });
-    let cooperative = cooperative_ranked_indices(&bootstrap, &learned, limit);
-    let mut ordinary = ordinary.into_iter().map(Some).collect::<Vec<_>>();
-    let mut cooperative = cooperative.into_iter().map(|index| {
-        ordinary[index]
+    for (rank, candidate) in learned.iter().copied().enumerate() {
+        let rank = CandidateRank::present(
+            u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
+        );
+        unprotected[candidate].learned_rank = rank;
+        candidate_fates[unprotected[candidate].fate_index].learned_rank = rank;
+    }
+    apply_operational_order(
+        origin_exploration,
+        derived_exploration,
+        unprotected,
+        &bootstrap,
+        Some(&learned),
+        limit,
+        candidates,
+    );
+}
+
+fn apply_operational_order<D: DomainDefinition>(
+    origin: Vec<ProposedCandidate<D>>,
+    derived: Vec<ProposedCandidate<D>>,
+    unprotected: Vec<ProposedCandidate<D>>,
+    bootstrap: &[usize],
+    learned: Option<&[usize]>,
+    limit: usize,
+    output: &mut Vec<ProposedCandidate<D>>,
+) {
+    let selections =
+        operational_ranked_selections(origin.len(), derived.len(), bootstrap, learned, limit);
+    let mut origin = origin.into_iter().map(Some).collect::<Vec<_>>();
+    let mut derived = derived.into_iter().map(Some).collect::<Vec<_>>();
+    let mut unprotected = unprotected.into_iter().map(Some).collect::<Vec<_>>();
+    output.extend(selections.into_iter().map(|selection| {
+        let candidate = match selection.partition {
+            OperationalPartition::ProtectedOrigin => &mut origin[selection.index],
+            OperationalPartition::ProtectedDerived => &mut derived[selection.index],
+            OperationalPartition::Unprotected => &mut unprotected[selection.index],
+        };
+        let mut candidate = candidate
             .take()
-            .expect("cooperative ordering emits each Candidate once")
-    });
-    candidates.extend(origin_exploration);
-    if candidates.len() >= limit {
-        candidates.truncate(limit);
-        return;
-    }
-    let mut derived_exploration = derived_exploration.into_iter();
-    loop {
-        let before = candidates.len();
-        candidates.extend(derived_exploration.by_ref().take(2));
-        candidates.extend(cooperative.by_ref().take(6));
-        if candidates.len() == before || candidates.len() >= limit {
-            break;
-        }
-    }
-    candidates.truncate(limit);
+            .expect("operational policy emits each Candidate once");
+        candidate.allocation_queue = selection.queue;
+        candidate
+    }));
 }
 
 fn partition_derived_exploration<D: DomainDefinition>(
@@ -1843,23 +2061,23 @@ fn partition_origin_exploration<D: DomainDefinition>(
         .filter_map(|candidate| {
             frontier
                 .get(candidate.candidate.source_index)
-                .map(|(_, origin)| *origin)
+                .map(|(artifact, _)| artifact.inner.claim_digest)
         })
         .collect::<BTreeSet<_>>();
     let protected = protected_origin_keys(origins, limit);
-    let mut selected: HashMap<usize, (usize, bool)> = HashMap::with_capacity(protected.len());
+    let mut selected: HashMap<[u8; 32], (usize, bool)> = HashMap::with_capacity(protected.len());
     for (index, candidate) in candidates.iter().enumerate() {
-        let Some(origin) = frontier
+        let Some(claim) = frontier
             .get(candidate.candidate.source_index)
-            .map(|(_, origin)| *origin)
+            .map(|(artifact, _)| artifact.inner.claim_digest)
         else {
             continue;
         };
-        if !protected.contains(&origin) {
+        if !protected.contains(&claim) {
             continue;
         }
         selected
-            .entry(origin)
+            .entry(claim)
             .and_modify(|(selected_index, selected_is_derived)| {
                 if candidate.protected_derived && !*selected_is_derived {
                     *selected_index = index;
@@ -1873,18 +2091,21 @@ fn partition_origin_exploration<D: DomainDefinition>(
         .map(|(index, _)| index)
         .collect::<HashSet<_>>();
     let mut exploration = Vec::with_capacity(protected.len());
-    let mut ordinary = Vec::with_capacity(candidates.len().saturating_sub(protected.len()));
+    let mut unprotected = Vec::with_capacity(candidates.len().saturating_sub(protected.len()));
     for (index, candidate) in candidates.into_iter().enumerate() {
         if selected.contains(&index) {
             exploration.push(candidate);
         } else {
-            ordinary.push(candidate);
+            unprotected.push(candidate);
         }
     }
-    (exploration, ordinary)
+    (exploration, unprotected)
 }
 
-fn protected_origin_keys(origins: BTreeSet<usize>, limit: usize) -> HashSet<usize> {
+fn protected_origin_keys<K: Copy + Eq + std::hash::Hash + Ord>(
+    origins: BTreeSet<K>,
+    limit: usize,
+) -> HashSet<K> {
     if origins.len() <= 1 || origins.len() > limit {
         return HashSet::new();
     }
@@ -1926,46 +2147,74 @@ fn retain_novel_candidates<D: DomainDefinition>(
     roots: &[VerifiedArtifact<D>],
     frontier: &[(VerifiedArtifact<D>, usize)],
     candidates: Vec<ProposedCandidate<D>>,
-) -> Result<Vec<ProposedCandidate<D>>, SessionError<D::Error>> {
-    let mut keys = known
+) -> Result<NovelCandidateBatch<D>, SessionError<D::Error>> {
+    let known_keys = known
         .iter()
         .map(|artifact| Ok((artifact.key(), claim_digest(domain, artifact)?)))
         .collect::<Result<HashSet<_>, SessionError<D::Error>>>()?;
+    let mut generated_keys = HashSet::with_capacity(candidates.len());
     let root_claims = roots
         .iter()
         .map(|root| claim_digest(domain, root))
         .collect::<Result<Vec<_>, _>>()?;
     let mut scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
     let identity = domain.semantic_identity();
-    candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            let mut canonical = Vec::new();
-            match domain.structure().encode_canonical(
-                &candidate.candidate.artifact,
-                &mut canonical,
-                &mut scratch,
-            ) {
-                Ok(()) => {
-                    let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
-                    let origin = frontier[candidate.candidate.source_index].1;
-                    if !keys.insert((key, root_claims[origin])) {
-                        return None;
-                    }
-                    (!experience.iter().any(|entry| {
-                        entry.candidate_key == key
-                            && entry.claim_digest == root_claims[origin]
-                            && matches!(
-                                entry.verdict,
-                                ExperienceVerdict::Refuted | ExperienceVerdict::Unknown
-                            )
-                    }))
-                    .then_some(Ok(candidate))
-                }
-                Err(error) => Some(Err(SessionError::Domain(error))),
-            }
-        })
-        .collect()
+    let mut retained = Vec::with_capacity(candidates.len());
+    let mut fates = Vec::with_capacity(candidates.len());
+    for (generation_rank, mut candidate) in candidates.into_iter().enumerate() {
+        let mut canonical = Vec::new();
+        domain
+            .structure()
+            .encode_canonical(&candidate.candidate.artifact, &mut canonical, &mut scratch)
+            .map_err(SessionError::Domain)?;
+        let candidate_key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
+        let origin = frontier[candidate.candidate.source_index].1;
+        let claim_digest = root_claims[origin];
+        let identity = (candidate_key, claim_digest);
+        let prior_negative = experience.iter().any(|entry| {
+            entry.candidate_key == candidate_key
+                && entry.claim_digest == claim_digest
+                && matches!(
+                    entry.verdict,
+                    ExperienceVerdict::Refuted | ExperienceVerdict::Unknown
+                )
+        });
+        let disposition = if known_keys.contains(&identity) {
+            CandidateFateDisposition::KnownArtifact
+        } else if !generated_keys.insert(identity) {
+            CandidateFateDisposition::DuplicateCandidate
+        } else if prior_negative {
+            CandidateFateDisposition::PriorNegativeExperience
+        } else {
+            CandidateFateDisposition::PolicyDeferred
+        };
+        let novel = disposition == CandidateFateDisposition::PolicyDeferred;
+        let fate_index = fates.len();
+        fates.push(CandidateFateObservation {
+            candidate_key,
+            claim_digest,
+            parent_key: frontier[candidate.candidate.source_index].0.key(),
+            operator_digest: Sha256::digest(&candidate.operator_symbol).into(),
+            epoch: candidate.epoch,
+            generation_rank: u32::try_from(generation_rank).unwrap_or(u32::MAX),
+            proposal_limit: candidate.proposal_limit,
+            policy_rank: CandidateRank::absent(),
+            bootstrap_rank: CandidateRank::absent(),
+            learned_rank: CandidateRank::absent(),
+            verification_batch_cpu_ns: 0,
+            verification_batch_size: 0,
+            disposition,
+            allocation_queue: None,
+        });
+        if novel {
+            candidate.fate_index = fate_index;
+            retained.push(candidate);
+        }
+    }
+    Ok(NovelCandidateBatch {
+        candidates: retained,
+        fates,
+    })
 }
 
 fn materialize<D: DomainDefinition>(
@@ -2500,6 +2749,38 @@ fn decode_bundle<D: DomainDefinition>(
             }
         }
     }
+    let mut entries_by_fate = HashMap::with_capacity(ledger.entries().len());
+    for entry in ledger.entries() {
+        if entries_by_fate
+            .insert(entry.candidate_fate_key(), entry)
+            .is_some()
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+    }
+    let mut matched_attempts = HashSet::with_capacity(ledger.entries().len());
+    if !candidate_fate_batches_are_valid(ledger.candidate_fates()) {
+        return Err(SessionError::CorruptBundle);
+    }
+    for fate in ledger.candidate_fates() {
+        if !fate.attribution_is_valid() {
+            return Err(SessionError::CorruptBundle);
+        }
+        if let Some(expected_verdict) = fate.expected_verdict() {
+            let Some(entry) = entries_by_fate.get(&fate.key()) else {
+                return Err(SessionError::CorruptBundle);
+            };
+            if entry.verdict != expected_verdict
+                || Some(entry.allocation_queue) != fate.allocation_queue
+                || !matched_attempts.insert(entry.attempt_id)
+            {
+                return Err(SessionError::CorruptBundle);
+            }
+        }
+    }
+    if !ledger.candidate_fates().is_empty() && matched_attempts.len() != ledger.entries().len() {
+        return Err(SessionError::CorruptBundle);
+    }
     let corpus_assignments = ledger
         .entries()
         .iter()
@@ -2985,6 +3266,7 @@ fn verify_candidates<D: DomainDefinition>(
     requirements: VerificationWorkerRequirements,
     resident_overlap: u64,
     instrumentation: &mut Recorder,
+    candidate_fates: &mut [CandidateFateObservation],
 ) -> Result<VerificationOutcome<D>, SessionError<D::Error>> {
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
     let identity = domain.semantic_identity();
@@ -3017,6 +3299,9 @@ fn verify_candidates<D: DomainDefinition>(
         })
         .collect::<Vec<_>>();
     let kernel_started = instrumentation.start();
+    let kernel_cpu_before = resource_meter
+        .current_cpu()
+        .map_err(|()| SessionError::Resource)?;
     let claims_and_verdicts = scheduled_verify(
         domain,
         scheduler,
@@ -3026,10 +3311,23 @@ fn verify_candidates<D: DomainDefinition>(
         &requests,
         false,
     );
+    let kernel_cpu = resource_meter
+        .current_cpu()
+        .map_err(|()| SessionError::Resource)?
+        .saturating_sub(kernel_cpu_before);
     instrumentation.finish(Phase::VerificationKernel, kernel_started);
     let claims_and_verdicts = claims_and_verdicts?;
     if claims_and_verdicts.len() != candidates.len() {
         return Err(SessionError::InvalidSeed);
+    }
+    let verification_batch_size = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    let verification_batch_cpu_ns = u64::try_from(kernel_cpu.as_nanos()).unwrap_or(u64::MAX);
+    for candidate in &candidates {
+        let fate = candidate_fates
+            .get_mut(candidate.fate_index)
+            .ok_or(SessionError::CorruptBundle)?;
+        fate.verification_batch_cpu_ns = verification_batch_cpu_ns;
+        fate.verification_batch_size = verification_batch_size;
     }
     let revision = domain.kernel().revision();
     let mut accepted = Vec::new();
@@ -3056,7 +3354,8 @@ fn verify_candidates<D: DomainDefinition>(
             candidate.epoch,
             candidate.candidate.proposal_features,
         );
-        let experience_verdict = match verdict {
+        let fate_index = candidate.fate_index;
+        let (experience_verdict, fate_disposition) = match verdict {
             Verdict::Accepted { evidence } => {
                 accepted.push((
                     StoredArtifact {
@@ -3073,11 +3372,31 @@ fn verify_candidates<D: DomainDefinition>(
                     origin,
                     attempt_id,
                 ));
-                ExperienceVerdict::Accepted
+                (
+                    ExperienceVerdict::Accepted,
+                    CandidateFateDisposition::VerifiedAccepted,
+                )
             }
-            Verdict::Refuted => ExperienceVerdict::Refuted,
-            Verdict::Unknown => ExperienceVerdict::Unknown,
+            Verdict::Refuted => (
+                ExperienceVerdict::Refuted,
+                CandidateFateDisposition::VerifiedRefuted,
+            ),
+            Verdict::Unknown => (
+                ExperienceVerdict::Unknown,
+                CandidateFateDisposition::VerifiedUnknown,
+            ),
         };
+        let fate = candidate_fates
+            .get_mut(fate_index)
+            .ok_or(SessionError::CorruptBundle)?;
+        if fate.candidate_key != candidate_key
+            || fate.claim_digest != claim_digest
+            || fate.parent_key != parent_key
+            || fate.allocation_queue != Some(candidate.allocation_queue)
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        fate.disposition = fate_disposition;
         experience.push(ExperienceEntry {
             attempt_id,
             candidate_key,
@@ -3086,6 +3405,7 @@ fn verify_candidates<D: DomainDefinition>(
             parent_key,
             canonical_candidate,
             verdict: experience_verdict,
+            allocation_queue: candidate.allocation_queue,
             operator_symbol: candidate.operator_symbol,
             proposal_features: candidate.candidate.proposal_features,
             features: candidate.features,

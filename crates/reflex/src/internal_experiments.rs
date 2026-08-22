@@ -13,8 +13,55 @@ use crate::{DomainDefinition, ImprovementRequest, SessionError};
 #[derive(Clone, Debug)]
 pub struct ExperienceInspection {
     pub attempts: Vec<ExperienceAttemptInspection>,
+    pub candidate_fates: Vec<CandidateFateInspection>,
     pub consequence_count: usize,
     pub measurements: Vec<ExperienceMeasurementInspection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateFateInspection {
+    pub candidate_key: [u8; 32],
+    pub claim_digest: [u8; 32],
+    pub parent_key: [u8; 32],
+    pub operator_digest: [u8; 32],
+    pub epoch: u64,
+    pub generation_rank: u32,
+    pub proposal_limit: u32,
+    pub policy_rank: Option<u32>,
+    pub verification_batch_cpu_ns: Option<u64>,
+    pub verification_batch_size: Option<u32>,
+    pub outcome: CandidateFateOutcomeInspection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateFateOutcomeInspection {
+    NoveltyFiltered {
+        reason: CandidateNoveltyFilterReasonInspection,
+    },
+    PolicyDeferred {
+        bootstrap_rank: Option<u32>,
+        learned_rank: Option<u32>,
+    },
+    VerificationInterrupted {
+        allocation_queue: CandidateAllocationQueueInspection,
+        bootstrap_rank: Option<u32>,
+        learned_rank: Option<u32>,
+    },
+    Verified {
+        verdict: ExperienceVerdictInspection,
+        allocation_queue: CandidateAllocationQueueInspection,
+        bootstrap_rank: Option<u32>,
+        learned_rank: Option<u32>,
+        admitted: bool,
+        strict_improvement: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateNoveltyFilterReasonInspection {
+    KnownArtifact,
+    DuplicateCandidate,
+    PriorNegativeExperience,
 }
 
 #[derive(Clone, Debug)]
@@ -23,8 +70,17 @@ pub struct ExperienceAttemptInspection {
     pub canonical_candidate: Vec<u8>,
     pub operator_symbol: Vec<u8>,
     pub verdict: ExperienceVerdictInspection,
+    pub allocation_queue: CandidateAllocationQueueInspection,
     pub verification_requests: u32,
     pub epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateAllocationQueueInspection {
+    ProtectedOrigin,
+    ProtectedDerived,
+    Learned,
+    Bootstrap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
