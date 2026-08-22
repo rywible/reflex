@@ -703,7 +703,7 @@ pub struct VerifiedArtifact<D: DomainDefinition> {
 }
 ```
 
-The private record binds the domain Artifact to its Seed, Correctness Claim, assumptions, Verification Kernel revision, evidence, provenance, and Measurements. `Arc` exists at retained-result granularity, not per Candidate or graph edge.
+The private record binds the domain Artifact to its Seed, Correctness Claim, assumptions, Verification Kernel revision, evidence, provenance, and Measurements. For Runtime-owned records, `Arc` exists at retained-result granularity, not per Candidate or Discovery Graph edge. A Domain's specialized immutable Artifact representation may share internal structure when its Semantic Identity and canonical encoding remain content-based; ADR 0053 applies that exception to Lean expression subtrees.
 
 ### Resource accounting
 

@@ -676,8 +676,8 @@ fn compose_expression(
         }
         (LeanConstructor::Application, NodeAuxiliary::Application, [function, argument]) => {
             Ok(LeanExpr::App {
-                function: Box::new(function.clone()),
-                argument: Box::new(argument.clone()),
+                function: Arc::new(function.clone()),
+                argument: Arc::new(argument.clone()),
             })
         }
         (
@@ -686,8 +686,8 @@ fn compose_expression(
             [binder_type, body],
         ) => Ok(LeanExpr::Lam {
             name: name.clone(),
-            binder_type: Box::new(binder_type.clone()),
-            body: Box::new(body.clone()),
+            binder_type: Arc::new(binder_type.clone()),
+            body: Arc::new(body.clone()),
             binder_info: *binder_info,
         }),
         (
@@ -696,16 +696,16 @@ fn compose_expression(
             [binder_type, body],
         ) => Ok(LeanExpr::ForallE {
             name: name.clone(),
-            binder_type: Box::new(binder_type.clone()),
-            body: Box::new(body.clone()),
+            binder_type: Arc::new(binder_type.clone()),
+            body: Arc::new(body.clone()),
             binder_info: *binder_info,
         }),
         (LeanConstructor::Let, NodeAuxiliary::Let { name, non_dep }, [r#type, value, body]) => {
             Ok(LeanExpr::LetE {
                 name: name.clone(),
-                r#type: Box::new(r#type.clone()),
-                value: Box::new(value.clone()),
-                body: Box::new(body.clone()),
+                r#type: Arc::new(r#type.clone()),
+                value: Arc::new(value.clone()),
+                body: Arc::new(body.clone()),
                 non_dep: *non_dep,
             })
         }
@@ -719,7 +719,7 @@ fn compose_expression(
         ) => Ok(LeanExpr::Proj {
             type_name: type_name.clone(),
             index: *index,
-            subject: Box::new(subject.clone()),
+            subject: Arc::new(subject.clone()),
         }),
         _ => Err(invalid()),
     }
@@ -899,8 +899,8 @@ impl LeanOperators {
                 candidate: candidate_with_proof(
                     source,
                     LeanExpr::App {
-                        function: Box::new(function),
-                        argument: Box::new(argument),
+                        function: Arc::new(function),
+                        argument: Arc::new(argument),
                     },
                 ),
             });
@@ -950,9 +950,9 @@ impl LeanOperators {
             };
             let proof_term = LeanExpr::LetE {
                 name: LeanName::from_dotted("_reflex_shared"),
-                r#type: Box::new(shared.proposition.clone()),
-                value: Box::new(shared.proof_term.clone()),
-                body: Box::new(body),
+                r#type: Arc::new(shared.proposition.clone()),
+                value: Arc::new(shared.proof_term.clone()),
+                body: Arc::new(body),
                 non_dep: false,
             };
             output.push(LeanApplication {
@@ -1483,8 +1483,8 @@ fn generalized_application(
     let mut result = proof_term.clone();
     for argument in bindings.into_iter().rev() {
         result = LeanExpr::App {
-            function: Box::new(result),
-            argument: Box::new(argument?),
+            function: Arc::new(result),
+            argument: Arc::new(argument?),
         };
     }
     Some(result)
@@ -1832,12 +1832,36 @@ pub fn pinned_environment_identity() -> LeanEnvironmentIdentity {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use reflex::{StructuralProtocol, StructuralView};
 
     use super::{
         LeanArtifact, LeanConstructor, LeanExpr, LeanStructure, pinned_environment_identity,
     };
     use crate::ast::{LeanBinderInfo, LeanDeclarationIdentity, LeanName};
+
+    #[test]
+    fn cloned_proof_terms_share_immutable_subtrees() {
+        let proof = LeanExpr::App {
+            function: Arc::new(LeanExpr::Bvar { index: 0 }),
+            argument: Arc::new(LeanExpr::Bvar { index: 1 }),
+        };
+        let cloned = proof.clone();
+        let (
+            LeanExpr::App {
+                function: original, ..
+            },
+            LeanExpr::App {
+                function: copied, ..
+            },
+        ) = (&proof, &cloned)
+        else {
+            panic!("the proof shape changed during cloning");
+        };
+
+        assert!(Arc::ptr_eq(original, copied));
+    }
 
     fn artifact() -> LeanArtifact {
         let nat = LeanExpr::constant(LeanName::from_dotted("Nat"), vec![]);
@@ -1849,14 +1873,14 @@ mod tests {
             },
             proposition: LeanExpr::ForallE {
                 name: LeanName::from_dotted("n"),
-                binder_type: Box::new(nat.clone()),
-                body: Box::new(nat.clone()),
+                binder_type: Arc::new(nat.clone()),
+                body: Arc::new(nat.clone()),
                 binder_info: LeanBinderInfo::Default,
             },
             proof_term: LeanExpr::Lam {
                 name: LeanName::from_dotted("n"),
-                binder_type: Box::new(nat),
-                body: Box::new(LeanExpr::Bvar { index: 0 }),
+                binder_type: Arc::new(nat),
+                body: Arc::new(LeanExpr::Bvar { index: 0 }),
                 binder_info: LeanBinderInfo::Default,
             },
             dependencies: vec![LeanName::from_dotted("Nat")],
@@ -1936,23 +1960,23 @@ mod tests {
         let nat = LeanExpr::constant(LeanName::from_dotted("Nat"), vec![]);
         let zero = LeanExpr::constant(LeanName::from_dotted("Nat.zero"), vec![]);
         let beta = LeanExpr::App {
-            function: Box::new(LeanExpr::Lam {
+            function: Arc::new(LeanExpr::Lam {
                 name: LeanName::from_dotted("x"),
-                binder_type: Box::new(nat.clone()),
-                body: Box::new(LeanExpr::Bvar { index: 0 }),
+                binder_type: Arc::new(nat.clone()),
+                body: Arc::new(LeanExpr::Bvar { index: 0 }),
                 binder_info: LeanBinderInfo::Default,
             }),
-            argument: Box::new(zero.clone()),
+            argument: Arc::new(zero.clone()),
         };
         assert_eq!(beta.beta_or_zeta_contract(), Some(zero));
 
         let function = LeanExpr::constant(LeanName::from_dotted("f"), vec![]);
         let eta = LeanExpr::Lam {
             name: LeanName::from_dotted("x"),
-            binder_type: Box::new(nat),
-            body: Box::new(LeanExpr::App {
-                function: Box::new(function.clone()),
-                argument: Box::new(LeanExpr::Bvar { index: 0 }),
+            binder_type: Arc::new(nat),
+            body: Arc::new(LeanExpr::App {
+                function: Arc::new(function.clone()),
+                argument: Arc::new(LeanExpr::Bvar { index: 0 }),
             }),
             binder_info: LeanBinderInfo::Default,
         };
@@ -1962,19 +1986,19 @@ mod tests {
     #[test]
     fn factoring_round_trips_through_kernel_zeta_semantics() {
         let shared = LeanExpr::App {
-            function: Box::new(LeanExpr::constant(LeanName::from_dotted("f"), vec![])),
-            argument: Box::new(LeanExpr::constant(LeanName::from_dotted("x"), vec![])),
+            function: Arc::new(LeanExpr::constant(LeanName::from_dotted("f"), vec![])),
+            argument: Arc::new(LeanExpr::constant(LeanName::from_dotted("x"), vec![])),
         };
         let original = LeanExpr::App {
-            function: Box::new(shared.clone()),
-            argument: Box::new(shared.clone()),
+            function: Arc::new(shared.clone()),
+            argument: Arc::new(shared.clone()),
         };
         let body = original.factor_closed(&shared).unwrap();
         let factored = LeanExpr::LetE {
             name: LeanName::from_dotted("shared"),
-            r#type: Box::new(LeanExpr::constant(LeanName::from_dotted("T"), vec![])),
-            value: Box::new(shared),
-            body: Box::new(body),
+            r#type: Arc::new(LeanExpr::constant(LeanName::from_dotted("T"), vec![])),
+            value: Arc::new(shared),
+            body: Arc::new(body),
             non_dep: false,
         };
         assert_eq!(factored.beta_or_zeta_contract(), Some(original));
@@ -1985,8 +2009,8 @@ mod tests {
         let binder = LeanExpr::constant(LeanName::from_dotted("T"), vec![]);
         let proposition = LeanExpr::ForallE {
             name: LeanName::from_dotted("x"),
-            binder_type: Box::new(binder),
-            body: Box::new(LeanExpr::Bvar { index: 0 }),
+            binder_type: Arc::new(binder),
+            body: Arc::new(LeanExpr::Bvar { index: 0 }),
             binder_info: LeanBinderInfo::Default,
         };
         let proof = LeanExpr::constant(LeanName::from_dotted("general"), vec![]);
@@ -1994,8 +2018,8 @@ mod tests {
         assert_eq!(
             super::generalized_application(&proposition, &proof, &target),
             Some(LeanExpr::App {
-                function: Box::new(proof),
-                argument: Box::new(target),
+                function: Arc::new(proof),
+                argument: Arc::new(target),
             })
         );
     }

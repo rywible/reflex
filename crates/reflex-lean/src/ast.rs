@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -96,26 +97,26 @@ pub enum LeanExpr {
         levels: Vec<LeanLevel>,
     },
     App {
-        function: Box<Self>,
-        argument: Box<Self>,
+        function: Arc<Self>,
+        argument: Arc<Self>,
     },
     Lam {
         name: LeanName,
-        binder_type: Box<Self>,
-        body: Box<Self>,
+        binder_type: Arc<Self>,
+        body: Arc<Self>,
         binder_info: LeanBinderInfo,
     },
     ForallE {
         name: LeanName,
-        binder_type: Box<Self>,
-        body: Box<Self>,
+        binder_type: Arc<Self>,
+        body: Arc<Self>,
         binder_info: LeanBinderInfo,
     },
     LetE {
         name: LeanName,
-        r#type: Box<Self>,
-        value: Box<Self>,
-        body: Box<Self>,
+        r#type: Arc<Self>,
+        value: Arc<Self>,
+        body: Arc<Self>,
         non_dep: bool,
     },
     Lit {
@@ -124,7 +125,7 @@ pub enum LeanExpr {
     Proj {
         type_name: LeanName,
         index: usize,
-        subject: Box<Self>,
+        subject: Arc<Self>,
     },
 }
 
@@ -249,8 +250,8 @@ impl LeanExpr {
             }
             let rebuilt = match expression {
                 LeanExpr::App { function, argument } => LeanExpr::App {
-                    function: Box::new(rewrite(function, target, current, replacement)?),
-                    argument: Box::new(rewrite(argument, target, current, replacement)?),
+                    function: Arc::new(rewrite(function, target, current, replacement)?),
+                    argument: Arc::new(rewrite(argument, target, current, replacement)?),
                 },
                 LeanExpr::Lam {
                     name,
@@ -259,8 +260,8 @@ impl LeanExpr {
                     binder_info,
                 } => LeanExpr::Lam {
                     name: name.clone(),
-                    binder_type: Box::new(rewrite(binder_type, target, current, replacement)?),
-                    body: Box::new(rewrite(body, target, current, replacement)?),
+                    binder_type: Arc::new(rewrite(binder_type, target, current, replacement)?),
+                    body: Arc::new(rewrite(body, target, current, replacement)?),
                     binder_info: *binder_info,
                 },
                 LeanExpr::ForallE {
@@ -270,8 +271,8 @@ impl LeanExpr {
                     binder_info,
                 } => LeanExpr::ForallE {
                     name: name.clone(),
-                    binder_type: Box::new(rewrite(binder_type, target, current, replacement)?),
-                    body: Box::new(rewrite(body, target, current, replacement)?),
+                    binder_type: Arc::new(rewrite(binder_type, target, current, replacement)?),
+                    body: Arc::new(rewrite(body, target, current, replacement)?),
                     binder_info: *binder_info,
                 },
                 LeanExpr::LetE {
@@ -282,9 +283,9 @@ impl LeanExpr {
                     non_dep,
                 } => LeanExpr::LetE {
                     name: name.clone(),
-                    r#type: Box::new(rewrite(r#type, target, current, replacement)?),
-                    value: Box::new(rewrite(value, target, current, replacement)?),
-                    body: Box::new(rewrite(body, target, current, replacement)?),
+                    r#type: Arc::new(rewrite(r#type, target, current, replacement)?),
+                    value: Arc::new(rewrite(value, target, current, replacement)?),
+                    body: Arc::new(rewrite(body, target, current, replacement)?),
                     non_dep: *non_dep,
                 },
                 LeanExpr::Proj {
@@ -294,7 +295,7 @@ impl LeanExpr {
                 } => LeanExpr::Proj {
                     type_name: type_name.clone(),
                     index: *index,
-                    subject: Box::new(rewrite(subject, target, current, replacement)?),
+                    subject: Arc::new(rewrite(subject, target, current, replacement)?),
                 },
                 leaf => leaf.clone(),
             };
@@ -354,8 +355,8 @@ impl LeanExpr {
             }
             match expression {
                 LeanExpr::App { function, argument } => LeanExpr::App {
-                    function: Box::new(replace(function, needle, depth)),
-                    argument: Box::new(replace(argument, needle, depth)),
+                    function: Arc::new(replace(function, needle, depth)),
+                    argument: Arc::new(replace(argument, needle, depth)),
                 },
                 LeanExpr::Lam {
                     name,
@@ -364,8 +365,8 @@ impl LeanExpr {
                     binder_info,
                 } => LeanExpr::Lam {
                     name: name.clone(),
-                    binder_type: Box::new(replace(binder_type, needle, depth)),
-                    body: Box::new(replace(body, needle, depth.saturating_add(1))),
+                    binder_type: Arc::new(replace(binder_type, needle, depth)),
+                    body: Arc::new(replace(body, needle, depth.saturating_add(1))),
                     binder_info: *binder_info,
                 },
                 LeanExpr::ForallE {
@@ -375,8 +376,8 @@ impl LeanExpr {
                     binder_info,
                 } => LeanExpr::ForallE {
                     name: name.clone(),
-                    binder_type: Box::new(replace(binder_type, needle, depth)),
-                    body: Box::new(replace(body, needle, depth.saturating_add(1))),
+                    binder_type: Arc::new(replace(binder_type, needle, depth)),
+                    body: Arc::new(replace(body, needle, depth.saturating_add(1))),
                     binder_info: *binder_info,
                 },
                 LeanExpr::LetE {
@@ -387,9 +388,9 @@ impl LeanExpr {
                     non_dep,
                 } => LeanExpr::LetE {
                     name: name.clone(),
-                    r#type: Box::new(replace(r#type, needle, depth)),
-                    value: Box::new(replace(value, needle, depth)),
-                    body: Box::new(replace(body, needle, depth.saturating_add(1))),
+                    r#type: Arc::new(replace(r#type, needle, depth)),
+                    value: Arc::new(replace(value, needle, depth)),
+                    body: Arc::new(replace(body, needle, depth.saturating_add(1))),
                     non_dep: *non_dep,
                 },
                 LeanExpr::Proj {
@@ -399,7 +400,7 @@ impl LeanExpr {
                 } => LeanExpr::Proj {
                     type_name: type_name.clone(),
                     index: *index,
-                    subject: Box::new(replace(subject, needle, depth)),
+                    subject: Arc::new(replace(subject, needle, depth)),
                 },
                 leaf => leaf.clone(),
             }
@@ -484,8 +485,8 @@ fn shift(expression: &LeanExpr, amount: isize, cutoff: usize) -> Option<LeanExpr
             index: shifted_index(*index)?,
         },
         LeanExpr::App { function, argument } => LeanExpr::App {
-            function: Box::new(shift(function, amount, cutoff)?),
-            argument: Box::new(shift(argument, amount, cutoff)?),
+            function: Arc::new(shift(function, amount, cutoff)?),
+            argument: Arc::new(shift(argument, amount, cutoff)?),
         },
         LeanExpr::Lam {
             name,
@@ -494,8 +495,8 @@ fn shift(expression: &LeanExpr, amount: isize, cutoff: usize) -> Option<LeanExpr
             binder_info,
         } => LeanExpr::Lam {
             name: name.clone(),
-            binder_type: Box::new(shift(binder_type, amount, cutoff)?),
-            body: Box::new(shift(body, amount, cutoff.saturating_add(1))?),
+            binder_type: Arc::new(shift(binder_type, amount, cutoff)?),
+            body: Arc::new(shift(body, amount, cutoff.saturating_add(1))?),
             binder_info: *binder_info,
         },
         LeanExpr::ForallE {
@@ -505,8 +506,8 @@ fn shift(expression: &LeanExpr, amount: isize, cutoff: usize) -> Option<LeanExpr
             binder_info,
         } => LeanExpr::ForallE {
             name: name.clone(),
-            binder_type: Box::new(shift(binder_type, amount, cutoff)?),
-            body: Box::new(shift(body, amount, cutoff.saturating_add(1))?),
+            binder_type: Arc::new(shift(binder_type, amount, cutoff)?),
+            body: Arc::new(shift(body, amount, cutoff.saturating_add(1))?),
             binder_info: *binder_info,
         },
         LeanExpr::LetE {
@@ -517,9 +518,9 @@ fn shift(expression: &LeanExpr, amount: isize, cutoff: usize) -> Option<LeanExpr
             non_dep,
         } => LeanExpr::LetE {
             name: name.clone(),
-            r#type: Box::new(shift(r#type, amount, cutoff)?),
-            value: Box::new(shift(value, amount, cutoff)?),
-            body: Box::new(shift(body, amount, cutoff.saturating_add(1))?),
+            r#type: Arc::new(shift(r#type, amount, cutoff)?),
+            value: Arc::new(shift(value, amount, cutoff)?),
+            body: Arc::new(shift(body, amount, cutoff.saturating_add(1))?),
             non_dep: *non_dep,
         },
         LeanExpr::Proj {
@@ -529,7 +530,7 @@ fn shift(expression: &LeanExpr, amount: isize, cutoff: usize) -> Option<LeanExpr
         } => LeanExpr::Proj {
             type_name: type_name.clone(),
             index: *index,
-            subject: Box::new(shift(subject, amount, cutoff)?),
+            subject: Arc::new(shift(subject, amount, cutoff)?),
         },
         leaf => leaf.clone(),
     })
@@ -546,8 +547,8 @@ fn instantiate(body: &LeanExpr, argument: &LeanExpr) -> Option<LeanExpr> {
                 function,
                 argument: right,
             } => LeanExpr::App {
-                function: Box::new(visit(function, argument, depth)?),
-                argument: Box::new(visit(right, argument, depth)?),
+                function: Arc::new(visit(function, argument, depth)?),
+                argument: Arc::new(visit(right, argument, depth)?),
             },
             LeanExpr::Lam {
                 name,
@@ -556,8 +557,8 @@ fn instantiate(body: &LeanExpr, argument: &LeanExpr) -> Option<LeanExpr> {
                 binder_info,
             } => LeanExpr::Lam {
                 name: name.clone(),
-                binder_type: Box::new(visit(binder_type, argument, depth)?),
-                body: Box::new(visit(body, argument, depth.saturating_add(1))?),
+                binder_type: Arc::new(visit(binder_type, argument, depth)?),
+                body: Arc::new(visit(body, argument, depth.saturating_add(1))?),
                 binder_info: *binder_info,
             },
             LeanExpr::ForallE {
@@ -567,8 +568,8 @@ fn instantiate(body: &LeanExpr, argument: &LeanExpr) -> Option<LeanExpr> {
                 binder_info,
             } => LeanExpr::ForallE {
                 name: name.clone(),
-                binder_type: Box::new(visit(binder_type, argument, depth)?),
-                body: Box::new(visit(body, argument, depth.saturating_add(1))?),
+                binder_type: Arc::new(visit(binder_type, argument, depth)?),
+                body: Arc::new(visit(body, argument, depth.saturating_add(1))?),
                 binder_info: *binder_info,
             },
             LeanExpr::LetE {
@@ -579,9 +580,9 @@ fn instantiate(body: &LeanExpr, argument: &LeanExpr) -> Option<LeanExpr> {
                 non_dep,
             } => LeanExpr::LetE {
                 name: name.clone(),
-                r#type: Box::new(visit(r#type, argument, depth)?),
-                value: Box::new(visit(value, argument, depth)?),
-                body: Box::new(visit(body, argument, depth.saturating_add(1))?),
+                r#type: Arc::new(visit(r#type, argument, depth)?),
+                value: Arc::new(visit(value, argument, depth)?),
+                body: Arc::new(visit(body, argument, depth.saturating_add(1))?),
                 non_dep: *non_dep,
             },
             LeanExpr::Proj {
@@ -591,7 +592,7 @@ fn instantiate(body: &LeanExpr, argument: &LeanExpr) -> Option<LeanExpr> {
             } => LeanExpr::Proj {
                 type_name: type_name.clone(),
                 index: *index,
-                subject: Box::new(visit(subject, argument, depth)?),
+                subject: Arc::new(visit(subject, argument, depth)?),
             },
             leaf => leaf.clone(),
         })
