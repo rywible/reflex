@@ -16,6 +16,8 @@ The training session receives four separate proof Optimization Goals: proof node
 
 The harness freezes the complete ordered stream of held-out Pareto additions and the final held-out Pareto Artifacts produced by each treatment. It does not manufacture per-head rankings. Training, restore, search, Verification, Admission, learning, and Knowledge Consolidation usage come from `SessionOutcome::usage` plus the resource-accounted Lean worker reports.
 
+Every resource-intensive development and confirmatory child runs inside an authenticated host-safety envelope outside its equal public Resource Envelope. The registered Linux execution reserves at least one logical CPU and 16 GiB of host memory from the complete child process tree and memory-backed work files. The child must observe and record the kernel-enforced memory boundary and CPU affinity before loading either catalog; absent isolation is a refusal, and reaching the outer boundary is a retained failure rather than permission to consume the reserve.
+
 ## Pre-cutoff causal gate
 
 Before any 2026 checkout, Full must beat Bootstrap and both one-factor ablations on verified held-out Pareto progress under the preregistered multiobjective comparison, with zero correctness, protected-Measurement, recovery, or Resource Envelope regression. Cold replay must reproduce every retained Artifact and Verification Record. A failure here is a retained Null Result and forbids audit exposure; Wrela still follows as the registered third domain.

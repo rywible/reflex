@@ -210,6 +210,10 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean_optimizer_audit::development(&arguments)
         }
+        Some("lean-public-optimizer-development-child") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            lean_optimizer_audit::development_child(&arguments)
+        }
         Some("lean-temporal-audit-freeze") => {
             let arguments = arguments.collect::<Vec<_>>();
             lean_audit::freeze(&arguments)

@@ -9,6 +9,13 @@ use reflex::Completion;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+const ISOLATION_MEMORY_LIMIT: &str = "REFLEX_HOST_ISOLATION_MEMORY_LIMIT";
+const ISOLATION_MEMORY_RESERVE: &str = "REFLEX_HOST_ISOLATION_MEMORY_RESERVE";
+const ISOLATION_TOTAL_MEMORY: &str = "REFLEX_HOST_ISOLATION_TOTAL_MEMORY";
+const ISOLATION_AVAILABLE_MEMORY: &str = "REFLEX_HOST_ISOLATION_AVAILABLE_MEMORY";
+const ISOLATION_ALLOWED_CPUS: &str = "REFLEX_HOST_ISOLATION_ALLOWED_CPUS";
+const ISOLATION_RESERVED_CPUS: &str = "REFLEX_HOST_ISOLATION_RESERVED_CPUS";
+
 pub(super) type AnyError = Box<dyn std::error::Error>;
 
 #[derive(Debug, Serialize)]
@@ -34,6 +41,23 @@ pub(super) struct ChildCapture {
     pub(super) resident_limit_exceeded: bool,
     pub(super) process_tree_cpu_ns: u64,
     pub(super) peak_process_tree_resident_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct HostIsolation {
+    pub(super) total_memory_bytes: u64,
+    pub(super) available_memory_bytes: u64,
+    pub(super) memory_limit_bytes: u64,
+    pub(super) memory_reserve_bytes: u64,
+    pub(super) allowed_cpu_list: String,
+    pub(super) reserved_cpus: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostIsolationPolicy {
+    pub(super) memory_limit_bytes: u64,
+    pub(super) memory_reserve_bytes: u64,
+    pub(super) cpu_reserve: usize,
 }
 
 pub(super) fn require_release(protocol: &str) -> Result<(), AnyError> {
@@ -150,6 +174,233 @@ pub(super) fn capture_child_bounded(
         Some(resident_bytes),
         environment,
     )
+}
+
+pub(super) fn capture_child_host_isolated(
+    executable: &Path,
+    arguments: &[OsString],
+    evidence_prefix: &Path,
+    timeout: Duration,
+    policy: HostIsolationPolicy,
+    environment: &[(OsString, OsString)],
+) -> Result<(ChildCapture, HostIsolation), AnyError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            executable,
+            arguments,
+            evidence_prefix,
+            timeout,
+            policy,
+            environment,
+        );
+        return Err(
+            "host-isolated experimental children currently require Linux systemd and taskset"
+                .into(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let isolation = detect_host_isolation(policy)?;
+        let child_arguments = [
+            OsString::from("--user"),
+            OsString::from("--scope"),
+            OsString::from("--quiet"),
+            OsString::from("-p"),
+            OsString::from(format!("MemoryMax={}", isolation.memory_limit_bytes)),
+            OsString::from("-p"),
+            OsString::from("MemorySwapMax=0"),
+            OsString::from("-p"),
+            OsString::from("OOMPolicy=kill"),
+            OsString::from("--"),
+            OsString::from("taskset"),
+            OsString::from("--cpu-list"),
+            OsString::from(&isolation.allowed_cpu_list),
+            executable.as_os_str().to_owned(),
+        ]
+        .into_iter()
+        .chain(arguments.iter().cloned())
+        .collect::<Vec<_>>();
+        let mut isolated_environment = environment.to_vec();
+        isolated_environment.extend([
+            isolation_environment(ISOLATION_MEMORY_LIMIT, isolation.memory_limit_bytes),
+            isolation_environment(ISOLATION_MEMORY_RESERVE, isolation.memory_reserve_bytes),
+            isolation_environment(ISOLATION_TOTAL_MEMORY, isolation.total_memory_bytes),
+            isolation_environment(ISOLATION_AVAILABLE_MEMORY, isolation.available_memory_bytes),
+            (
+                OsString::from(ISOLATION_ALLOWED_CPUS),
+                OsString::from(&isolation.allowed_cpu_list),
+            ),
+            (
+                OsString::from(ISOLATION_RESERVED_CPUS),
+                OsString::from(
+                    isolation
+                        .reserved_cpus
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ),
+        ]);
+        let capture = capture_child_bounded(
+            Path::new("systemd-run"),
+            &child_arguments,
+            evidence_prefix,
+            timeout,
+            isolation.memory_limit_bytes,
+            &isolated_environment,
+        )?;
+        Ok((capture, isolation))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn isolation_environment(name: &str, value: u64) -> (OsString, OsString) {
+    (OsString::from(name), OsString::from(value.to_string()))
+}
+
+pub(super) fn inherited_host_isolation() -> Result<HostIsolation, AnyError> {
+    #[cfg(not(target_os = "linux"))]
+    return Err("host-isolated experimental children currently require Linux".into());
+    #[cfg(target_os = "linux")]
+    {
+        let number = |name: &str| -> Result<u64, AnyError> {
+            Ok(std::env::var(name)
+                .map_err(|_| format!("host isolation evidence omits {name}"))?
+                .parse()?)
+        };
+        let allowed_cpu_list = std::env::var(ISOLATION_ALLOWED_CPUS)?;
+        let allowed_cpus = parse_cpu_list(&allowed_cpu_list)
+            .ok_or("host isolation evidence has an invalid allowed CPU list")?;
+        let reserved_cpu_list = std::env::var(ISOLATION_RESERVED_CPUS)?;
+        let reserved_cpus = parse_cpu_list(&reserved_cpu_list)
+            .ok_or("host isolation evidence has an invalid reserved CPU list")?;
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let actual_cpu_list = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .and_then(parse_cpu_list)
+            .ok_or("Linux process metadata omits the allowed CPU list")?;
+        if actual_cpu_list != allowed_cpus {
+            return Err("taskset did not establish the registered host CPU reserve".into());
+        }
+        let memory_limit_bytes = number(ISOLATION_MEMORY_LIMIT)?;
+        if current_cgroup_memory_limit()? != memory_limit_bytes {
+            return Err("systemd did not establish the registered host memory boundary".into());
+        }
+        Ok(HostIsolation {
+            total_memory_bytes: number(ISOLATION_TOTAL_MEMORY)?,
+            available_memory_bytes: number(ISOLATION_AVAILABLE_MEMORY)?,
+            memory_limit_bytes,
+            memory_reserve_bytes: number(ISOLATION_MEMORY_RESERVE)?,
+            allowed_cpu_list,
+            reserved_cpus,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_cgroup_memory_limit() -> Result<u64, AnyError> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
+    let path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or("Linux process metadata omits the unified cgroup")?;
+    let limit = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max"))?;
+    Ok(limit.trim().parse()?)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_isolation(policy: HostIsolationPolicy) -> Result<HostIsolation, AnyError> {
+    let memory = std::fs::read_to_string("/proc/meminfo")?;
+    let (total_memory_bytes, available_memory_bytes) =
+        parse_memory_info(&memory).ok_or("Linux memory information omits host totals")?;
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let cpu_list = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .and_then(parse_cpu_list)
+        .ok_or("Linux process metadata omits the allowed CPU list")?;
+    plan_host_isolation(
+        total_memory_bytes,
+        available_memory_bytes,
+        &cpu_list,
+        policy.memory_limit_bytes,
+        policy.memory_reserve_bytes,
+        policy.cpu_reserve,
+    )
+}
+
+fn plan_host_isolation(
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    cpus: &[usize],
+    memory_limit_bytes: u64,
+    memory_reserve_bytes: u64,
+    cpu_reserve: usize,
+) -> Result<HostIsolation, AnyError> {
+    if memory_limit_bytes == 0 || memory_reserve_bytes == 0 {
+        return Err("host memory limit and reserve must both be nonzero".into());
+    }
+    let required_memory = memory_limit_bytes
+        .checked_add(memory_reserve_bytes)
+        .ok_or("host memory policy overflowed")?;
+    if total_memory_bytes < required_memory || available_memory_bytes < required_memory {
+        return Err(format!(
+            "host memory reserve cannot be guaranteed: experiment requires {memory_limit_bytes} bytes while preserving {memory_reserve_bytes} bytes, but the host reports {available_memory_bytes} available of {total_memory_bytes} total"
+        )
+        .into());
+    }
+    if cpu_reserve == 0 || cpus.len() <= cpu_reserve {
+        return Err("host CPU reserve must leave at least one experiment CPU".into());
+    }
+    let experiment_cpu_count = cpus.len() - cpu_reserve;
+    let (allowed_cpus, reserved_cpus) = cpus.split_at(experiment_cpu_count);
+    Ok(HostIsolation {
+        total_memory_bytes,
+        available_memory_bytes,
+        memory_limit_bytes,
+        memory_reserve_bytes,
+        allowed_cpu_list: allowed_cpus
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        reserved_cpus: reserved_cpus.to_vec(),
+    })
+}
+
+fn parse_memory_info(contents: &str) -> Option<(u64, u64)> {
+    let kibibytes = |key: &str| {
+        contents.lines().find_map(|line| {
+            let value = line.strip_prefix(key)?.trim();
+            let value = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+            Some(value.saturating_mul(1024))
+        })
+    };
+    Some((kibibytes("MemTotal:")?, kibibytes("MemAvailable:")?))
+}
+
+fn parse_cpu_list(value: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in value.trim().split(',') {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.parse::<usize>().ok()?;
+            let end = end.parse::<usize>().ok()?;
+            if start > end {
+                return None;
+            }
+            cpus.extend(start..=end);
+        } else {
+            cpus.push(part.parse::<usize>().ok()?);
+        }
+    }
+    if cpus.is_empty() || cpus.windows(2).any(|pair| pair[0] >= pair[1]) {
+        None
+    } else {
+        Some(cpus)
+    }
 }
 
 fn capture_child_with_limits(
@@ -396,8 +647,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        capture_child_bounded, parse_completed_child_cpu_ticks, parse_peak_resident_bytes,
-        parse_resident_bytes, ticks_to_nanoseconds,
+        HostIsolationPolicy, capture_child_bounded, capture_child_host_isolated,
+        inherited_host_isolation, parse_completed_child_cpu_ticks, parse_cpu_list,
+        parse_memory_info, parse_peak_resident_bytes, parse_resident_bytes, plan_host_isolation,
+        ticks_to_nanoseconds,
     };
 
     #[test]
@@ -418,6 +671,97 @@ mod tests {
     fn clock_ticks_convert_without_floating_point() {
         assert_eq!(ticks_to_nanoseconds(25, 100), 250_000_000);
         assert_eq!(ticks_to_nanoseconds(u64::MAX, 0), u64::MAX);
+    }
+
+    #[test]
+    fn host_isolation_reserves_memory_and_a_logical_cpu() {
+        let gib = 1024_u64.pow(3);
+        let isolation = plan_host_isolation(
+            64 * gib,
+            62 * gib,
+            &(0..8).collect::<Vec<_>>(),
+            40 * gib,
+            16 * gib,
+            1,
+        )
+        .expect("the host can satisfy the isolation policy");
+
+        assert_eq!(isolation.memory_limit_bytes, 40 * gib);
+        assert_eq!(isolation.allowed_cpu_list, "0,1,2,3,4,5,6");
+        assert_eq!(isolation.reserved_cpus, vec![7]);
+    }
+
+    #[test]
+    fn host_isolation_refuses_to_spend_the_reserve() {
+        let gib = 1024_u64.pow(3);
+        let error = plan_host_isolation(
+            64 * gib,
+            48 * gib,
+            &(0..8).collect::<Vec<_>>(),
+            40 * gib,
+            16 * gib,
+            1,
+        )
+        .expect_err("available memory equal to work plus reserve is required");
+
+        assert!(error.to_string().contains("host memory reserve"));
+    }
+
+    #[test]
+    fn linux_host_inputs_are_parsed_without_guessing_cpu_ids() {
+        assert_eq!(
+            parse_memory_info("MemTotal: 65536 kB\nMemAvailable: 49152 kB\n"),
+            Some((64 * 1024 * 1024, 48 * 1024 * 1024))
+        );
+        assert_eq!(parse_cpu_list("0-2,5,7-8"), Some(vec![0, 1, 2, 5, 7, 8]));
+        assert_eq!(parse_cpu_list("2-1"), None);
+    }
+
+    #[test]
+    #[ignore = "requires a Linux user systemd scope and taskset"]
+    fn host_isolated_child_observes_kernel_boundaries() {
+        const CHILD_MARKER: &str = "REFLEX_HOST_ISOLATION_INTEGRATION_CHILD";
+        const MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let isolation = inherited_host_isolation().expect("child isolation is authentic");
+            assert_eq!(isolation.memory_limit_bytes, MEMORY_LIMIT);
+            assert_eq!(
+                std::thread::available_parallelism()
+                    .expect("child parallelism is visible")
+                    .get(),
+                isolation.allowed_cpu_list.split(',').count()
+            );
+            return;
+        }
+
+        let prefix = std::env::temp_dir().join(format!(
+            "reflex-host-isolation-integration-test-{}",
+            std::process::id()
+        ));
+        let executable = std::env::current_exe().expect("test executable exists");
+        let (capture, isolation) = capture_child_host_isolated(
+            &executable,
+            &[
+                OsString::from("--exact"),
+                OsString::from("harness::tests::host_isolated_child_observes_kernel_boundaries"),
+                OsString::from("--nocapture"),
+                OsString::from("--ignored"),
+            ],
+            &prefix,
+            Duration::from_secs(10),
+            HostIsolationPolicy {
+                memory_limit_bytes: MEMORY_LIMIT,
+                memory_reserve_bytes: 16 * 1024 * 1024 * 1024,
+                cpu_reserve: 1,
+            },
+            &[(OsString::from(CHILD_MARKER), OsString::from("1"))],
+        )
+        .expect("host-isolated child starts");
+
+        assert_eq!(isolation.memory_limit_bytes, MEMORY_LIMIT);
+        assert!(!capture.timed_out, "{}", capture.stderr);
+        assert!(!capture.resident_limit_exceeded, "{}", capture.stderr);
+        assert!(capture.status.success(), "{}", capture.stderr);
     }
 
     #[test]

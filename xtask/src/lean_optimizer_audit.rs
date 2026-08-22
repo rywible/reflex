@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -15,13 +16,20 @@ use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig};
 use serde::Serialize;
 
 use crate::harness::{
-    AnyError, HostEnvironment, environment, hash_file, hash_json, parse_flag_values,
-    require_absent, require_clean, require_release,
+    AnyError, HostEnvironment, HostIsolation, HostIsolationPolicy, capture_child_host_isolated,
+    environment, hash_file, hash_json, inherited_host_isolation, parse_flag_values, require_absent,
+    require_clean, require_release,
 };
 
 const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v1";
-const RESIDENT_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const HOST_CPU_RESERVE: usize = 1;
+const WORKER_THREADS: usize = 6;
 const DURABLE_BYTES: u64 = 1024 * 1024 * 1024;
+const SUPERVISOR_WALL_LIMIT: Duration = Duration::from_mins(35);
+const SUPERVISOR_CAPABILITY: &str = "reflex-lean-public-optimizer-supervisor-v1";
 
 struct Arguments {
     lake: PathBuf,
@@ -76,11 +84,97 @@ struct Report {
     full_has_more_improvements: bool,
     full_uses_less_cpu_per_improvement: bool,
     host: HostEnvironment,
+    host_isolation: HostIsolation,
     content_sha256: String,
+}
+
+struct ReportInputs {
+    host: HostEnvironment,
+    host_isolation: HostIsolation,
+    training_artifacts: usize,
+    heldout_artifacts: usize,
+    training_usage: Usage,
+    full: TreatmentResult,
+    bootstrap: TreatmentResult,
 }
 
 pub fn development(arguments: &[String]) -> Result<(), AnyError> {
     require_release("lean-public-optimizer-development")?;
+    let host = environment()?;
+    require_clean(&host, DEVELOPMENT_SCHEMA)?;
+    if host.available_parallelism < WORKER_THREADS + HOST_CPU_RESERVE {
+        return Err(
+            "Lean public-optimizer development cannot preserve its host CPU reserve".into(),
+        );
+    }
+    let parsed = parse(arguments)?;
+    require_absent(&parsed.output, "Lean public-optimizer development report")?;
+    if parsed.work.exists() {
+        return Err(format!(
+            "Lean public-optimizer work directory already exists: {}",
+            parsed.work.display()
+        )
+        .into());
+    }
+    let executable = std::env::current_exe()?;
+    let child_arguments =
+        std::iter::once(OsString::from("lean-public-optimizer-development-child"))
+            .chain(arguments.iter().map(OsString::from))
+            .collect::<Vec<_>>();
+    let evidence_prefix = std::env::temp_dir().join(format!(
+        "reflex-lean-public-optimizer-supervisor-{}",
+        std::process::id()
+    ));
+    let (capture, isolation) = capture_child_host_isolated(
+        &executable,
+        &child_arguments,
+        &evidence_prefix,
+        SUPERVISOR_WALL_LIMIT,
+        HostIsolationPolicy {
+            memory_limit_bytes: SUPERVISOR_RESIDENT_BYTES,
+            memory_reserve_bytes: HOST_MEMORY_RESERVE_BYTES,
+            cpu_reserve: HOST_CPU_RESERVE,
+        },
+        &[(
+            OsString::from("REFLEX_LEAN_OPTIMIZER_SUPERVISOR_CAPABILITY"),
+            OsString::from(SUPERVISOR_CAPABILITY),
+        )],
+    )?;
+    if capture.status.success() && !capture.timed_out && !capture.resident_limit_exceeded {
+        print!("{}", capture.stdout);
+        return Ok(());
+    }
+    let failure = if capture.timed_out {
+        "exceeded its 35-minute supervised wall limit"
+    } else if capture.resident_limit_exceeded {
+        "reached its 40-GiB supervised resident boundary"
+    } else {
+        "failed inside its hard host-isolated boundary"
+    };
+    Err(format!(
+        "Lean public-optimizer development {failure}; reserved CPUs {:?}, preserved {} memory bytes; child stderr: {}",
+        isolation.reserved_cpus,
+        isolation.memory_reserve_bytes,
+        capture.stderr.trim()
+    )
+    .into())
+}
+
+pub fn development_child(arguments: &[String]) -> Result<(), AnyError> {
+    if std::env::var("REFLEX_LEAN_OPTIMIZER_SUPERVISOR_CAPABILITY").as_deref()
+        != Ok(SUPERVISOR_CAPABILITY)
+    {
+        return Err(
+            "Lean public-optimizer child execution requires its host-isolated supervisor".into(),
+        );
+    }
+    require_supervising_parent()?;
+    let isolation = inherited_host_isolation()?;
+    development_once(arguments, isolation)
+}
+
+fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<(), AnyError> {
+    require_release("lean-public-optimizer-development-child")?;
     let host = environment()?;
     require_clean(&host, DEVELOPMENT_SCHEMA)?;
     let arguments = parse(arguments)?;
@@ -160,24 +254,28 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
     )?;
     write_report(
         &arguments,
-        host,
-        prepared.training,
-        prepared.heldout,
-        training_usage,
-        full,
-        bootstrap,
+        ReportInputs {
+            host,
+            host_isolation: isolation,
+            training_artifacts: prepared.training,
+            heldout_artifacts: prepared.heldout,
+            training_usage,
+            full,
+            bootstrap,
+        },
     )
 }
 
-fn write_report(
-    arguments: &Arguments,
-    host: HostEnvironment,
-    training_artifacts: usize,
-    heldout_artifacts: usize,
-    training_usage: Usage,
-    full: TreatmentResult,
-    bootstrap: TreatmentResult,
-) -> Result<(), AnyError> {
+fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyError> {
+    let ReportInputs {
+        host,
+        host_isolation,
+        training_artifacts,
+        heldout_artifacts,
+        training_usage,
+        full,
+        bootstrap,
+    } = inputs;
     let full_has_more_improvements =
         full.strict_proof_node_improvements > bootstrap.strict_proof_node_improvements;
     let cpu_per_improvement = |result: &TreatmentResult| {
@@ -200,6 +298,7 @@ fn write_report(
         full_has_more_improvements,
         full_uses_less_cpu_per_improvement,
         host,
+        host_isolation,
         content_sha256: String::new(),
     };
     report.content_sha256 = hash_json(&report)?;
@@ -325,8 +424,8 @@ fn request(
         GoalSet::try_from_iter(goals).map_err(|_| "Lean development goals cannot be empty")?,
         seeds,
         ResourceEnvelope::new(
-            NonZeroUsize::new(6).ok_or("six worker lanes must be nonzero")?,
-            NonZeroU64::new(RESIDENT_BYTES).ok_or("resident limit must be nonzero")?,
+            NonZeroUsize::new(WORKER_THREADS).ok_or("worker lanes must be nonzero")?,
+            NonZeroU64::new(RUNTIME_RESIDENT_BYTES).ok_or("resident limit must be nonzero")?,
             NonZeroU64::new(DURABLE_BYTES).ok_or("durable limit must be nonzero")?,
             NonZeroDuration::new(Duration::from_mins(10)).ok_or("elapsed limit must be nonzero")?,
             NonZeroDuration::new(Duration::from_mins(10)).ok_or("CPU limit must be nonzero")?,
@@ -335,6 +434,36 @@ fn request(
         ),
         bundle,
     )?)
+}
+
+fn require_supervising_parent() -> Result<(), AnyError> {
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let fields = stat
+        .rsplit_once(')')
+        .ok_or("Linux process metadata is malformed")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let parent = fields
+        .get(1)
+        .ok_or("Linux process metadata omits the parent")?;
+    let parent_executable = std::fs::read_link(format!("/proc/{parent}/exe"))?;
+    if parent_executable != std::env::current_exe()? {
+        return Err("Lean public-optimizer child parent is not its registered supervisor".into());
+    }
+    let command = std::fs::read(format!("/proc/{parent}/cmdline"))?;
+    let arguments = command
+        .split(|byte| *byte == 0)
+        .filter_map(|value| std::str::from_utf8(value).ok())
+        .collect::<Vec<_>>();
+    if !arguments.contains(&"lean-public-optimizer-development")
+        || arguments.contains(&"lean-public-optimizer-development-child")
+    {
+        return Err(
+            "Lean public-optimizer child parent has no registered supervisor command".into(),
+        );
+    }
+    Ok(())
 }
 
 fn treatment(
