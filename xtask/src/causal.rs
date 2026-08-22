@@ -1592,7 +1592,7 @@ fn ablate_bundle(
     model_template: Option<&Path>,
     derived: bool,
 ) -> Result<(), AnyError> {
-    let mut bundle = CanonicalBundle::decode(&std::fs::read(source)?)?;
+    let mut bundle = CanonicalBundle::decode(&std::fs::read(source)?, RESIDENT_BYTES)?;
     let identity = bundle.identity().to_vec();
     let artifacts = bundle.segment(SegmentKind::Artifacts).to_vec();
     let revisions = bundle.segment(SegmentKind::Revisions);
@@ -1604,7 +1604,7 @@ fn ablate_bundle(
     }
     let mut model_id: [u8; 32] = revisions[32..64].try_into()?;
     if let Some(template) = model_template {
-        let template_bundle = CanonicalBundle::decode(&std::fs::read(template)?)?;
+        let template_bundle = CanonicalBundle::decode(&std::fs::read(template)?, RESIDENT_BYTES)?;
         let template_revisions = template_bundle.segment(SegmentKind::Revisions);
         model_id = template_revisions[32..64].try_into()?;
         let mut template_input = &template_revisions[64..];
@@ -1718,7 +1718,7 @@ fn knowledge_revision_id(
 }
 
 fn revision_ids(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), AnyError> {
-    let bundle = CanonicalBundle::decode(bytes)?;
+    let bundle = CanonicalBundle::decode(bytes, RESIDENT_BYTES)?;
     let revisions = bundle.segment(SegmentKind::Revisions);
     Ok((revisions[..32].try_into()?, revisions[32..64].try_into()?))
 }

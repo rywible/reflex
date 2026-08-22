@@ -9,6 +9,7 @@ use reflex::{
     OptimizationGoal, Preference, ResourceEnvelope, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 
 #[test]
 #[expect(
@@ -197,10 +198,10 @@ struct Attempt {
 
 fn snapshot(path: &Path) -> Snapshot {
     let bytes = std::fs::read(path).unwrap();
-    let segments = segments(&bytes);
-    let artifacts = segments.iter().find(|(kind, _)| *kind == 3).unwrap().1;
-    let revisions = segments.iter().find(|(kind, _)| *kind == 2).unwrap().1;
-    let experience = segments.iter().find(|(kind, _)| *kind == 4).unwrap().1;
+    let bundle = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
+    let artifacts = bundle.segment(SegmentKind::Artifacts);
+    let revisions = bundle.segment(SegmentKind::Revisions);
+    let experience = bundle.segment(SegmentKind::Experience);
     let artifact_count =
         usize::try_from(u64::from_le_bytes(artifacts[..8].try_into().unwrap())).unwrap();
     let knowledge_length =
@@ -237,24 +238,6 @@ fn snapshot(path: &Path) -> Snapshot {
         model_generation,
         attempts,
     }
-}
-
-fn segments(mut bytes: &[u8]) -> Vec<(u8, &[u8])> {
-    bytes = &bytes[8..];
-    let identity_length = usize::try_from(read_u64(&mut bytes)).unwrap();
-    bytes = &bytes[identity_length..];
-    let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    bytes = &bytes[4..];
-    let mut segments = Vec::with_capacity(count);
-    for _ in 0..count {
-        let kind = bytes[0];
-        bytes = &bytes[5..];
-        let length = usize::try_from(read_u64(&mut bytes)).unwrap();
-        let (payload, remainder) = bytes.split_at(length);
-        segments.push((kind, payload));
-        bytes = &remainder[32..];
-    }
-    segments
 }
 
 fn read_u64(bytes: &mut &[u8]) -> u64 {

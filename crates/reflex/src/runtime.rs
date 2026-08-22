@@ -119,6 +119,7 @@ const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 4 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
 const RUNTIME_REVISION: u64 = 2;
+const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1856,7 +1857,26 @@ fn decode_bundle<D: DomainDefinition>(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != bundle_bytes {
         return Err(SessionError::Resource);
     }
-    let decoded = CanonicalBundle::decode(&bytes).map_err(|_| SessionError::CorruptBundle)?;
+    let maximum_logical_bytes = resource_meter
+        .available_resident(resident_before_bundle.saturating_add(bundle_bytes))
+        .checked_div(BUNDLE_DECODE_RESIDENT_MULTIPLIER)
+        .ok_or(SessionError::Resource)?;
+    let decoded = CanonicalBundle::decode(&bytes, maximum_logical_bytes).map_err(|error| {
+        if error.is_logical_size_limit() {
+            SessionError::Resource
+        } else {
+            SessionError::CorruptBundle
+        }
+    })?;
+    let decoded_resident_bytes = decoded
+        .logical_bytes()
+        .saturating_mul(BUNDLE_DECODE_RESIDENT_MULTIPLIER);
+    if !resource_meter.reserve(
+        ResidentReservation::live(resident_before_bundle.saturating_add(decoded_resident_bytes))
+            .with_transient(bundle_bytes),
+    ) {
+        return Err(SessionError::Resource);
+    }
     drop(bytes);
     if decoded.identity() != domain.semantic_identity().as_str().as_bytes() {
         return Err(SessionError::IncompatibleBundle);
@@ -2214,7 +2234,7 @@ fn decode_bundle<D: DomainDefinition>(
         interrupted_usage,
         knowledge,
         learning,
-        resident_bytes: bundle_bytes.saturating_mul(3),
+        resident_bytes: decoded_resident_bytes,
     })
 }
 
@@ -2460,7 +2480,7 @@ fn replay_experience<D: DomainDefinition>(
     resident_overlap: u64,
 ) -> Result<(), SessionError<D::Error>> {
     let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
-    for entries in experience.chunks(256) {
+    for entries in experience.chunks(1) {
         let candidates = entries
             .iter()
             .map(|entry| {
@@ -2793,21 +2813,24 @@ fn replace_interrupted_session<D: DomainDefinition>(
     encoded_bundle: &[u8],
     usage: ResourceUsage,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
-    let mut bundle =
-        CanonicalBundle::decode(encoded_bundle).map_err(|_| SessionError::CorruptBundle)?;
-    if bundle.identity() != domain.semantic_identity().as_str().as_bytes() {
-        return Err(SessionError::IncompatibleBundle);
-    }
-    bundle.replace_segment(
-        SegmentKind::Session,
-        encode_session(
-            domain,
-            request,
-            seed_cursor,
-            SessionSeal::Interrupted(usage),
-        )?,
-    );
-    Ok(bundle.encode())
+    let session = encode_session(
+        domain,
+        request,
+        seed_cursor,
+        SessionSeal::Interrupted(usage),
+    )?;
+    CanonicalBundle::replace_session(
+        encoded_bundle,
+        domain.semantic_identity().as_str().as_bytes(),
+        &session,
+    )
+    .map_err(|error| {
+        if error.is_identity_mismatch() {
+            SessionError::IncompatibleBundle
+        } else {
+            SessionError::CorruptBundle
+        }
+    })
 }
 
 fn publish_recovery_interruption<D: DomainDefinition>(

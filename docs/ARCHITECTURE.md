@@ -769,6 +769,8 @@ All hot work is memory-resident. Search workers never await filesystem operation
 
 Mutable Runtime state appends to generation-local segments. A short checkpoint barrier seals completed segments and hands them to the durability thread; workers continue on new segments. The durability implementation writes content-addressed canonical records and a recovery tail, not a byte dump of process memory.
 
+The private Bundle framing layer deterministically compresses replay-complete Artifact and Experience segments under ADR 0054. Segment checksums, Artifact identities, and revision identities remain defined over the expanded canonical bytes; compression is a physical storage decision and cannot change Verification or Semantic Identity. Recovery bounds expansion from the Resource Envelope before allocation, charges the expanded representation rather than the physical file, and replays potentially large Experience Candidates one at a time.
+
 A Domain Bundle contains:
 
 - Semantic Identity and format versions;
@@ -868,7 +870,7 @@ The binary declaration catalog includes the type, dependency edges, declaration 
 
 Lean structural views follow the Runtime's canonical post-order convention: every child precedes its parent and the root is last. Primitive Operators cover exact proof substitution, directed application and composition, local rewriting, common-subproof factoring, structural anti-unification transfer, eta abstraction, beta/zeta normalization, and syntactic instantiation of general theorems. Every result remains a Candidate until the Lean kernel accepts it.
 
-The worker's configured memory is a hard Linux address-space ceiling, not an estimate. Because resident memory cannot exceed that ceiling, the Runtime conservatively charges the ceiling to the Resource Envelope on success and failure. The fixed Development suite separately gates cold restore and clean replay at 60 seconds, warm first kernel-certified Proof Collapse at 1 second p50 and 5 seconds p95, and exact proof-node improvement on five historical cases. Development timing never constitutes Scientific Confirmation.
+The worker's configured memory is a hard Linux address-space ceiling, not an estimate. Because resident memory cannot exceed that ceiling, the Runtime conservatively charges the ceiling to the Resource Envelope on success and failure. Formal Artifacts can differ by millions of expression nodes, so fetch and Verification traffic is paged into single-item protocol transactions; request order and the batch deadline remain unchanged while the worker never retains a batch-wide decoded payload. The fixed Development suite separately gates cold restore and clean replay at 60 seconds, warm first kernel-certified Proof Collapse at 1 second p50 and 5 seconds p95, and exact proof-node improvement on five historical cases. Development timing never constitutes Scientific Confirmation.
 
 ## First production vertical slice
 

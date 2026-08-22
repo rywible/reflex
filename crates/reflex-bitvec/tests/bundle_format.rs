@@ -7,6 +7,7 @@ use reflex::{
     OptimizationGoal, Preference, ResourceEnvelope, SessionError, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -44,12 +45,9 @@ fn v3_bundle_segments_preserve_refuted_experience() {
     })
     .unwrap();
     let bytes = std::fs::read(&bundle_path).unwrap();
+    let decoded = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
+    let experience = decoded.segment(SegmentKind::Experience);
     let segments = read_segments(&bytes);
-    let experience = segments
-        .iter()
-        .find(|(kind, _, _)| *kind == 4)
-        .map(|(_, _, payload)| *payload)
-        .unwrap();
     let count = u64::from_le_bytes(experience[..8].try_into().unwrap());
     let candidate_length =
         usize::try_from(u64::from_le_bytes(experience[168..176].try_into().unwrap())).unwrap();
@@ -61,7 +59,7 @@ fn v3_bundle_segments_preserve_refuted_experience() {
             && segments
                 .iter()
                 .map(|(_, version, _)| *version)
-                .eq([1, 4, 2, 2, 1])
+                .eq([1, 4, 3, 3, 1])
             && count == 1
             && verdict == 2
             && outcome.usage().verification_requests == 2,
@@ -105,12 +103,8 @@ fn v3_experience_keeps_resource_admission_and_measurement_observations_separate(
     .unwrap();
 
     let bytes = std::fs::read(&bundle_path).unwrap();
-    let segments = read_segments(&bytes);
-    let mut experience = segments
-        .iter()
-        .find(|(kind, _, _)| *kind == 4)
-        .map(|(_, _, payload)| *payload)
-        .unwrap();
+    let decoded = CanonicalBundle::decode(&bytes, 16 * 1024 * 1024).unwrap();
+    let mut experience = decoded.segment(SegmentKind::Experience);
     assert_eq!(read_u64(&mut experience), 1);
     experience = &experience[160..];
     let candidate_length = usize::try_from(read_u64(&mut experience)).unwrap();
@@ -277,19 +271,13 @@ fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches(
         Err(SessionError::CorruptBundle)
     ));
 
-    let mut false_verdict = valid.clone();
-    let (_, payload, length, checksum) = segment_location(&false_verdict, 4);
-    let candidate_length = usize::try_from(u64::from_le_bytes(
-        false_verdict[payload + 168..payload + 176]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    false_verdict[payload + 176 + candidate_length] = 1;
-    let segment_digest = Sha256::digest(&false_verdict[payload..payload + length]);
-    false_verdict[checksum..checksum + 32].copy_from_slice(&segment_digest);
-    refresh_file_checksum(&mut false_verdict);
-    std::fs::write(&bundle_path, false_verdict).unwrap();
+    let mut false_verdict = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
+    let mut experience = false_verdict.segment(SegmentKind::Experience).to_vec();
+    let candidate_length =
+        usize::try_from(u64::from_le_bytes(experience[168..176].try_into().unwrap())).unwrap();
+    experience[176 + candidate_length] = 1;
+    false_verdict.replace_segment(SegmentKind::Experience, experience);
+    std::fs::write(&bundle_path, false_verdict.encode()).unwrap();
     assert!(matches!(
         improve(
             BitVecDomain::unary_u8(),

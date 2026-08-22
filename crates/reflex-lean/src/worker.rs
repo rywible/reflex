@@ -15,6 +15,7 @@ use crate::{ARTIFACT_FORMAT_VERSION, KERNEL_CONTRACT_VERSION, LeanSnapshotPin};
 pub const PROTOCOL_VERSION: usize = 1;
 pub const DEFAULT_WORKER_RESIDENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const MINIMUM_WORKER_RESIDENT_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const MAX_ITEMS_PER_TRANSACTION: usize = 1;
 
 #[derive(Debug)]
 pub enum WorkerError {
@@ -565,19 +566,23 @@ impl LeanWorker {
     ) -> Result<(Vec<VerificationResult>, WorkerUsage), WorkerError> {
         let started = Instant::now();
         let mut process = self.lock()?;
-        let id = process.id();
-        match process.transact(&Request::Verify {
-            id: id.clone(),
-            items,
-        })? {
-            Response::Verified {
-                id: response_id,
-                results,
-            } if response_id == id && results.len() == items.len() => {
-                Ok((results, self.usage(started.elapsed())))
+        let mut combined = Vec::with_capacity(items.len());
+        for items in items.chunks(MAX_ITEMS_PER_TRANSACTION) {
+            let id = process.id();
+            match process.transact(&Request::Verify {
+                id: id.clone(),
+                items,
+            })? {
+                Response::Verified {
+                    id: response_id,
+                    results,
+                } if response_id == id && results.len() == items.len() => {
+                    combined.extend(results);
+                }
+                response => return Err(unexpected("verified page", response)),
             }
-            response => Err(unexpected("verified batch", response)),
         }
+        Ok((combined, self.usage(started.elapsed())))
     }
 
     pub fn verify_bounded(
@@ -587,22 +592,27 @@ impl LeanWorker {
     ) -> Result<(Vec<VerificationResult>, WorkerUsage), WorkerError> {
         let started = Instant::now();
         let mut process = self.lock()?;
-        let id = process.id();
-        match process.transact_bounded(
-            &Request::Verify {
-                id: id.clone(),
-                items,
-            },
-            deadline,
-        )? {
-            Response::Verified {
-                id: response_id,
-                results,
-            } if response_id == id && results.len() == items.len() => {
-                Ok((results, self.usage(started.elapsed())))
+        let mut combined = Vec::with_capacity(items.len());
+        for items in items.chunks(MAX_ITEMS_PER_TRANSACTION) {
+            let id = process.id();
+            let remaining = deadline.saturating_sub(started.elapsed());
+            match process.transact_bounded(
+                &Request::Verify {
+                    id: id.clone(),
+                    items,
+                },
+                remaining,
+            )? {
+                Response::Verified {
+                    id: response_id,
+                    results,
+                } if response_id == id && results.len() == items.len() => {
+                    combined.extend(results);
+                }
+                response => return Err(unexpected("bounded verified page", response)),
             }
-            response => Err(unexpected("bounded verified batch", response)),
         }
+        Ok((combined, self.usage(started.elapsed())))
     }
 
     pub fn index_page(&self, offset: usize, limit: usize) -> Result<IndexPage, WorkerError> {
@@ -655,17 +665,23 @@ impl LeanWorker {
 
     pub fn fetch(&self, names: &[LeanName]) -> Result<Vec<IndexedTheorem>, WorkerError> {
         let mut process = self.lock()?;
-        let id = process.id();
-        match process.transact(&Request::Fetch {
-            id: id.clone(),
-            names,
-        })? {
-            Response::Fetched {
-                id: response_id,
-                artifacts,
-            } if response_id == id && artifacts.len() == names.len() => Ok(artifacts),
-            response => Err(unexpected("fetched theorem bodies", response)),
+        let mut combined = Vec::with_capacity(names.len());
+        for names in names.chunks(MAX_ITEMS_PER_TRANSACTION) {
+            let id = process.id();
+            match process.transact(&Request::Fetch {
+                id: id.clone(),
+                names,
+            })? {
+                Response::Fetched {
+                    id: response_id,
+                    artifacts,
+                } if response_id == id && artifacts.len() == names.len() => {
+                    combined.extend(artifacts);
+                }
+                response => return Err(unexpected("fetched theorem page", response)),
+            }
         }
+        Ok(combined)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Process>, WorkerError> {
