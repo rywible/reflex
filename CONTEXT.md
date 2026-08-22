@@ -180,6 +180,10 @@ _Avoid_: Toy example, benchmark fixture, application integration
 A domain-supplied transformation that proposes Candidates from existing search state.
 _Avoid_: Derived Operator, verifier, learned policy
 
+**Premise Retrieval**:
+A deterministic, domain-owned ordering of verified library Artifacts that may legally support a Primitive Operator proposal. Retrieval controls bounded proposal availability but supplies neither correctness evidence nor goal-relative value; the Runtime still ranks emitted Candidates and the Verification Kernel still decides correctness.
+_Avoid_: Verification, learned allocation, theorem proof
+
 **Derived Operator**:
 A reusable transformation discovered through Knowledge Consolidation from verified derivations that becomes immediately eligible for search and initial exploration. Later Knowledge Revisions may specialize or deactivate it, while every proposed result remains subject to the Verification Kernel.
 _Avoid_: Primitive Operator, unchecked generated code, model action
@@ -231,6 +235,10 @@ _Avoid_: Artifact, solution
 **Proposal Features**:
 A bounded, domain-supplied advisory description of how an Operator formed a Candidate. Proposal Features may guide learned search but never establish correctness.
 _Avoid_: Verification evidence, reward, opaque metadata
+
+**Proposal Provenance**:
+A stable, domain-owned identity for a verified supporting Artifact used to form a Candidate. Proposal Provenance survives into Experience so later learning and audits can attribute an outcome to its support; it supplies neither correctness evidence nor value.
+_Avoid_: Verification Record, Candidate identity, declaration name
 
 **Candidate Fate**:
 An immutable Experience Ledger observation of how one generated Candidate progressed through novelty filtering, Allocation, Verification, and Admission. A Candidate Fate records what happened under a bounded Runtime policy; it is not a Training Target or correctness evidence.

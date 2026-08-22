@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 use crate::bundle::DomainBundle;
 use crate::domain::{
     ApplicationWriter, Candidate, CandidateWriter, ClaimOf, DomainDefinition, EvidenceOf,
-    OperatorAlgebra, OperatorEnumerationBatch, ProposalFeatures, Seed, SeedSource, SeedWriter,
-    StructuralLocation, StructuralProtocol, StructuralView, Verdict, VerificationBatchReport,
-    VerificationKernel, VerificationRecord, VerificationReplayRequest,
+    OperatorAlgebra, OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, Seed,
+    SeedSource, SeedWriter, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
+    VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayRequest,
     VerificationWorkerRequirements,
 };
 use crate::durability;
@@ -173,6 +173,7 @@ struct DeferredCandidate<D: DomainDefinition> {
     parent_key: ArtifactKey,
     operator_symbol: Vec<u8>,
     proposal_features: ProposalFeatures,
+    proposal_provenance: Option<ProposalProvenance>,
     proposal_limit: u32,
     protected_derived: bool,
 }
@@ -225,7 +226,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 10;
+const RUNTIME_REVISION: u64 = 11;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -251,10 +252,20 @@ where
         .ok_or(SessionError::Resource)?;
     let scheduler =
         Scheduler::from_environment(runtime_lanes).map_err(|()| SessionError::Resource)?;
+    let maximum_candidate_capacity =
+        usize::try_from(MAX_CANDIDATE_CHOICES).map_err(|_| SessionError::Resource)?;
     let worker_resident_bytes = (runtime_lanes as u64)
         .saturating_mul(WORKER_STACK_BYTES as u64)
         .saturating_add(DURABILITY_STACK_BYTES as u64)
-        .saturating_add(requirements.resident_bytes());
+        .saturating_add(requirements.resident_bytes())
+        .saturating_add(domain.operators().resident_bytes())
+        .saturating_add(
+            (runtime_lanes as u64).saturating_mul(
+                domain
+                    .operators()
+                    .scratch_resident_bytes(maximum_candidate_capacity),
+            ),
+        );
     if !resource_meter.reserve(ResidentReservation::live(worker_resident_bytes)) {
         return Err(SessionError::Resource);
     }
@@ -352,6 +363,9 @@ fn experience_attempt_inspections(
                 claim_digest: entry.claim_digest,
                 canonical_candidate: entry.canonical_candidate.clone(),
                 operator_symbol: entry.operator_symbol.clone(),
+                support_key: entry
+                    .proposal_provenance
+                    .map(ProposalProvenance::support_key),
                 verdict: match entry.verdict {
                     ExperienceVerdict::Accepted => {
                         crate::internal_experiments::ExperienceVerdictInspection::Accepted
@@ -441,6 +455,9 @@ fn candidate_fate_inspections(
                 claim_digest: fate.claim_digest,
                 parent_key: fate.parent_key.0,
                 operator_digest: fate.operator_digest,
+                support_key: fate
+                    .proposal_provenance
+                    .map(ProposalProvenance::support_key),
                 epoch: fate.epoch,
                 generation_rank: fate.generation_rank,
                 proposal_limit: fate.proposal_limit,
@@ -929,6 +946,7 @@ where
                     source_index,
                     artifact: deferred.artifact,
                     proposal_features: deferred.proposal_features,
+                    proposal_provenance: deferred.proposal_provenance,
                 },
                 operator_symbol: deferred.operator_symbol,
                 features: Features([0.0; FEATURE_COUNT]),
@@ -2688,6 +2706,7 @@ fn retain_novel_candidates<D: DomainDefinition>(
             claim_digest,
             parent_key: frontier[candidate.candidate.source_index].0.key(),
             operator_digest: Sha256::digest(&candidate.operator_symbol).into(),
+            proposal_provenance: candidate.candidate.proposal_provenance,
             epoch: candidate.epoch,
             generation_rank: u32::try_from(generation_rank).unwrap_or(u32::MAX),
             proposal_limit: candidate.proposal_limit,
@@ -3167,7 +3186,7 @@ fn decode_bundle<D: DomainDefinition>(
     }
     let deferred_count = usize::try_from(read_bundle_u64(&mut recovery)?)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if deferred_count > recovery.len().saturating_div(85) {
+    if deferred_count > recovery.len().saturating_div(86) {
         return Err(SessionError::CorruptBundle);
     }
     let mut deferred_candidates = Vec::with_capacity(deferred_count);
@@ -3200,6 +3219,15 @@ fn decode_bundle<D: DomainDefinition>(
                     .expect("exactly four proposal-feature bytes were taken"),
             ));
         }
+        let proposal_provenance = match take_bundle(&mut recovery, 1)?[0] {
+            0 => None,
+            1 => Some(ProposalProvenance::new(
+                take_bundle(&mut recovery, 32)?
+                    .try_into()
+                    .expect("exactly 32 proposal-provenance bytes were taken"),
+            )),
+            _ => return Err(SessionError::CorruptBundle),
+        };
         if proposal_limit == 0
             || operator_symbol.is_empty()
             || std::str::from_utf8(&operator_symbol).is_err()
@@ -3212,6 +3240,7 @@ fn decode_bundle<D: DomainDefinition>(
             parent_key,
             operator_symbol,
             proposal_features: ProposalFeatures::new(proposal_features),
+            proposal_provenance,
             proposal_limit,
             protected_derived,
         });
@@ -3285,6 +3314,7 @@ fn decode_bundle<D: DomainDefinition>(
                 &entry.operator_symbol,
                 entry.epoch,
                 entry.proposal_features,
+                entry.proposal_provenance,
             ) != entry.attempt_id
             || opportunity_features(
                 domain,
@@ -3965,6 +3995,7 @@ fn verify_candidates<D: DomainDefinition>(
             &candidate.operator_symbol,
             candidate.epoch,
             candidate.candidate.proposal_features,
+            candidate.candidate.proposal_provenance,
         );
         let fate_index = candidate.fate_index;
         let (experience_verdict, fate_disposition) = match verdict {
@@ -4020,6 +4051,7 @@ fn verify_candidates<D: DomainDefinition>(
             allocation_queue: candidate.allocation_queue,
             operator_symbol: candidate.operator_symbol,
             proposal_features: candidate.candidate.proposal_features,
+            proposal_provenance: candidate.candidate.proposal_provenance,
             features: candidate.features,
             verification_requests: 1,
             epoch: candidate.epoch,
@@ -4225,6 +4257,12 @@ fn encode_recovery_segment<D: DomainDefinition>(
         recovery.push(u8::from(candidate.protected_derived));
         for feature in candidate.candidate.proposal_features.as_array() {
             recovery.extend_from_slice(&feature.to_bits().to_le_bytes());
+        }
+        if let Some(provenance) = candidate.candidate.proposal_provenance {
+            recovery.push(1);
+            recovery.extend_from_slice(&provenance.support_key());
+        } else {
+            recovery.push(0);
         }
     }
     push_u64(&mut recovery, pending_parent_keys.len() as u64);
@@ -4432,9 +4470,10 @@ fn attempt_digest(
     operator_symbol: &[u8],
     epoch: u64,
     proposal_features: ProposalFeatures,
+    proposal_provenance: Option<ProposalProvenance>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"reflex-attempt-observation-v2\0");
+    digest.update(b"reflex-attempt-observation-v3\0");
     digest.update(candidate_key.as_bytes());
     digest.update(origin_key.as_bytes());
     digest.update(parent_key.as_bytes());
@@ -4443,6 +4482,12 @@ fn attempt_digest(
     digest.update(epoch.to_le_bytes());
     for feature in proposal_features.as_array() {
         digest.update(feature.to_bits().to_le_bytes());
+    }
+    if let Some(provenance) = proposal_provenance {
+        digest.update([1]);
+        digest.update(provenance.support_key());
+    } else {
+        digest.update([0]);
     }
     digest.finalize().into()
 }

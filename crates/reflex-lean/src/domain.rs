@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -8,10 +7,11 @@ use reflex::{
     ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
     ExternalVerificationUsage, Incomparable, KernelRevision, MeasurementDescriptor,
     MeasurementEnvironment, MeasurementSpace, MeasurementWriter, MetricOrdering, OperatorAlgebra,
-    OperatorDescriptor, OperatorEnumerationBatch, ProposalFeatures, Seed, SeedPage, SeedSource,
-    SeedWriter, SemanticIdentity, StructuralProtocol, StructuralView, Verdict, VerdictWriter,
-    VerificationBatch, VerificationBatchOutcome, VerificationBatchReport, VerificationKernel,
-    VerificationRecord, VerificationReplayBatch, VerificationWorkerRequirements, VerifiedBatch,
+    OperatorDescriptor, OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, Seed,
+    SeedPage, SeedSource, SeedWriter, SemanticIdentity, StructuralProtocol, StructuralView,
+    Verdict, VerdictWriter, VerificationBatch, VerificationBatchOutcome, VerificationBatchReport,
+    VerificationKernel, VerificationRecord, VerificationReplayBatch,
+    VerificationWorkerRequirements, VerifiedBatch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,7 @@ use crate::ast::{
     LeanArtifact, LeanBinderInfo, LeanDeclarationIdentity, LeanEnvironmentIdentity, LeanExpr,
     LeanLevel, LeanLiteral, LeanName,
 };
+use crate::retrieval::{DonorRetrievalIndex, DonorRetrievalScratch, RetrievalTier, RetrievedDonor};
 use crate::worker::{
     IndexPage, IndexedTheorem, LeanWorker, LeanWorkerConfig, VerificationItem, WorkerError,
     WorkerUsage,
@@ -254,7 +255,7 @@ impl LeanDomain {
             seeds: LeanSeeds {
                 entries: Arc::new(corpus.entries),
             },
-            operators: LeanOperators::new(substitutions),
+            operators: LeanOperators::new(substitutions)?,
             kernel: LeanKernel {
                 config,
                 environment: environment.clone(),
@@ -279,7 +280,7 @@ impl DomainDefinition for LeanDomain {
 
     fn semantic_identity(&self) -> SemanticIdentity {
         SemanticIdentity::new(format!(
-            "reflex-lean-v3:mathlib={}:toolchain={}:lean={}:artifact={}:kernel={}:worker={}",
+            "reflex-lean-v4:mathlib={}:toolchain={}:lean={}:artifact={}:kernel={}:worker={}",
             self.environment.mathlib_commit,
             self.environment.lean_toolchain,
             self.environment.lean_commit,
@@ -856,39 +857,69 @@ pub enum LeanOperator {
 
 pub struct LeanOperators {
     catalog: Vec<OperatorDescriptor<LeanOperator>>,
-    substitutions_by_proposition: HashMap<LeanExpr, Vec<usize>>,
+    retrieval: DonorRetrievalIndex,
     all_proofs: Vec<LeanArtifact>,
+    donor_keys: Vec<ProposalProvenance>,
+    resident_bytes: u64,
+}
+
+// Canonical JSON is the stable measurable payload; this matches the Runtime's
+// conservative decoded-bundle multiplier for tree nodes and allocation control data.
+const ARTIFACT_RESIDENT_MULTIPLIER: u64 = 12;
+
+#[derive(Default)]
+pub struct LeanOperatorScratch {
+    retrieval: DonorRetrievalScratch,
 }
 
 impl LeanOperators {
-    fn new(substitutions: Vec<LeanArtifact>) -> Self {
-        let mut substitutions_by_proposition = HashMap::new();
-        for (index, artifact) in substitutions.iter().enumerate() {
-            substitutions_by_proposition
-                .entry(artifact.proposition.clone())
-                .or_insert_with(Vec::new)
-                .push(index);
+    fn new(substitutions: Vec<LeanArtifact>) -> Result<Self, LeanError> {
+        let mut donor_keys = Vec::with_capacity(substitutions.len());
+        let mut artifact_bytes = 0_u64;
+        for artifact in &substitutions {
+            let encoded = serde_json::to_vec(artifact)?;
+            artifact_bytes = artifact_bytes.saturating_add(encoded.len() as u64);
+            donor_keys.push(ProposalProvenance::new(Sha256::digest(encoded).into()));
         }
+        let retrieval = DonorRetrievalIndex::build(&substitutions);
         let descriptor =
             |operator, symbol| OperatorDescriptor::new(operator, SymbolId::new(symbol));
-        Self {
-            catalog: vec![
-                descriptor(LeanOperator::ProofSubstitution, "lean-proof-substitution"),
-                descriptor(LeanOperator::Application, "lean-application"),
-                descriptor(LeanOperator::Rewriting, "lean-rewriting"),
-                descriptor(LeanOperator::Factoring, "lean-factoring"),
-                descriptor(LeanOperator::AntiUnification, "lean-anti-unification"),
-                descriptor(LeanOperator::Abstraction, "lean-abstraction"),
-                descriptor(LeanOperator::Normalization, "lean-normalization"),
-                descriptor(LeanOperator::Composition, "lean-composition"),
-                descriptor(
-                    LeanOperator::VerifiedGeneralization,
-                    "lean-verified-generalization",
-                ),
-            ],
-            substitutions_by_proposition,
+        let catalog = vec![
+            descriptor(LeanOperator::ProofSubstitution, "lean-proof-substitution"),
+            descriptor(LeanOperator::Application, "lean-application"),
+            descriptor(LeanOperator::Rewriting, "lean-rewriting"),
+            descriptor(LeanOperator::Factoring, "lean-factoring"),
+            descriptor(LeanOperator::AntiUnification, "lean-anti-unification"),
+            descriptor(LeanOperator::Abstraction, "lean-abstraction"),
+            descriptor(LeanOperator::Normalization, "lean-normalization"),
+            descriptor(LeanOperator::Composition, "lean-composition"),
+            descriptor(
+                LeanOperator::VerifiedGeneralization,
+                "lean-verified-generalization",
+            ),
+        ];
+        let resident_bytes = (catalog.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<OperatorDescriptor<LeanOperator>>() as u64)
+            .saturating_add(catalog.iter().fold(0_u64, |bytes, descriptor| {
+                bytes.saturating_add(descriptor.symbol().as_str().len() as u64)
+            }))
+            .saturating_add(
+                (substitutions.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<LeanArtifact>() as u64),
+            )
+            .saturating_add(artifact_bytes.saturating_mul(ARTIFACT_RESIDENT_MULTIPLIER))
+            .saturating_add(
+                (donor_keys.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<ProposalProvenance>() as u64),
+            )
+            .saturating_add(retrieval.resident_bytes());
+        Ok(Self {
+            catalog,
+            retrieval,
             all_proofs: substitutions,
-        }
+            donor_keys,
+            resident_bytes,
+        })
     }
 
     fn substitutions(
@@ -896,39 +927,30 @@ impl LeanOperators {
         source_index: usize,
         source: &LeanArtifact,
         output: &mut ApplicationWriter<'_, LeanApplication>,
+        scratch: &mut LeanOperatorScratch,
     ) {
-        if let Some(substitutions) = self.substitutions_by_proposition.get(&source.proposition) {
-            for index in substitutions {
-                if output.is_full() {
-                    return;
-                }
-                let substitution = &self.all_proofs[*index];
-                if substitution.proof_term != source.proof_term {
-                    output.push(LeanApplication::supported(
-                        source_index,
-                        candidate_with_proof(source, substitution.proof_term.clone()),
-                        source,
-                        substitution,
-                        *index,
-                    ));
-                }
-            }
-        }
-        for (index, substitution) in self.all_proofs.iter().enumerate() {
+        let limit = output.remaining_capacity();
+        let ranked = self.retrieval.rank_prefix(
+            &source.proposition,
+            &source.proof_term,
+            limit.saturating_add(1),
+            &mut scratch.retrieval,
+        );
+        for (proposal_rank, donor) in ranked.iter().take(limit).enumerate() {
             if output.is_full() {
                 return;
             }
-            if substitution.proposition != source.proposition
-                && substitution.proof_term != source.proof_term
-            {
-                output.push(LeanApplication::supported(
-                    source_index,
-                    candidate_with_proof(source, substitution.proof_term.clone()),
-                    source,
-                    substitution,
-                    index,
-                ));
-            }
+            let substitution = &self.all_proofs[donor.index];
+            let relevance = donor.relevance();
+            let margin = retrieval_margin(ranked, proposal_rank);
+            output.push(LeanApplication::supported(
+                source_index,
+                candidate_with_proof(source, substitution.proof_term.clone()),
+                source,
+                substitution,
+                SupportRelationship::retrieved(proposal_rank, donor.tier, relevance, margin),
+                self.donor_keys[donor.index],
+            ));
         }
     }
 
@@ -959,7 +981,8 @@ impl LeanOperators {
                 ),
                 source,
                 other,
-                index,
+                SupportRelationship::corpus(index),
+                self.donor_keys[index],
             ));
         }
     }
@@ -984,7 +1007,8 @@ impl LeanOperators {
                     candidate_with_proof(source, proof_term),
                     source,
                     other,
-                    index,
+                    SupportRelationship::corpus(index),
+                    self.donor_keys[index],
                 ));
             }
         }
@@ -1020,7 +1044,8 @@ impl LeanOperators {
                 candidate_with_proof(source, proof_term),
                 source,
                 shared,
-                index,
+                SupportRelationship::corpus(index),
+                self.donor_keys[index],
             ));
         }
     }
@@ -1058,7 +1083,8 @@ impl LeanOperators {
                 candidate_with_proof(source, proof_term),
                 source,
                 analogous,
-                index,
+                SupportRelationship::corpus(index),
+                self.donor_keys[index],
             ));
         }
     }
@@ -1104,7 +1130,8 @@ impl LeanOperators {
                     candidate_with_proof(source, proof_term),
                     source,
                     general,
-                    index,
+                    SupportRelationship::corpus(index),
+                    self.donor_keys[index],
                 ));
             }
         }
@@ -1115,6 +1142,35 @@ pub struct LeanApplication {
     source_index: usize,
     candidate: LeanArtifact,
     proposal_features: ProposalFeatures,
+    proposal_provenance: Option<ProposalProvenance>,
+}
+
+#[derive(Clone, Copy)]
+struct SupportRelationship {
+    ordinal: usize,
+    tier: Option<RetrievalTier>,
+    relevance: f32,
+    margin: f32,
+}
+
+impl SupportRelationship {
+    const fn corpus(ordinal: usize) -> Self {
+        Self {
+            ordinal,
+            tier: None,
+            relevance: 0.0,
+            margin: 0.0,
+        }
+    }
+
+    const fn retrieved(ordinal: usize, tier: RetrievalTier, relevance: f32, margin: f32) -> Self {
+        Self {
+            ordinal,
+            tier: Some(tier),
+            relevance,
+            margin,
+        }
+    }
 }
 
 impl LeanApplication {
@@ -1123,12 +1179,14 @@ impl LeanApplication {
         candidate: LeanArtifact,
         source: &LeanArtifact,
         support: &LeanArtifact,
-        library_rank: usize,
+        relationship: SupportRelationship,
+        proposal_provenance: ProposalProvenance,
     ) -> Self {
         Self {
             source_index,
             candidate,
-            proposal_features: proposal_features(source, support, library_rank),
+            proposal_features: proposal_features(source, support, relationship),
+            proposal_provenance: Some(proposal_provenance),
         }
     }
 
@@ -1137,6 +1195,7 @@ impl LeanApplication {
             source_index,
             candidate,
             proposal_features: ProposalFeatures::default(),
+            proposal_provenance: None,
         }
     }
 }
@@ -1144,39 +1203,61 @@ impl LeanApplication {
 fn proposal_features(
     source: &LeanArtifact,
     support: &LeanArtifact,
-    library_rank: usize,
+    relationship: SupportRelationship,
 ) -> ProposalFeatures {
-    let exact_proposition = source.proposition == support.proposition;
-    let rank = u16::try_from(library_rank.saturating_add(1)).unwrap_or(u16::MAX);
-    let support_proposition_nodes =
-        u16::try_from(support.proposition.node_count()).unwrap_or(u16::MAX);
-    let support_proof_nodes = u16::try_from(support.proof_term.node_count()).unwrap_or(u16::MAX);
+    let rank = u16::try_from(relationship.ordinal.saturating_add(1)).unwrap_or(u16::MAX);
+    let source_proposition_nodes = bounded_nodes(source.proposition.node_count());
+    let support_proposition_nodes = bounded_nodes(support.proposition.node_count());
+    let source_proof_nodes = bounded_nodes(source.proof_term.node_count());
+    let support_proof_nodes = bounded_nodes(support.proof_term.node_count());
     ProposalFeatures::new([
-        f32::from(exact_proposition),
-        f32::from(!exact_proposition),
-        f32::from(source.declaration.level_params == support.declaration.level_params),
+        f32::from(relationship.tier == Some(RetrievalTier::Exact)),
+        f32::from(relationship.tier == Some(RetrievalTier::Structural)),
+        relationship.relevance,
         1.0 / f32::from(rank),
-        (f32::from(support_proposition_nodes) / 1024.0).min(1.0),
-        (f32::from(support_proof_nodes) / 1024.0).min(1.0),
+        signed_reduction(source_proposition_nodes, support_proposition_nodes),
+        signed_reduction(source_proof_nodes, support_proof_nodes),
         f32::from(source.allowed_axioms == support.allowed_axioms),
-        f32::from(source.dependencies == support.dependencies),
+        relationship.margin,
     ])
+}
+
+fn retrieval_margin(ranked: &[RetrievedDonor], index: usize) -> f32 {
+    (ranked[index].relevance() - ranked.get(index + 1).map_or(0.0, |next| next.relevance()))
+        .max(0.0)
+}
+
+fn bounded_nodes(nodes: usize) -> f32 {
+    f32::from(u16::try_from(nodes).unwrap_or(u16::MAX))
+}
+
+fn signed_reduction(source: f32, support: f32) -> f32 {
+    ((source - support) / source.max(1.0)).clamp(-1.0, 1.0)
 }
 
 impl OperatorAlgebra<LeanDomain> for LeanOperators {
     type Operator = LeanOperator;
     type Application = LeanApplication;
-    type Scratch = ();
+    type Scratch = LeanOperatorScratch;
 
     fn catalog(&self) -> &[OperatorDescriptor<Self::Operator>] {
         &self.catalog
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    fn scratch_resident_bytes(&self, output_capacity: usize) -> u64 {
+        self.retrieval
+            .scratch_resident_bytes(output_capacity.saturating_add(1))
     }
 
     fn enumerate_legal(
         &self,
         requests: OperatorEnumerationBatch<'_, LeanDomain, Self::Operator>,
         output: &mut ApplicationWriter<'_, Self::Application>,
-        _scratch: &mut Self::Scratch,
+        scratch: &mut Self::Scratch,
     ) -> Result<(), LeanError> {
         for location in requests.locations() {
             let source = requests
@@ -1190,7 +1271,7 @@ impl OperatorAlgebra<LeanDomain> for LeanOperators {
                     LeanOperator::ProofSubstitution
                         if is_root_location(source, location.node_index()) =>
                     {
-                        self.substitutions(location.artifact_index(), source, output);
+                        self.substitutions(location.artifact_index(), source, output, scratch);
                     }
                     LeanOperator::Application
                         if is_root_location(source, location.node_index()) =>
@@ -1257,10 +1338,11 @@ impl OperatorAlgebra<LeanDomain> for LeanOperators {
         _scratch: &mut Self::Scratch,
     ) -> Result<(), LeanError> {
         for application in applications {
-            output.push_with_features(
+            output.push_with_provenance(
                 application.source_index,
                 application.candidate.clone(),
                 application.proposal_features,
+                application.proposal_provenance,
             );
         }
         Ok(())
@@ -1952,14 +2034,18 @@ pub fn pinned_environment_identity() -> LeanEnvironmentIdentity {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use reflex::{StructuralProtocol, StructuralView};
+    use cpu_time::ProcessTime;
+    use reflex::{OperatorAlgebra, StructuralProtocol, StructuralView};
 
     use super::{
-        LeanArtifact, LeanConstructor, LeanExpr, LeanStructure, pinned_environment_identity,
+        LeanArtifact, LeanConstructor, LeanExpr, LeanOperatorScratch, LeanOperators, LeanStructure,
+        RetrievalTier, pinned_environment_identity,
     };
     use crate::ast::{LeanBinderInfo, LeanDeclarationIdentity, LeanName};
+    use crate::worker::{LeanWorker, LeanWorkerConfig};
 
     #[test]
     fn cloned_proof_terms_share_immutable_subtrees() {
@@ -2021,8 +2107,16 @@ mod tests {
             ..source.clone()
         };
 
-        let exact_features = super::proposal_features(&source, &exact, 0);
-        let unrelated_features = super::proposal_features(&source, &unrelated, 1);
+        let exact_features = super::proposal_features(
+            &source,
+            &exact,
+            super::SupportRelationship::retrieved(0, RetrievalTier::Exact, 1.0, 1.0),
+        );
+        let unrelated_features = super::proposal_features(
+            &source,
+            &unrelated,
+            super::SupportRelationship::retrieved(1, RetrievalTier::Fallback, 0.0, 0.0),
+        );
 
         let exact_values = exact_features.as_array();
         let unrelated_values = unrelated_features.as_array();
@@ -2032,9 +2126,246 @@ mod tests {
         );
         assert_eq!(
             [unrelated_values[0].to_bits(), unrelated_values[1].to_bits()],
-            [0.0_f32.to_bits(), 1.0_f32.to_bits()]
+            [0.0_f32.to_bits(), 0.0_f32.to_bits()]
         );
         assert_ne!(exact_features, unrelated_features);
+    }
+
+    #[test]
+    fn donor_retrieval_prioritizes_exact_then_structurally_related_propositions() {
+        let source = artifact();
+        let unrelated = LeanArtifact {
+            proposition: LeanExpr::constant(LeanName::from_dotted("False"), vec![]),
+            proof_term: LeanExpr::constant(LeanName::from_dotted("unrelated"), vec![]),
+            ..source.clone()
+        };
+        let boolean = LeanExpr::constant(LeanName::from_dotted("Bool"), vec![]);
+        let structurally_related = LeanArtifact {
+            proposition: LeanExpr::ForallE {
+                name: LeanName::from_dotted("b"),
+                binder_type: Arc::new(boolean.clone()),
+                body: Arc::new(boolean),
+                binder_info: LeanBinderInfo::Default,
+            },
+            proof_term: LeanExpr::constant(LeanName::from_dotted("related"), vec![]),
+            ..source.clone()
+        };
+        let exact = LeanArtifact {
+            proof_term: LeanExpr::constant(LeanName::from_dotted("exact"), vec![]),
+            ..source.clone()
+        };
+        let operators =
+            LeanOperators::new(vec![unrelated, structurally_related, exact.clone()]).unwrap();
+        let mut scratch = LeanOperatorScratch::default();
+
+        assert_eq!(
+            operators
+                .retrieval
+                .rank_prefix(
+                    &source.proposition,
+                    &source.proof_term,
+                    3,
+                    &mut scratch.retrieval,
+                )
+                .iter()
+                .map(|donor| donor.index)
+                .collect::<Vec<_>>(),
+            [2, 1, 0],
+            "bounded generation must see exact and structurally relevant donors before corpus-order noise"
+        );
+
+        let mut applications = Vec::new();
+        operators.substitutions(
+            0,
+            &source,
+            &mut reflex::ApplicationWriter::new(&mut applications),
+            &mut scratch,
+        );
+        assert_eq!(
+            applications
+                .iter()
+                .map(|application| application.candidate.proof_term.clone())
+                .collect::<Vec<_>>(),
+            [
+                LeanExpr::constant(LeanName::from_dotted("exact"), vec![]),
+                LeanExpr::constant(LeanName::from_dotted("related"), vec![]),
+                LeanExpr::constant(LeanName::from_dotted("unrelated"), vec![]),
+            ]
+        );
+        assert_eq!(
+            applications
+                .iter()
+                .map(|application| application.proposal_features.as_array()[3].to_bits())
+                .collect::<Vec<_>>(),
+            [
+                1.0_f32.to_bits(),
+                0.5_f32.to_bits(),
+                (1.0_f32 / 3.0).to_bits()
+            ],
+            "proposal rank must describe emitted retrieval order rather than original corpus position"
+        );
+        assert!(
+            applications
+                .iter()
+                .all(|application| application.proposal_provenance.is_some()),
+            "every supported proposal retains its verified donor identity"
+        );
+
+        let second_exact = LeanArtifact {
+            proof_term: LeanExpr::constant(LeanName::from_dotted("second-exact"), vec![]),
+            ..source.clone()
+        };
+        let tied = LeanOperators::new(vec![exact, second_exact]).unwrap();
+        let tied_ranked = tied.retrieval.rank_prefix(
+            &source.proposition,
+            &source.proof_term,
+            2,
+            &mut scratch.retrieval,
+        );
+        assert_eq!(
+            super::retrieval_margin(tied_ranked, 0).to_bits(),
+            0.0_f32.to_bits(),
+            "the boundary margin must compare against the first omitted donor"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Lean/mathlib installation; Development diagnostic"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the complete frozen Development corpus is intentionally visible in one diagnostic"
+    )]
+    fn premise_retrieval_recalls_known_shorter_proofs_in_the_v11_corpus() {
+        const TRAINING: &[&str] = &[
+            "Nat.bitwise.eq_1",
+            "Filter.EventuallyLE.refl",
+            "exists_eq_ciSup_of_not_isSuccPrelimit'",
+            "LinearMap.map_coprod_prod",
+            "Nat.card_divisors",
+            "MeasureTheory.MeasurePreserving.setLIntegral_comp_emb",
+            "Init.Data.Int.Lemmas._auxLemma.1",
+            "MeasureTheory.Supermartingale.setIntegral_le",
+            "Left.mul_lt_one_of_le_of_lt",
+            "Mathlib.Data.Fin.Basic._auxLemma.9",
+            "Relation.EqvGen.is_equivalence",
+            "dist_triangle",
+            "contMDiffAt_finset_prod'",
+            "Lean.Omega.Fin.not_lt",
+            "lt_of_eq_of_lt",
+            "mul_lt_mul_left'",
+        ];
+        const TRAINING_LIBRARY: &[&str] = &[
+            "exists_eq_ciSup_of_not_isSuccLimit'",
+            "mul_lt_one_of_le_of_lt",
+            "smoothAt_finset_prod'",
+            "ArithmeticFunction.card_divisors",
+            "Eq.trans_lt",
+            "EqvGen.is_equivalence",
+            "Fin.not_lt",
+            "Int.ofNat_add_ofNat",
+            "Int.ofNat_add_out",
+            "LinearMap.coprod_map_prod",
+            "OrderedCommGroup.mul_lt_mul_left'",
+            "PseudoMetricSpace.dist_triangle",
+            "Filter.EventuallyLE.rfl",
+            "MeasureTheory.MeasurePreserving.set_lintegral_comp_emb",
+            "MeasureTheory.Supermartingale.set_integral_le",
+            "Nat.bitwise.eq_def",
+            "Batteries.Classes.Order._auxLemma.7",
+            "Mathlib.AlgebraicTopology.ExtraDegeneracy._auxLemma.5",
+            "Mathlib.AlgebraicTopology.SimplexCategory._auxLemma.13",
+            "Mathlib.CategoryTheory.ComposableArrows._auxLemma.3",
+            "Mathlib.Order.JordanHolder._auxLemma.8",
+            "Init.Data.Fin.Lemmas._auxLemma.15",
+            "Init.Data.Int.DivModLemmas._auxLemma.13",
+            "Mathlib.Algebra.BigOperators.Fin._auxLemma.3",
+            "Mathlib.AlgebraicTopology.DoldKan.Faces._auxLemma.5",
+            "Mathlib.LinearAlgebra.Matrix.ZPow._auxLemma.4",
+            "Mathlib.Data.Int.Cast.Basic._auxLemma.6",
+        ];
+        const COLLAPSES: &[(&str, &str)] = &[
+            (
+                "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+                "CompleteLattice.isCompactlyGenerated_of_wellFounded",
+            ),
+            (
+                "Matrix.det_updateCol_eq_zero",
+                "Matrix.det_updateColumn_eq_zero",
+            ),
+            ("hfdifferential_apply", "apply_hfdifferential"),
+            (
+                "Matrix.fromCols_mul_fromRows",
+                "Matrix.fromColumns_mul_fromRows",
+            ),
+        ];
+        let lake = std::env::var_os("REFLEX_LEAN_LAKE").expect("REFLEX_LEAN_LAKE is required");
+        let mathlib =
+            std::env::var_os("REFLEX_LEAN_MATHLIB").expect("REFLEX_LEAN_MATHLIB is required");
+        let worker = LeanWorker::start(&LeanWorkerConfig::pinned(lake, mathlib)).unwrap();
+        let seed_names = COLLAPSES
+            .iter()
+            .map(|(seed, _)| LeanName::from_dotted(seed))
+            .collect::<Vec<_>>();
+        let library_names = TRAINING
+            .iter()
+            .chain(TRAINING_LIBRARY)
+            .copied()
+            .chain(COLLAPSES.iter().map(|(_, donor)| *donor))
+            .map(LeanName::from_dotted)
+            .collect::<Vec<_>>();
+        let seeds = worker.fetch(&seed_names).unwrap();
+        let library = worker.fetch(&library_names).unwrap();
+        let corpus = super::LeanCorpus::verified_seeds_with_library(&worker, seeds, library)
+            .expect("the retained Development artifacts must still pass the pinned kernel");
+        let donor_indexes = corpus
+            .operator_library()
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| (artifact.declaration.name.to_string(), index))
+            .collect::<HashMap<_, _>>();
+        let build_cpu_started = ProcessTime::now();
+        let operators = LeanOperators::new(corpus.operator_library().to_vec()).unwrap();
+        let build_cpu = build_cpu_started.elapsed();
+        let mut scratch = LeanOperatorScratch::default();
+        let query_cpu_started = ProcessTime::now();
+        let ranks = corpus
+            .entries()
+            .iter()
+            .zip(COLLAPSES)
+            .map(|(entry, (_, donor))| {
+                let expected = donor_indexes[*donor];
+                operators
+                    .retrieval
+                    .rank_prefix(
+                        &entry.artifact.proposition,
+                        &entry.artifact.proof_term,
+                        16,
+                        &mut scratch.retrieval,
+                    )
+                    .iter()
+                    .position(|candidate| candidate.index == expected)
+                    .map(|rank| rank + 1)
+            })
+            .collect::<Vec<_>>();
+        let query_cpu = query_cpu_started.elapsed();
+        let recall = [1, 4, 8, 16].map(|cutoff| {
+            ranks
+                .iter()
+                .filter(|rank| rank.is_some_and(|rank| rank <= cutoff))
+                .count()
+        });
+
+        eprintln!(
+            "premise retrieval ranks={ranks:?} recall@1/4/8/16={recall:?}/{} build_cpu={build_cpu:?} query_cpu={query_cpu:?} index_and_library_bytes={} scratch_bytes={}",
+            COLLAPSES.len(),
+            operators.resident_bytes(),
+            operators.scratch_resident_bytes(16),
+        );
+        assert_eq!(
+            recall[3],
+            COLLAPSES.len(),
+            "every known shorter proof must enter the bounded top-16 generation window"
+        );
     }
 
     #[test]

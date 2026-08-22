@@ -425,6 +425,8 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
     type Scratch: Default + Send + 'static;
 
     fn catalog(&self) -> &[OperatorDescriptor<Self::Operator>];
+    fn resident_bytes(&self) -> u64;
+    fn scratch_resident_bytes(&self, output_capacity: usize) -> u64;
 
     fn enumerate_legal(
         &self,
@@ -442,9 +444,9 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
 }
 ```
 
-`OperatorEnumerationBatch` contains the Runtime-selected Artifacts, explicit structural locations, and primitive Operators. `enumerate_legal` describes deterministic legal parameterizations only at those locations. It may not rank, prune for predicted value, allocate resources, or create its own search loop. The Runtime chooses which Artifacts, locations, and Operators receive attention and how returned applications are scheduled.
+`OperatorEnumerationBatch` contains the Runtime-selected Artifacts, explicit structural locations, and primitive Operators. `enumerate_legal` describes deterministic legal parameterizations only at those locations. It may not rank or prune for predicted value, allocate resources, or create its own search loop; a domain may use goal-independent retrieval to make the legal prefix relevant under a bounded writer. `resident_bytes` and `scratch_resident_bytes` make retained indexes and maximum per-batch workspace for every Runtime lane part of the Resource Envelope before workers start. The Runtime chooses which Artifacts, locations, and Operators receive attention and how returned applications are scheduled.
 
-Primitive and Derived Operators produce Candidates only.
+Primitive and Derived Operators produce Candidates only. A Candidate may retain Proposal Provenance identifying a verified supporting Artifact, plus bounded Proposal Features describing the support relationship. Both survive into Experience for attribution but establish neither correctness nor value.
 
 ### Verification Kernel
 
@@ -874,7 +876,7 @@ A Lean Artifact is a replay-complete elaborated core declaration: declaration na
 
 The binary declaration catalog includes the type, dependency edges, declaration kind, and local eligibility of every declaration exposed by the imported environment. A declaration enters the eligible subgraph only when all transitive dependencies are present and eligible. The compact catalog is checksummed and environment-bound; normal restoration loads it into RAM rather than rescanning Mathlib.
 
-Lean structural views follow the Runtime's canonical post-order convention: every child precedes its parent and the root is last. Primitive Operators cover exact and fingerprint-retrieved proof substitution, directed application and composition, local rewriting, common-subproof factoring, structural anti-unification transfer, eta abstraction, beta/zeta normalization, and syntactic instantiation of general theorems. Retrieval never establishes equivalence: every result remains a Candidate until the Lean kernel accepts it.
+Lean structural views follow the Runtime's canonical post-order convention: every child precedes its parent and the root is last. Primitive Operators cover indexed proof substitution, directed application and composition, local rewriting, common-subproof factoring, structural anti-unification transfer, eta abstraction, beta/zeta normalization, and syntactic instantiation of general theorems. Proof substitution indexes the verified Operator library in RAM: exact proposition matches precede a deterministic symbol-independent structural retrieval tier, with corpus order as the complete fallback. Contiguous sparse postings are merged by bounded cursors into a top-k heap, so query workspace scales with the Candidate window and structural-token bound rather than library size; the index and per-lane worst-case scratch are charged to the Resource Envelope. Retrieval is goal-independent proposal enumeration, not Runtime ranking, and never establishes equivalence; every result remains a Candidate until the Lean kernel accepts it. Stable donor provenance and relation features survive every Candidate Fate into Experience.
 
 The worker's configured memory is a hard Linux address-space ceiling, not an estimate. Because resident memory cannot exceed that ceiling, the Runtime conservatively charges the ceiling to the Resource Envelope on success and failure. Formal Artifacts can differ by millions of expression nodes, so fetch and Verification traffic is paged into single-item protocol transactions; request order and the batch deadline remain unchanged while the worker never retains a batch-wide decoded payload. The fixed Development suite separately gates cold restore and clean replay at 60 seconds, warm first kernel-certified Proof Collapse at 1 second p50 and 5 seconds p95, and exact proof-node improvement on five historical cases. Development timing never constitutes Scientific Confirmation.
 

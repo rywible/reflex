@@ -11,5 +11,8 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["unbounded_depth"] }
 sha2 = { version = "0.11", default-features = false }
 
+[dev-dependencies]
+cpu-time = "1.0"
+
 [lints]
 workspace = true

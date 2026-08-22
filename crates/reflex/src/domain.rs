@@ -423,6 +423,12 @@ impl<'a, A> ApplicationWriter<'a, A> {
         self.remaining == 0
     }
 
+    /// Remaining applications accepted by this bounded enumeration batch.
+    #[must_use]
+    pub fn remaining_capacity(&self) -> usize {
+        self.remaining
+    }
+
     pub(crate) fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -432,6 +438,25 @@ pub struct Candidate<D: DomainDefinition> {
     pub source_index: usize,
     pub artifact: D::Artifact,
     pub proposal_features: ProposalFeatures,
+    pub proposal_provenance: Option<ProposalProvenance>,
+}
+
+/// Stable domain-owned identity for the verified support behind a proposal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProposalProvenance {
+    support_key: [u8; 32],
+}
+
+impl ProposalProvenance {
+    #[must_use]
+    pub const fn new(support_key: [u8; 32]) -> Self {
+        Self { support_key }
+    }
+
+    #[must_use]
+    pub const fn support_key(self) -> [u8; 32] {
+        self.support_key
+    }
 }
 
 /// A bounded advisory description of how an Operator formed a Candidate.
@@ -492,7 +517,7 @@ impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
     }
 
     pub fn push(&mut self, source_index: usize, artifact: D::Artifact) {
-        self.push_with_features(source_index, artifact, ProposalFeatures::default());
+        self.push_with_provenance(source_index, artifact, ProposalFeatures::default(), None);
     }
 
     pub fn push_with_features(
@@ -500,6 +525,16 @@ impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
         source_index: usize,
         artifact: D::Artifact,
         proposal_features: ProposalFeatures,
+    ) {
+        self.push_with_provenance(source_index, artifact, proposal_features, None);
+    }
+
+    pub fn push_with_provenance(
+        &mut self,
+        source_index: usize,
+        artifact: D::Artifact,
+        proposal_features: ProposalFeatures,
+        proposal_provenance: Option<ProposalProvenance>,
     ) {
         if self.remaining == 0 {
             self.overflowed = true;
@@ -509,6 +544,7 @@ impl<'a, D: DomainDefinition> CandidateWriter<'a, D> {
                 source_index,
                 artifact,
                 proposal_features,
+                proposal_provenance,
             });
         }
     }
@@ -524,6 +560,10 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
     type Scratch: Default + Send + 'static;
 
     fn catalog(&self) -> &[OperatorDescriptor<Self::Operator>];
+    /// Resident bytes retained by this Operator implementation.
+    fn resident_bytes(&self) -> u64;
+    /// Maximum scratch bytes needed for a batch with this output capacity.
+    fn scratch_resident_bytes(&self, output_capacity: usize) -> u64;
     fn enumerate_legal(
         &self,
         requests: OperatorEnumerationBatch<'_, D, Self::Operator>,

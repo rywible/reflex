@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use sha2::Digest;
 
-use crate::domain::{DomainDefinition, ProposalFeatures};
+use crate::domain::{DomainDefinition, ProposalFeatures, ProposalProvenance};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, VerdictTarget,
@@ -25,12 +25,13 @@ const FIXED_ENTRY_BYTES: usize = DIGEST_BYTES * 5
     + VERDICT_BYTES
     + 1
     + crate::domain::PROPOSAL_FEATURE_COUNT * FLOAT_BYTES
+    + 1
     + crate::learning::FEATURE_COUNT * FLOAT_BYTES
     + VERIFICATION_REQUEST_BYTES
     + EPOCH_BYTES;
 const FIXED_CONSEQUENCE_BYTES: usize = DIGEST_BYTES + 1;
 const MINIMUM_MEASUREMENT_BYTES: usize = DIGEST_BYTES + SIZED_LENGTH_BYTES * 2;
-const FIXED_CANDIDATE_FATE_BYTES: usize = DIGEST_BYTES * 4 + 8 * 2 + 4 * 6 + 1 + 1;
+const FIXED_CANDIDATE_FATE_BYTES: usize = DIGEST_BYTES * 4 + 8 * 2 + 4 * 6 + 1 + 1 + 1;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ExperienceVerdict {
@@ -51,6 +52,7 @@ pub(super) struct ExperienceEntry {
     pub(super) allocation_queue: AllocationQueue,
     pub(super) operator_symbol: Vec<u8>,
     pub(super) proposal_features: ProposalFeatures,
+    pub(super) proposal_provenance: Option<ProposalProvenance>,
     pub(super) features: Features,
     pub(super) verification_requests: u32,
     pub(super) epoch: u64,
@@ -63,6 +65,7 @@ impl ExperienceEntry {
             claim_digest: self.claim_digest,
             parent_key: self.parent_key,
             operator_digest: sha2::Sha256::digest(&self.operator_symbol).into(),
+            proposal_provenance: self.proposal_provenance,
             epoch: self.epoch,
         }
     }
@@ -128,6 +131,7 @@ pub(super) struct CandidateFateObservation {
     pub(super) claim_digest: [u8; 32],
     pub(super) parent_key: ArtifactKey,
     pub(super) operator_digest: [u8; 32],
+    pub(super) proposal_provenance: Option<ProposalProvenance>,
     pub(super) epoch: u64,
     pub(super) generation_rank: u32,
     pub(super) proposal_limit: u32,
@@ -147,6 +151,7 @@ impl CandidateFateObservation {
             claim_digest: self.claim_digest,
             parent_key: self.parent_key,
             operator_digest: self.operator_digest,
+            proposal_provenance: self.proposal_provenance,
             epoch: self.epoch,
         }
     }
@@ -229,6 +234,7 @@ pub(super) struct CandidateFateKey {
     claim_digest: [u8; 32],
     parent_key: ArtifactKey,
     operator_digest: [u8; 32],
+    proposal_provenance: Option<ProposalProvenance>,
     epoch: u64,
 }
 
@@ -377,6 +383,11 @@ impl ExperienceLedger {
             let operator_symbol = read_sized(&mut input)?.to_vec();
             let mut proposal_values = [0.0; crate::domain::PROPOSAL_FEATURE_COUNT];
             read_finite_features(&mut input, &mut proposal_values)?;
+            let proposal_provenance = match take(&mut input, 1)?[0] {
+                0 => None,
+                1 => Some(ProposalProvenance::new(read_digest(&mut input)?)),
+                _ => return Err(()),
+            };
             let mut feature_values = [0.0; crate::learning::FEATURE_COUNT];
             read_finite_features(&mut input, &mut feature_values)?;
             let verification_requests = u32::from_le_bytes(
@@ -396,6 +407,7 @@ impl ExperienceLedger {
                 allocation_queue,
                 operator_symbol,
                 proposal_features: ProposalFeatures::new(proposal_values),
+                proposal_provenance,
                 features: Features(feature_values),
                 verification_requests,
                 epoch,
@@ -613,6 +625,12 @@ impl ExperienceLedger {
             for feature in entry.proposal_features.as_array() {
                 output.extend_from_slice(&feature.to_bits().to_le_bytes());
             }
+            if let Some(provenance) = entry.proposal_provenance {
+                output.push(1);
+                output.extend_from_slice(&provenance.support_key());
+            } else {
+                output.push(0);
+            }
             for feature in entry.features.0 {
                 output.extend_from_slice(&feature.to_bits().to_le_bytes());
             }
@@ -645,6 +663,12 @@ impl ExperienceLedger {
             output.extend_from_slice(&fate.claim_digest);
             output.extend_from_slice(fate.parent_key.as_bytes());
             output.extend_from_slice(&fate.operator_digest);
+            if let Some(provenance) = fate.proposal_provenance {
+                output.push(1);
+                output.extend_from_slice(&provenance.support_key());
+            } else {
+                output.push(0);
+            }
             output.extend_from_slice(&fate.epoch.to_le_bytes());
             output.extend_from_slice(&fate.generation_rank.to_le_bytes());
             output.extend_from_slice(&fate.proposal_limit.to_le_bytes());
@@ -709,6 +733,11 @@ fn decode_candidate_fates(input: &mut &[u8]) -> Result<Vec<CandidateFateObservat
         let claim_digest = read_digest(input)?;
         let parent_key = ArtifactKey(read_digest(input)?);
         let operator_digest = read_digest(input)?;
+        let proposal_provenance = match take(input, 1)?[0] {
+            0 => None,
+            1 => Some(ProposalProvenance::new(read_digest(input)?)),
+            _ => return Err(()),
+        };
         let epoch = read_u64(input)?;
         let generation_rank = read_u32(input)?;
         let proposal_limit = read_u32(input)?;
@@ -741,6 +770,7 @@ fn decode_candidate_fates(input: &mut &[u8]) -> Result<Vec<CandidateFateObservat
             claim_digest,
             parent_key,
             operator_digest,
+            proposal_provenance,
             epoch,
             generation_rank,
             proposal_limit,
@@ -878,6 +908,8 @@ mod tests {
                     allocation_queue: AllocationQueue::Bootstrap,
                     operator_symbol: vec![marker],
                     proposal_features: ProposalFeatures::default(),
+                    proposal_provenance: (index == 0)
+                        .then_some(ProposalProvenance::new([0xa5; 32])),
                     features: Features([0.0; crate::learning::FEATURE_COUNT]),
                     verification_requests: 1,
                     epoch: u64::try_from(index).unwrap(),
@@ -912,6 +944,8 @@ mod tests {
                     claim_digest: [marker; 32],
                     parent_key: ArtifactKey([marker; 32]),
                     operator_digest: [marker; 32],
+                    proposal_provenance: (index == 0)
+                        .then_some(ProposalProvenance::new([0x5a; 32])),
                     epoch: if matches!(
                         disposition,
                         CandidateFateDisposition::VerifiedAccepted
@@ -992,6 +1026,7 @@ mod tests {
             claim_digest: [marker; 32],
             parent_key: ArtifactKey([marker; 32]),
             operator_digest: [marker; 32],
+            proposal_provenance: None,
             epoch: 7,
             generation_rank: u32::from(marker),
             proposal_limit: 8,

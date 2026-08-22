@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod catalog;
 pub mod domain;
+mod retrieval;
 #[doc(hidden)]
 pub mod temporal;
 pub mod worker;

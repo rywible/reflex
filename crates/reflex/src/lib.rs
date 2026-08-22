@@ -21,8 +21,8 @@ pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
     ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
     ExternalVerificationUsage, ImmediateArity, KernelRevision, OperatorAlgebra, OperatorDescriptor,
-    OperatorEnumerationBatch, ProposalFeatures, Seed, SeedPage, SeedSource, SeedWriter,
-    SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
+    OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, Seed, SeedPage, SeedSource,
+    SeedWriter, SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
     VerdictWriter, VerificationAllowance, VerificationBatch, VerificationBatchOutcome,
     VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayBatch,
     VerificationWorkerRequirements,

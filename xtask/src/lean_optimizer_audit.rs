@@ -30,7 +30,7 @@ use crate::harness::{
     require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v14";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v15";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -249,6 +249,7 @@ struct DonorTrace {
     operational_policy_rank: u32,
     strict_improvement: bool,
     feature_bits: Vec<u32>,
+    support_key_sha256: Option<String>,
     proof_term_sha256: Option<String>,
     donor_declarations: Vec<String>,
 }
@@ -451,7 +452,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v11";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v12";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
@@ -1369,8 +1370,13 @@ fn substitution_information_audit(
     donor_context: Option<(&LeanDomain, &[LeanArtifact])>,
 ) -> Result<DonorAudit, AnyError> {
     let mut donors_by_proof = HashMap::<[u8; 32], Vec<String>>::new();
+    let mut donors_by_support = HashMap::<[u8; 32], Vec<String>>::new();
     if let Some((_, library)) = donor_context {
         for artifact in library {
+            donors_by_support
+                .entry(Sha256::digest(serde_json::to_vec(artifact)?).into())
+                .or_default()
+                .push(artifact.declaration.name.to_string());
             donors_by_proof
                 .entry(proof_term_digest(&artifact.proof_term)?)
                 .or_default()
@@ -1378,6 +1384,10 @@ fn substitution_information_audit(
         }
     }
     for declarations in donors_by_proof.values_mut() {
+        declarations.sort_unstable();
+        declarations.dedup();
+    }
+    for declarations in donors_by_support.values_mut() {
         declarations.sort_unstable();
         declarations.dedup();
     }
@@ -1417,22 +1427,29 @@ fn substitution_information_audit(
             .get(&(attempt.candidate_key, attempt.claim_digest, attempt.epoch))
             .copied()
             .ok_or("Lean proof-substitution attempt has no matching Verified Candidate Fate")?;
-        let donor = if let Some((domain, _)) = donor_context {
+        let proof_digest = if let Some((domain, _)) = donor_context {
             let candidate = domain
                 .structure()
                 .decode_canonical(&attempt.canonical_candidate, &mut scratch)
                 .map_err(|_| "Lean Candidate Experience has malformed canonical structure")?;
             let proof_digest = proof_term_digest(&candidate.proof_term)?;
-            Some((
-                proof_digest,
-                donors_by_proof
-                    .get(&proof_digest)
-                    .cloned()
-                    .unwrap_or_default(),
-            ))
+            Some(proof_digest)
         } else {
             None
         };
+        let donor_declarations = attempt.support_key.map_or_else(
+            || {
+                proof_digest.map_or_else(Vec::new, |digest| {
+                    donors_by_proof.get(&digest).cloned().unwrap_or_default()
+                })
+            },
+            |support_key| {
+                donors_by_support
+                    .get(&support_key)
+                    .cloned()
+                    .unwrap_or_default()
+            },
+        );
         traces.push(DonorTrace {
             candidate_key: hex(&attempt.candidate_key),
             claim_digest: hex(&attempt.claim_digest),
@@ -1445,8 +1462,9 @@ fn substitution_information_audit(
             operational_policy_rank,
             strict_improvement,
             feature_bits: attempt.feature_bits.clone(),
-            proof_term_sha256: donor.as_ref().map(|(digest, _)| hex(digest)),
-            donor_declarations: donor.map_or_else(Vec::new, |(_, declarations)| declarations),
+            support_key_sha256: attempt.support_key.as_ref().map(|key| hex(key)),
+            proof_term_sha256: proof_digest.as_ref().map(|digest| hex(digest)),
+            donor_declarations,
         });
     }
     summarize_substitution_information(traces)
@@ -1955,6 +1973,7 @@ mod tests {
                 operational_policy_rank: rank,
                 strict_improvement: marker == "accepted",
                 feature_bits,
+                support_key_sha256: None,
                 proof_term_sha256: Some(marker.into()),
                 donor_declarations,
             }
@@ -2022,6 +2041,7 @@ mod tests {
                 claim_digest: [1; 32],
                 parent_key: [2; 32],
                 operator_digest: [3; 32],
+                support_key: None,
                 epoch: 7,
                 generation_rank: rank,
                 proposal_limit: 8,

@@ -1676,6 +1676,18 @@ impl OperatorAlgebra<BitVecDomain> for ExpressionOperators {
         &self.catalog
     }
 
+    fn resident_bytes(&self) -> u64 {
+        (self.catalog.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<OperatorDescriptor<PrimitiveOperator>>() as u64)
+            .saturating_add(self.catalog.iter().fold(0_u64, |bytes, descriptor| {
+                bytes.saturating_add(descriptor.symbol().as_str().len() as u64)
+            }))
+    }
+
+    fn scratch_resident_bytes(&self, _output_capacity: usize) -> u64 {
+        0
+    }
+
     fn enumerate_legal(
         &self,
         requests: OperatorEnumerationBatch<'_, BitVecDomain, Self::Operator>,
