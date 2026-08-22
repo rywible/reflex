@@ -46,6 +46,20 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     )
     .unwrap();
     let trained_snapshot = snapshot(&trained);
+    assert!(
+        trained_snapshot.candidate_fates.iter().any(|fate| {
+            matches!(
+                fate.outcome,
+                CandidateFateOutcomeInspection::Verified {
+                    allocation_queue: CandidateAllocationQueueInspection::ProtectedOrigin,
+                    bootstrap_rank: Some(_),
+                    learned_rank: None,
+                    ..
+                }
+            )
+        }),
+        "protected Bootstrap work must retain its counterfactual Bootstrap rank"
+    );
     let training_claims = trained_snapshot
         .attempts
         .iter()
@@ -215,6 +229,22 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
     )
     .unwrap();
     let learned_full = snapshot(&learned_full);
+    let learned_full_fates =
+        &learned_full.candidate_fates[trained_snapshot.candidate_fates.len()..];
+    assert!(
+        learned_full_fates.iter().any(|fate| {
+            matches!(
+                fate.outcome,
+                CandidateFateOutcomeInspection::Verified {
+                    allocation_queue: CandidateAllocationQueueInspection::ProtectedOrigin,
+                    bootstrap_rank: Some(_),
+                    learned_rank: Some(_),
+                    ..
+                }
+            )
+        }),
+        "protected learned work must retain both counterfactual policy ranks"
+    );
     let bootstrap_full = snapshot(&bootstrap_full);
     let learned_semantics = learned_full.attempts[trained_snapshot.attempts.len()..]
         .iter()

@@ -153,7 +153,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 7;
+const RUNTIME_REVISION: u64 = 8;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -2004,6 +2004,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
     candidates: &mut Vec<ProposedCandidate<D>>,
     candidate_fates: &mut [CandidateFateObservation],
 ) {
+    rank_all_candidates(goals, frontier, model, candidates, candidate_fates);
     let (mut origin_exploration, remaining) =
         partition_origin_exploration(frontier, std::mem::take(candidates), limit);
     let (mut derived_exploration, mut unprotected) = partition_derived_exploration(remaining);
@@ -2013,35 +2014,28 @@ fn order_by_learned_potential<D: DomainDefinition>(
     for candidate in &mut derived_exploration {
         candidate.allocation_queue = AllocationQueue::ProtectedDerived;
     }
-    let bootstrap_compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
-        goals.compare_parents(frontier, left, right).then_with(|| {
-            left.operator_symbol
-                .cmp(&right.operator_symbol)
-                .then_with(|| {
-                    left.candidate
-                        .source_index
-                        .cmp(&right.candidate.source_index)
-                })
-        })
+    let bootstrap_rank = |candidate: &ProposedCandidate<D>| {
+        candidate
+            .bootstrap_rank
+            .value()
+            .expect("all novel Candidates retain a Bootstrap rank")
     };
-    sort_prefix_by(&mut derived_exploration, limit, bootstrap_compare);
+    sort_prefix_by(&mut derived_exploration, limit, |left, right| {
+        bootstrap_rank(left).cmp(&bootstrap_rank(right))
+    });
     if model.is_none() {
-        unprotected.sort_unstable_by(bootstrap_compare);
+        unprotected.sort_unstable_by_key(bootstrap_rank);
     }
     let mut bootstrap = (0..unprotected.len()).collect::<Vec<_>>();
     if model.is_some() {
-        bootstrap.sort_unstable_by(|left, right| {
-            bootstrap_compare(&unprotected[*left], &unprotected[*right])
+        bootstrap.sort_unstable_by_key(|candidate| {
+            unprotected[*candidate]
+                .bootstrap_rank
+                .value()
+                .expect("all novel Candidates retain a Bootstrap rank")
         });
     }
-    for (rank, candidate) in bootstrap.iter().copied().enumerate() {
-        let rank = CandidateRank::present(
-            u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
-        );
-        unprotected[candidate].bootstrap_rank = rank;
-        candidate_fates[unprotected[candidate].fate_index].bootstrap_rank = rank;
-    }
-    let Some(model) = model else {
+    let Some(_) = model else {
         apply_operational_order(
             origin_exploration,
             derived_exploration,
@@ -2053,37 +2047,13 @@ fn order_by_learned_potential<D: DomainDefinition>(
         );
         return;
     };
-    let ranked_features = unprotected
-        .iter()
-        .map(|candidate| candidate.features)
-        .collect::<Vec<_>>();
-    let mut forecasts = Vec::with_capacity(ranked_features.len());
-    model.forecast_batch(&ranked_features, &mut forecasts);
     let mut learned = (0..unprotected.len()).collect::<Vec<_>>();
-    learned.sort_unstable_by(|left, right| {
-        compare_forecasts(forecasts[*left], forecasts[*right])
-            .then_with(|| {
-                goals.compare_parents(frontier, &unprotected[*left], &unprotected[*right])
-            })
-            .then_with(|| {
-                unprotected[*left]
-                    .operator_symbol
-                    .cmp(&unprotected[*right].operator_symbol)
-                    .then_with(|| {
-                        unprotected[*left]
-                            .candidate
-                            .source_index
-                            .cmp(&unprotected[*right].candidate.source_index)
-                    })
-            })
+    learned.sort_unstable_by_key(|candidate| {
+        unprotected[*candidate]
+            .learned_rank
+            .value()
+            .expect("active-model Candidates retain a learned rank")
     });
-    for (rank, candidate) in learned.iter().copied().enumerate() {
-        let rank = CandidateRank::present(
-            u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
-        );
-        unprotected[candidate].learned_rank = rank;
-        candidate_fates[unprotected[candidate].fate_index].learned_rank = rank;
-    }
     apply_operational_order(
         origin_exploration,
         derived_exploration,
@@ -2093,6 +2063,69 @@ fn order_by_learned_potential<D: DomainDefinition>(
         limit,
         candidates,
     );
+}
+
+fn rank_all_candidates<D: DomainDefinition>(
+    goals: &GoalEvaluator<'_, D>,
+    frontier: &[(VerifiedArtifact<D>, usize)],
+    model: Option<&FtrlModel>,
+    candidates: &mut [ProposedCandidate<D>],
+    candidate_fates: &mut [CandidateFateObservation],
+) {
+    let bootstrap_compare = |left: &ProposedCandidate<D>, right: &ProposedCandidate<D>| {
+        goals.compare_parents(frontier, left, right).then_with(|| {
+            left.operator_symbol
+                .cmp(&right.operator_symbol)
+                .then_with(|| {
+                    left.candidate
+                        .source_index
+                        .cmp(&right.candidate.source_index)
+                })
+        })
+    };
+    let mut global_bootstrap = (0..candidates.len()).collect::<Vec<_>>();
+    global_bootstrap
+        .sort_unstable_by(|left, right| bootstrap_compare(&candidates[*left], &candidates[*right]));
+    for (rank, candidate) in global_bootstrap.into_iter().enumerate() {
+        let rank = CandidateRank::present(
+            u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
+        );
+        candidates[candidate].bootstrap_rank = rank;
+        candidate_fates[candidates[candidate].fate_index].bootstrap_rank = rank;
+    }
+    if let Some(model) = model {
+        let ranked_features = candidates
+            .iter()
+            .map(|candidate| candidate.features)
+            .collect::<Vec<_>>();
+        let mut forecasts = Vec::with_capacity(ranked_features.len());
+        model.forecast_batch(&ranked_features, &mut forecasts);
+        let mut global_learned = (0..candidates.len()).collect::<Vec<_>>();
+        global_learned.sort_unstable_by(|left, right| {
+            compare_forecasts(forecasts[*left], forecasts[*right])
+                .then_with(|| {
+                    goals.compare_parents(frontier, &candidates[*left], &candidates[*right])
+                })
+                .then_with(|| {
+                    candidates[*left]
+                        .operator_symbol
+                        .cmp(&candidates[*right].operator_symbol)
+                        .then_with(|| {
+                            candidates[*left]
+                                .candidate
+                                .source_index
+                                .cmp(&candidates[*right].candidate.source_index)
+                        })
+                })
+        });
+        for (rank, candidate) in global_learned.into_iter().enumerate() {
+            let rank = CandidateRank::present(
+                u32::try_from(rank).expect("Candidate count is bounded below u32::MAX"),
+            );
+            candidates[candidate].learned_rank = rank;
+            candidate_fates[candidates[candidate].fate_index].learned_rank = rank;
+        }
+    }
 }
 
 fn apply_operational_order<D: DomainDefinition>(
