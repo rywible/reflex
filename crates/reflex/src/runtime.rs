@@ -1410,28 +1410,28 @@ fn structural_opportunity_features<C: Copy + Eq>(
 ) -> Features {
     const NODE_SCALE: f32 = 11.512_936;
     const DEPTH_SCALE: f32 = 11.090_37;
-    let signed_log_ratio = |parent: f32, candidate: f32, scale: f32| {
-        ((parent + 1.0).ln() - (candidate + 1.0).ln()).clamp(-scale, scale) / scale
-    };
     let mut values = [0.0; crate::learning::FEATURE_COUNT];
+    let parent_nodes = parent.node_count.min(f32::from(u16::MAX));
+    let candidate_nodes = candidate.node_count.min(f32::from(u16::MAX));
+    let reduction = ((parent_nodes - candidate_nodes) / parent_nodes.max(1.0)).clamp(-1.0, 1.0);
     values[0] = 1.0;
-    values[1] = (parent.node_count.ln_1p() / NODE_SCALE).min(1.0);
-    values[2] = (candidate.node_count.ln_1p() / NODE_SCALE).min(1.0);
-    values[3] = signed_log_ratio(parent.node_count, candidate.node_count, NODE_SCALE);
-    values[4] = (candidate.depth.ln_1p() / DEPTH_SCALE).min(1.0);
-    values[5] = signed_log_ratio(parent.depth, candidate.depth, DEPTH_SCALE);
-    values[6] = parent
+    values[1] = (parent_nodes / 1024.0).min(1.0);
+    values[2] = (candidate_nodes / 1024.0).min(1.0);
+    values[3] = reduction;
+    values[4] = (candidate.node_count.ln_1p() / NODE_SCALE).min(1.0);
+    let digest = Sha256::digest(operator_symbol.as_bytes());
+    values[5 + usize::from(digest[0] % 8)] = 1.0;
+    values[13] = (candidate.depth.ln_1p() / DEPTH_SCALE).min(1.0);
+    values[14] = parent
         .constructor_frequencies
         .iter()
         .zip(&candidate.constructor_frequencies)
         .map(|(parent, candidate)| (parent - candidate).abs())
         .sum::<f32>()
         / 2.0;
-    values[7] = f32::from(
+    values[15] = f32::from(
         parent.root_constructor.is_some() && parent.root_constructor == candidate.root_constructor,
     );
-    let digest = Sha256::digest(operator_symbol.as_bytes());
-    values[8 + usize::from(digest[0] % 8)] = 1.0;
     Features(values)
 }
 
