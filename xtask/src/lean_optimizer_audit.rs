@@ -30,7 +30,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v16";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v17";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -358,6 +358,7 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
         "reflex-lean-public-optimizer-supervisor-{}",
         std::process::id()
     ));
+    let phase_report_prefix = parsed.work.join("runtime-phase");
     let (capture, isolation) = capture_child_host_isolated(
         &executable,
         &child_arguments,
@@ -368,10 +369,16 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
             memory_reserve_bytes: HOST_MEMORY_RESERVE_BYTES,
             cpu_reserve: HOST_CPU_RESERVE,
         },
-        &[(
-            OsString::from("REFLEX_LEAN_OPTIMIZER_SUPERVISOR_CAPABILITY"),
-            OsString::from(SUPERVISOR_CAPABILITY),
-        )],
+        &[
+            (
+                OsString::from("REFLEX_LEAN_OPTIMIZER_SUPERVISOR_CAPABILITY"),
+                OsString::from(SUPERVISOR_CAPABILITY),
+            ),
+            (
+                OsString::from("REFLEX_INTERNAL_PHASE_REPORT_PREFIX"),
+                phase_report_prefix.into_os_string(),
+            ),
+        ],
     )?;
     if capture.status.success() && !capture.timed_out && !capture.resident_limit_exceeded {
         print!("{}", capture.stdout);
@@ -461,7 +468,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
 }
 
 pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
-    const SCHEMA: &str = "reflex-lean-model-feature-development-v13";
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v14";
     require_release("lean-model-feature-development")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;

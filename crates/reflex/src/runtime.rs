@@ -227,7 +227,7 @@ const CHOICES_PER_VERIFICATION: u64 = 8;
 const GENERATION_COHORT_LOOKAHEAD: u64 = 2;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 12;
+const RUNTIME_REVISION: u64 = 13;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1245,9 +1245,15 @@ where
             &parent_claims,
             &covered_claims,
         );
+        let catalog = domain.operators().catalog();
         let available_resident = resource_meter.available_resident(resident_before_epoch);
-        let generation_limit =
-            candidate_generation_limit(cohort_limit, remaining_verifications, available_resident);
+        let generation_limit = candidate_generation_limit(
+            cohort_limit,
+            remaining_verifications,
+            pending_parent_indexes.len(),
+            catalog.len(),
+            available_resident,
+        );
         if generation_limit == 0 {
             resident_budget_exhausted = true;
             break;
@@ -1261,7 +1267,6 @@ where
             resident_budget_exhausted = true;
             break;
         }
-        let catalog = domain.operators().catalog();
         let has_derived = !pending_parent_indexes.is_empty()
             && pinned_knowledge
                 .operators()
@@ -2137,15 +2142,21 @@ fn candidate_pipeline_reserve<D: DomainDefinition>(
 fn candidate_generation_limit(
     cohort_limit: usize,
     remaining_verifications: u64,
+    pending_parent_count: usize,
+    operator_count: usize,
     available_resident: u64,
 ) -> usize {
-    let verification_lookahead = u64::try_from(cohort_limit)
-        .unwrap_or(u64::MAX)
+    let cohort_limit = u64::try_from(cohort_limit).unwrap_or(u64::MAX);
+    let lookahead_parents = cohort_limit
         .saturating_mul(GENERATION_COHORT_LOOKAHEAD)
-        .min(remaining_verifications);
-    let cohort_choices = verification_lookahead.saturating_mul(CHOICES_PER_VERIFICATION);
+        .min(remaining_verifications)
+        .min(u64::try_from(pending_parent_count).unwrap_or(u64::MAX));
+    let cohort_choices = cohort_limit.saturating_mul(CHOICES_PER_VERIFICATION);
+    let operator_breadth =
+        lookahead_parents.saturating_mul(u64::try_from(operator_count).unwrap_or(u64::MAX));
     usize::try_from(
         cohort_choices
+            .max(operator_breadth)
             .min(available_resident / MIN_CHOICE_RESIDENT_BYTES)
             .min(MAX_CANDIDATE_CHOICES),
     )
@@ -4640,11 +4651,11 @@ mod tests {
     }
 
     #[test]
-    fn candidate_generation_is_bounded_by_two_verification_cohorts() {
-        assert_eq!(candidate_generation_limit(24, 1_008, u64::MAX), 384);
-        assert_eq!(candidate_generation_limit(8, 10, u64::MAX), 80);
-        assert_eq!(candidate_generation_limit(24, 1_008, 64 * 1024), 8);
-        assert_eq!(candidate_generation_limit(0, 1_008, u64::MAX), 0);
+    fn candidate_generation_covers_one_cohort_and_two_cohorts_of_operator_breadth() {
+        assert_eq!(candidate_generation_limit(24, 1_008, 16, 9, u64::MAX), 192);
+        assert_eq!(candidate_generation_limit(8, 10, 32, 8, u64::MAX), 80);
+        assert_eq!(candidate_generation_limit(24, 1_008, 16, 9, 64 * 1024), 8);
+        assert_eq!(candidate_generation_limit(0, 1_008, 16, 9, u64::MAX), 0);
     }
 
     #[test]
