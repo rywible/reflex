@@ -87,10 +87,6 @@ structure TheoremFingerprint where
   name : WireName
   moduleName : WireName
   statementHash : UInt64
-  statementNodes : Nat
-  statementDepth : Nat
-  valueNodes : Nat
-  valueDepth : Nat
   dependencies : Array WireName
   kind : String
   locallyEligible : Bool
@@ -365,25 +361,6 @@ def locallyEligible (name : Name) (info : ConstantInfo) : Bool :=
     | some value => !value.hasSorry
     | none => true
 
-partial def expressionNodes : Expr → Nat
-  | .app function argument => 1 + expressionNodes function + expressionNodes argument
-  | .lam _ type body _ | .forallE _ type body _ => 1 + expressionNodes type + expressionNodes body
-  | .letE _ type value body _ =>
-      1 + expressionNodes type + expressionNodes value + expressionNodes body
-  | .mdata _ expression => 1 + expressionNodes expression
-  | .proj _ _ subject => 1 + expressionNodes subject
-  | _ => 1
-
-partial def expressionDepth : Expr → Nat
-  | .app function argument => 1 + max (expressionDepth function) (expressionDepth argument)
-  | .lam _ type body _ | .forallE _ type body _ =>
-      1 + max (expressionDepth type) (expressionDepth body)
-  | .letE _ type value body _ =>
-      1 + max (expressionDepth type) (max (expressionDepth value) (expressionDepth body))
-  | .mdata _ expression => 1 + expressionDepth expression
-  | .proj _ _ subject => 1 + expressionDepth subject
-  | _ => 1
-
 def declarationModule (env : Environment) (name : Name) : Name :=
   match env.getModuleIdxFor? name with
   | some index => (env.allImportedModuleNames.get? index).getD .anonymous
@@ -417,12 +394,6 @@ partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allN
       let fingerprints := (allNames.extract offset (min allNames.size (offset + limit))).filterMap fun name =>
         match env.find? name with
         | some info =>
-          let (statementNodes, statementDepth, valueNodes, valueDepth) :=
-            match info with
-            | .thmInfo theoremInfo =>
-              (expressionNodes theoremInfo.type, expressionDepth theoremInfo.type,
-                expressionNodes theoremInfo.value, expressionDepth theoremInfo.value)
-            | _ => (0, 0, 0, 0)
           let dependencies := Id.run do
             let mut found : NameSet := {}
             for dependency in info.type.getUsedConstants do
@@ -434,10 +405,6 @@ partial def serve (env : Environment) (cache : AnalysisCache) (theoremNames allN
             name := WireName.ofLean name
             moduleName := WireName.ofLean (declarationModule env name)
             statementHash := hash info.type
-            statementNodes
-            statementDepth
-            valueNodes
-            valueDepth
             dependencies := dependencies.map WireName.ofLean
             kind := declarationKind info
             locallyEligible := locallyEligible name info

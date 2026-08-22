@@ -61,10 +61,6 @@ pub struct TemporalExample {
     pub declaration: LeanName,
     pub module: LeanName,
     pub semantic_group: [u8; 32],
-    pub statement_nodes: usize,
-    pub statement_depth: usize,
-    pub proof_nodes: usize,
-    pub proof_depth: usize,
     pub features: Vec<f32>,
     pub targets: [f32; POTENTIAL_HEADS],
 }
@@ -162,10 +158,6 @@ struct GraphEntry {
     name: LeanName,
     module: LeanName,
     statement_hash: u64,
-    statement_nodes: usize,
-    statement_depth: usize,
-    value_nodes: usize,
-    value_depth: usize,
     dependencies: Vec<LeanName>,
     kind: DeclarationKind,
     inbound: usize,
@@ -223,10 +215,6 @@ impl TemporalSnapshot {
                 declaration: entry.name.clone(),
                 module: entry.module.clone(),
                 semantic_group: semantic_group(entry),
-                statement_nodes: entry.statement_nodes,
-                statement_depth: entry.statement_depth,
-                proof_nodes: entry.value_nodes,
-                proof_depth: entry.value_depth,
                 features: features(entry),
                 targets: [0.0; POTENTIAL_HEADS],
             })
@@ -355,10 +343,6 @@ impl TemporalPair {
                     declaration: entry.name.clone(),
                     module: entry.module.clone(),
                     semantic_group: semantic_group(entry),
-                    statement_nodes: entry.statement_nodes,
-                    statement_depth: entry.statement_depth,
-                    proof_nodes: entry.value_nodes,
-                    proof_depth: entry.value_depth,
                     features: features(entry),
                     targets: [
                         f32::from(anticipated),
@@ -1017,10 +1001,6 @@ fn graph_entry(catalog: &LeanCatalog, entry: &CatalogEntry) -> Option<GraphEntry
         name: catalog.name(entry.name)?,
         module: catalog.name(entry.module_name)?,
         statement_hash: entry.statement_hash,
-        statement_nodes: entry.statement_nodes,
-        statement_depth: entry.statement_depth,
-        value_nodes: entry.value_nodes,
-        value_depth: entry.value_depth,
         dependencies: entry
             .dependencies
             .iter()
@@ -1058,10 +1038,6 @@ fn features(entry: &GraphEntry) -> Vec<f32> {
     features[1] = (bounded_f32(entry.dependencies.len()) + 1.0).ln_1p() / 8.0;
     features[2] = (bounded_f32(entry.inbound) + 1.0).ln_1p() / 8.0;
     features[3 + usize::from(entry.kind.code())] = 1.0;
-    features[11] = bounded_f32(entry.statement_nodes).ln_1p() / 16.0;
-    features[12] = bounded_f32(entry.statement_depth).ln_1p() / 8.0;
-    features[13] = bounded_f32(entry.value_nodes).ln_1p() / 16.0;
-    features[14] = bounded_f32(entry.value_depth).ln_1p() / 8.0;
     for bit in 0..32 {
         let pair = u8::try_from((entry.statement_hash >> (bit * 2)) & 3)
             .expect("two statement-hash bits fit in u8");
@@ -1115,10 +1091,6 @@ mod tests {
             name: LeanName::from_dotted(name),
             module: LeanName::from_dotted("Test.Module"),
             statement_hash: name.bytes().map(u64::from).sum(),
-            statement_nodes: 3,
-            statement_depth: 2,
-            value_nodes: 5,
-            value_depth: 3,
             dependencies: dependencies
                 .iter()
                 .map(|name| LeanName::from_dotted(name))
@@ -1137,10 +1109,6 @@ mod tests {
             declaration: LeanName::from_dotted(&format!("T{index}")),
             module: LeanName::from_dotted("Test.Module"),
             semantic_group: [index; 32],
-            statement_nodes: 3,
-            statement_depth: 2,
-            proof_nodes: 5,
-            proof_depth: 3,
             features,
             targets: [
                 f32::from(useful),

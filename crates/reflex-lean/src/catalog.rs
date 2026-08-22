@@ -67,10 +67,6 @@ pub struct CatalogEntry {
     pub name: u32,
     pub module_name: u32,
     pub statement_hash: u64,
-    pub statement_nodes: usize,
-    pub statement_depth: usize,
-    pub value_nodes: usize,
-    pub value_depth: usize,
     pub dependencies: Vec<u32>,
     pub kind: DeclarationKind,
     pub locally_eligible: bool,
@@ -124,10 +120,6 @@ impl LeanCatalog {
                     name,
                     module_name,
                     statement_hash,
-                    statement_nodes: fingerprint.statement_nodes,
-                    statement_depth: fingerprint.statement_depth,
-                    value_nodes: fingerprint.value_nodes,
-                    value_depth: fingerprint.value_depth,
                     dependencies,
                     kind: DeclarationKind::parse(&fingerprint.kind)?,
                     locally_eligible: fingerprint.locally_eligible,
@@ -192,10 +184,6 @@ impl LeanCatalog {
             let name = decoder.name_id(name_count)?;
             let module_name = decoder.name_id(name_count)?;
             let statement_hash = decoder.u64()?;
-            let statement_nodes = decoder.usize()?;
-            let statement_depth = decoder.usize()?;
-            let value_nodes = decoder.usize()?;
-            let value_depth = decoder.usize()?;
             let dependency_count = decoder.usize()?;
             let mut dependencies = Vec::with_capacity(dependency_count);
             for _ in 0..dependency_count {
@@ -205,10 +193,6 @@ impl LeanCatalog {
                 name,
                 module_name,
                 statement_hash,
-                statement_nodes,
-                statement_depth,
-                value_nodes,
-                value_depth,
                 dependencies,
                 kind: DeclarationKind::decode(decoder.byte()?)?,
                 locally_eligible: decoder.boolean()?,
@@ -350,10 +334,6 @@ impl LeanCatalog {
             write_varint(&mut output, u64::from(entry.name));
             write_varint(&mut output, u64::from(entry.module_name));
             output.extend_from_slice(&entry.statement_hash.to_le_bytes());
-            write_usize(&mut output, entry.statement_nodes)?;
-            write_usize(&mut output, entry.statement_depth)?;
-            write_usize(&mut output, entry.value_nodes)?;
-            write_usize(&mut output, entry.value_depth)?;
             write_usize(&mut output, entry.dependencies.len())?;
             for dependency in &entry.dependencies {
                 write_varint(&mut output, u64::from(*dependency));
@@ -677,10 +657,6 @@ mod tests {
             name,
             module_name: name,
             statement_hash: u64::from(name),
-            statement_nodes: 3,
-            statement_depth: 2,
-            value_nodes: 5,
-            value_depth: 3,
             dependencies,
             kind: DeclarationKind::Theorem,
             locally_eligible,
