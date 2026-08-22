@@ -66,6 +66,7 @@ pub enum CandidateNoveltyFilterReasonInspection {
 
 #[derive(Clone, Debug)]
 pub struct ExperienceAttemptInspection {
+    pub candidate_key: [u8; 32],
     pub claim_digest: [u8; 32],
     pub canonical_candidate: Vec<u8>,
     pub operator_symbol: Vec<u8>,

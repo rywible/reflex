@@ -11,15 +11,18 @@ use reflex::internal_experiments::{
     compare_candidate_features, inspect_experience_segment,
 };
 use reflex::{
-    BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
-    OptimizationGoal, ParetoUpdate, Preference, ResourceEnvelope, ResourceUsage, improve,
+    BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
+    NonZeroDuration, Objective, OptimizationGoal, ParetoUpdate, Preference, ResourceEnvelope,
+    ResourceUsage, StructuralProtocol, improve,
 };
 use reflex_bundle::{CanonicalBundle, SegmentKind};
+use reflex_lean::ast::{LeanArtifact, LeanExpr};
 use reflex_lean::catalog::LeanCatalog;
-use reflex_lean::domain::{LeanCorpus, LeanDomain, LeanMetric, LeanSeedScope};
+use reflex_lean::domain::{LeanCorpus, LeanDomain, LeanMetric, LeanSeedScope, LeanStructure};
 use reflex_lean::temporal::{TemporalExample, TemporalSnapshot};
 use reflex_lean::worker::{IndexedTheorem, LeanWorker, LeanWorkerConfig, VerificationItem};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::harness::{
     AnyError, HostEnvironment, HostIsolation, HostIsolationPolicy, capture_child_host_isolated,
@@ -27,7 +30,7 @@ use crate::harness::{
     require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v8";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v9";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -221,6 +224,23 @@ struct FeatureDevelopmentReport {
 }
 
 #[derive(Serialize)]
+struct DonorAudit {
+    proof_substitution_attempts: usize,
+    reconstructed_attempts: usize,
+    ambiguous_attempts: usize,
+    unmatched_attempts: usize,
+    traces: Vec<DonorTrace>,
+}
+
+#[derive(Serialize)]
+struct DonorTrace {
+    candidate_key: String,
+    verdict: &'static str,
+    proof_term_sha256: String,
+    donor_declarations: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct SegmentLogicalBytes {
     segment: &'static str,
     bytes: usize,
@@ -255,6 +275,7 @@ struct Report {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
+    phase_zero_donor_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -277,6 +298,7 @@ struct ReportInputs {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
+    phase_zero_donor_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
@@ -583,20 +605,13 @@ fn run_treatments(
         prepared.training,
         &bootstrap_template_bundle,
     )?;
-    let training_usage = finish_training(improve(
-        LeanDomain::new(prepared.config.clone(), prepared.training_corpus)?,
-        request(
-            LeanSeedScope {
-                start: 0,
-                count: prepared.training,
-            },
-            arguments.training_verification_requests,
-            BundlePlan::Fresh {
-                target: training_bundle.clone(),
-            },
-        )?,
-        |_| ControlFlow::Continue(()),
-    )?);
+    let training_usage = run_training(
+        &prepared.config,
+        prepared.training_corpus.clone(),
+        prepared.training,
+        arguments.training_verification_requests,
+        &training_bundle,
+    )?;
     let training_learning = learning_summary(&training_bundle)?;
     if !training_learning.champion_present {
         return Err(format!(
@@ -605,6 +620,11 @@ fn run_treatments(
         )
         .into());
     }
+    let phase_zero_donor_audit = donor_audit_for_training(
+        &prepared.config,
+        &prepared.training_corpus,
+        &training_bundle,
+    )?;
     let bootstrap = run_fresh_treatment(
         "bootstrap",
         &prepared.config,
@@ -661,6 +681,7 @@ fn run_treatments(
         selected_artifacts: prepared.selected_artifacts,
         training_usage,
         training_learning,
+        phase_zero_donor_audit,
         full,
         no_model,
         no_derived,
@@ -691,6 +712,29 @@ fn build_bootstrap_template(
     Ok(())
 }
 
+fn run_training(
+    config: &LeanWorkerConfig,
+    corpus: LeanCorpus,
+    training: usize,
+    verification_requests: u64,
+    target: &Path,
+) -> Result<Usage, AnyError> {
+    Ok(finish_training(improve(
+        LeanDomain::new(config.clone(), corpus)?,
+        request(
+            LeanSeedScope {
+                start: 0,
+                count: training,
+            },
+            verification_requests,
+            BundlePlan::Fresh {
+                target: target.to_path_buf(),
+            },
+        )?,
+        |_| ControlFlow::Continue(()),
+    )?))
+}
+
 fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyError> {
     let ReportInputs {
         host,
@@ -702,6 +746,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
+        phase_zero_donor_audit,
         full,
         no_model,
         no_derived,
@@ -742,6 +787,7 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
+        phase_zero_donor_audit,
         full,
         no_model,
         no_derived,
@@ -1298,6 +1344,89 @@ fn bundle_candidate_fate_count(bundle: &Path) -> Result<usize, AnyError> {
     )
 }
 
+fn reconstruct_substitution_donors(
+    bundle: &Path,
+    domain: &LeanDomain,
+    library: &[LeanArtifact],
+) -> Result<DonorAudit, AnyError> {
+    let mut donors_by_proof = HashMap::<[u8; 32], Vec<String>>::new();
+    for artifact in library {
+        donors_by_proof
+            .entry(proof_term_digest(&artifact.proof_term)?)
+            .or_default()
+            .push(artifact.declaration.name.to_string());
+    }
+    for declarations in donors_by_proof.values_mut() {
+        declarations.sort_unstable();
+        declarations.dedup();
+    }
+    let bytes = std::fs::read(bundle)?;
+    let decoded = CanonicalBundle::decode(&bytes, RUNTIME_RESIDENT_BYTES)?;
+    let experience = inspect_experience_segment(decoded.segment(SegmentKind::Experience))
+        .map_err(|_| "Lean Bundle has malformed Experience framing")?;
+    let mut scratch = <LeanStructure as StructuralProtocol<LeanDomain>>::Scratch::default();
+    let mut traces = Vec::new();
+    for attempt in experience
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.operator_symbol == b"lean-proof-substitution")
+    {
+        let candidate = domain
+            .structure()
+            .decode_canonical(&attempt.canonical_candidate, &mut scratch)
+            .map_err(|_| "Lean Candidate Experience has malformed canonical structure")?;
+        let proof_digest = proof_term_digest(&candidate.proof_term)?;
+        traces.push(DonorTrace {
+            candidate_key: hex(&attempt.candidate_key),
+            verdict: match attempt.verdict {
+                ExperienceVerdictInspection::Accepted => "accepted",
+                ExperienceVerdictInspection::Refuted => "refuted",
+                ExperienceVerdictInspection::Unknown => "unknown",
+            },
+            proof_term_sha256: hex(&proof_digest),
+            donor_declarations: donors_by_proof
+                .get(&proof_digest)
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    Ok(summarize_donor_traces(traces))
+}
+
+fn summarize_donor_traces(traces: Vec<DonorTrace>) -> DonorAudit {
+    let reconstructed_attempts = traces
+        .iter()
+        .filter(|trace| !trace.donor_declarations.is_empty())
+        .count();
+    let ambiguous_attempts = traces
+        .iter()
+        .filter(|trace| trace.donor_declarations.len() > 1)
+        .count();
+    DonorAudit {
+        proof_substitution_attempts: traces.len(),
+        reconstructed_attempts,
+        ambiguous_attempts,
+        unmatched_attempts: traces.len().saturating_sub(reconstructed_attempts),
+        traces,
+    }
+}
+
+fn proof_term_digest(proof: &LeanExpr) -> Result<[u8; 32], AnyError> {
+    Ok(Sha256::digest(serde_json::to_vec(proof)?).into())
+}
+
+fn donor_audit_for_training(
+    config: &LeanWorkerConfig,
+    corpus: &LeanCorpus,
+    bundle: &Path,
+) -> Result<DonorAudit, AnyError> {
+    reconstruct_substitution_donors(
+        bundle,
+        &LeanDomain::new(config.clone(), corpus.clone())?,
+        corpus.operator_library(),
+    )
+}
+
 fn candidate_verification_curve(
     bundle: &Path,
     fate_offset: usize,
@@ -1686,6 +1815,26 @@ mod tests {
             features: Vec::new(),
             targets: [0.0; POTENTIAL_HEADS],
         }
+    }
+
+    #[test]
+    fn donor_summary_distinguishes_exact_ambiguous_and_unmatched_reconstruction() {
+        let trace = |marker: &str, donor_declarations: Vec<String>| DonorTrace {
+            candidate_key: marker.into(),
+            verdict: "accepted",
+            proof_term_sha256: marker.into(),
+            donor_declarations,
+        };
+        let summary = summarize_donor_traces(vec![
+            trace("exact", vec!["A".into()]),
+            trace("ambiguous", vec!["B".into(), "C".into()]),
+            trace("unmatched", Vec::new()),
+        ]);
+
+        assert_eq!(summary.proof_substitution_attempts, 3);
+        assert_eq!(summary.reconstructed_attempts, 2);
+        assert_eq!(summary.ambiguous_attempts, 1);
+        assert_eq!(summary.unmatched_attempts, 1);
     }
 
     #[test]

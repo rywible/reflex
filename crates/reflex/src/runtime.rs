@@ -278,6 +278,7 @@ fn experience_attempt_inspections(
         .iter()
         .map(
             |entry| crate::internal_experiments::ExperienceAttemptInspection {
+                candidate_key: entry.candidate_key.0,
                 claim_digest: entry.claim_digest,
                 canonical_candidate: entry.canonical_candidate.clone(),
                 operator_symbol: entry.operator_symbol.clone(),
