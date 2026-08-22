@@ -6,11 +6,11 @@ Measure whether richer Candidate structure or additional linear capacity improve
 
 ## Entry gate
 
-The existing 16-feature linear model must first be genuinely promoted and causally evaluated against Bootstrap under the 128-request Lean envelope. A zero-generation or absent champion is a failed activation, not a model result. No larger model may run before this gate records verified discoveries, nodes removed, CPU time, and discovery order for Full and all counterfactuals.
+The existing 16-feature linear model must first be genuinely promoted and causally evaluated against Bootstrap under the 128-request Lean envelope. A zero-generation or absent champion is a failed activation, not a model result. [The active v7 run](./lean-public-optimizer-development-v7-active.md) satisfies this gate and rejects the baseline model: Full found two strict improvements and removed 998 nodes in 49.261 CPU seconds, while Bootstrap found three and removed 9,164 in 43.114 CPU seconds. Full and no-model found the same strict improvements in the same order.
 
 ## Fixed data and training
 
-The initial sweep corpus is the retained v7 Experience bundle with SHA-256 `49ed43f7bf805a449d2bd2f9a247ca25632d227f7f1fcba47bcb03fdcaf19332`: 1,008 kernel-labeled attempts, nine Accepted and 999 Refuted. A successor corpus may add attempts needed to cover the three starved claims, but once chosen it is content-addressed and every model receives identical canonical Candidates, verdicts, consequences, claim-group Replay/Selection roles, example order, eight training epochs, FTRL hyperparameters, and calibration logic. Results from different corpus identities are never compared as a capacity sweep.
+The initial sweep corpus is the retained active v7 Experience bundle with SHA-256 `7ba3e9a199a261b770d686060dc5a48d77fb1fad745885afe1991c15aa6797d3`: 1,008 kernel-labeled attempts across all 16 correctness claims, 13 Accepted and 995 Refuted. Every model receives identical canonical Candidates, verdicts, consequences, claim-group Replay/Selection roles, example order, eight training epochs, FTRL hyperparameters, and calibration logic. Feature extraction may replay canonical parent and Candidate Artifacts but may not request new Verification labels. Results from different corpus identities are never compared as a capacity sweep.
 
 ## Treatments
 
