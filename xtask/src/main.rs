@@ -206,14 +206,14 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean_taste::run(&arguments)
         }
-        Some("lean-public-optimizer-development") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_optimizer_audit::development(&arguments)
-        }
+        Some("lean-public-optimizer-development") =>
+            lean_optimizer_audit::development(&arguments.collect::<Vec<_>>()),
         Some("lean-public-optimizer-development-child") => {
             let arguments = arguments.collect::<Vec<_>>();
             lean_optimizer_audit::development_child(&arguments)
         }
+        Some("lean-bundle-summary") =>
+            lean_optimizer_audit::bundle_summary(&arguments.collect::<Vec<_>>()),
         Some("lean-temporal-audit-freeze") => {
             let arguments = arguments.collect::<Vec<_>>();
             lean_audit::freeze(&arguments)
@@ -235,7 +235,7 @@ fn run() -> Result<(), AnyError> {
             lean_audit_confirm::finalize(&arguments)
         }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-bundle-summary|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
                 .into(),
         ),
     }

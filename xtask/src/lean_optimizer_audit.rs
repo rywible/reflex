@@ -112,6 +112,36 @@ struct LearningSummary {
 }
 
 #[derive(Serialize)]
+struct BundleSummary {
+    schema: &'static str,
+    identity: String,
+    artifact_records: u64,
+    experience_entries: u64,
+    experience_claims: usize,
+    accepted_claims: usize,
+    accepted_experience: u64,
+    refuted_experience: u64,
+    unknown_experience: u64,
+    learning: LearningSummary,
+    knowledge_revision: String,
+    model_revision: String,
+    segment_logical_bytes: Vec<SegmentLogicalBytes>,
+}
+
+#[derive(Serialize)]
+struct SegmentLogicalBytes {
+    segment: &'static str,
+    bytes: usize,
+}
+
+struct ExperienceSummary {
+    entries: u64,
+    claims: usize,
+    accepted_claims: usize,
+    verdicts: [u64; 3],
+}
+
+#[derive(Serialize)]
 struct Report {
     schema: &'static str,
     status: &'static str,
@@ -213,6 +243,61 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
         capture.stderr.trim()
     )
     .into())
+}
+
+pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
+    let values = parse_flag_values(arguments, &["--bundle"], "lean-bundle-summary")?;
+    let path = values
+        .get("--bundle")
+        .ok_or("lean-bundle-summary requires --bundle PATH")?;
+    let bytes = std::fs::read(path)?;
+    let decoded = CanonicalBundle::decode(&bytes, 1024 * 1024 * 1024)?;
+    let artifacts = decoded.segment(SegmentKind::Artifacts);
+    if artifacts.len() < 8 {
+        return Err("Lean Bundle has a truncated Artifact count".into());
+    }
+    let artifact_records = u64::from_le_bytes(artifacts[..8].try_into()?);
+    let experience = experience_summary(decoded.segment(SegmentKind::Experience))?;
+    let revisions = decoded.segment(SegmentKind::Revisions);
+    if revisions.len() < 64 {
+        return Err("Lean Bundle has a truncated Revisions segment".into());
+    }
+    let mut state = &revisions[64..];
+    take_summary_sized(&mut state)?;
+    let learning = learning_header(take_summary_sized(&mut state)?)?;
+    if !state.is_empty() {
+        return Err("Lean Bundle has trailing Revisions state".into());
+    }
+    let segment_logical_bytes = [
+        ("session", SegmentKind::Session),
+        ("revisions", SegmentKind::Revisions),
+        ("artifacts", SegmentKind::Artifacts),
+        ("experience", SegmentKind::Experience),
+        ("recovery", SegmentKind::Recovery),
+    ]
+    .into_iter()
+    .map(|(segment, kind)| SegmentLogicalBytes {
+        segment,
+        bytes: decoded.segment(kind).len(),
+    })
+    .collect();
+    let summary = BundleSummary {
+        schema: "reflex-lean-bundle-summary-v1",
+        identity: String::from_utf8(decoded.identity().to_vec())?,
+        artifact_records,
+        experience_entries: experience.entries,
+        experience_claims: experience.claims,
+        accepted_claims: experience.accepted_claims,
+        accepted_experience: experience.verdicts[0],
+        refuted_experience: experience.verdicts[1],
+        unknown_experience: experience.verdicts[2],
+        learning,
+        knowledge_revision: hex(&revisions[..32]),
+        model_revision: hex(&revisions[32..64]),
+        segment_logical_bytes,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 pub fn development_child(arguments: &[String]) -> Result<(), AnyError> {
@@ -1011,6 +1096,40 @@ fn learning_summary(bundle: &Path) -> Result<LearningSummary, AnyError> {
     learning_header(learning)
 }
 
+fn experience_summary(mut experience: &[u8]) -> Result<ExperienceSummary, AnyError> {
+    let entries = read_summary_u64(&mut experience)?;
+    let mut verdicts = [0_u64; 3];
+    let mut claims = HashSet::new();
+    let mut accepted_claims = HashSet::new();
+    for _ in 0..entries {
+        take_summary(&mut experience, 32 * 2)?;
+        let claim: [u8; 32] = take_summary(&mut experience, 32)?.try_into()?;
+        claims.insert(claim);
+        take_summary(&mut experience, 32 * 2)?;
+        take_summary_sized(&mut experience)?;
+        let verdict = take_summary(&mut experience, 1)?[0];
+        let Some(index) = verdict
+            .checked_sub(1)
+            .map(usize::from)
+            .filter(|index| *index < 3)
+        else {
+            return Err("Lean Bundle has an invalid Experience verdict".into());
+        };
+        verdicts[index] = verdicts[index].saturating_add(1);
+        if verdict == 1 {
+            accepted_claims.insert(claim);
+        }
+        take_summary_sized(&mut experience)?;
+        take_summary(&mut experience, 16 * 4 + 4 + 8)?;
+    }
+    Ok(ExperienceSummary {
+        entries,
+        claims: claims.len(),
+        accepted_claims: accepted_claims.len(),
+        verdicts,
+    })
+}
+
 fn learning_header(learning: &[u8]) -> Result<LearningSummary, AnyError> {
     if learning.len() < 14 || &learning[..5] != b"RFLS\x02" {
         return Err("Lean training Bundle has incompatible Learning state".into());
@@ -1040,15 +1159,19 @@ fn learning_header(learning: &[u8]) -> Result<LearningSummary, AnyError> {
 }
 
 fn take_summary_sized<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], AnyError> {
-    if input.len() < 8 {
-        return Err("Lean training Bundle has a truncated sized field".into());
+    let length = usize::try_from(read_summary_u64(input)?)?;
+    take_summary(input, length)
+}
+
+fn read_summary_u64(input: &mut &[u8]) -> Result<u64, AnyError> {
+    Ok(u64::from_le_bytes(take_summary(input, 8)?.try_into()?))
+}
+
+fn take_summary<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], AnyError> {
+    if input.len() < count {
+        return Err("Lean Bundle has a truncated payload".into());
     }
-    let length = usize::try_from(u64::from_le_bytes(input[..8].try_into()?))?;
-    *input = &input[8..];
-    if input.len() < length {
-        return Err("Lean training Bundle has a truncated sized payload".into());
-    }
-    let (value, remainder) = input.split_at(length);
+    let (value, remainder) = input.split_at(count);
     *input = remainder;
     Ok(value)
 }
@@ -1184,5 +1307,28 @@ mod tests {
 
         promoted[14..22].copy_from_slice(&4_u64.to_le_bytes());
         assert!(learning_header(&promoted).is_err());
+    }
+
+    #[test]
+    fn experience_summary_counts_all_three_verdicts_and_rejects_invalid_values() {
+        let encoded = |verdicts: &[u8]| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(verdicts.len() as u64).to_le_bytes());
+            for verdict in verdicts {
+                bytes.extend_from_slice(&[0; 32 * 5]);
+                bytes.extend_from_slice(&0_u64.to_le_bytes());
+                bytes.push(*verdict);
+                bytes.extend_from_slice(&0_u64.to_le_bytes());
+                bytes.extend_from_slice(&[0; 16 * 4 + 4 + 8]);
+            }
+            bytes
+        };
+        let summary = experience_summary(&encoded(&[1, 2, 2, 3])).unwrap();
+        assert_eq!(summary.entries, 4);
+        assert_eq!(summary.claims, 1);
+        assert_eq!(summary.accepted_claims, 1);
+        assert_eq!(summary.verdicts, [1, 2, 1]);
+        assert!(experience_summary(&encoded(&[0])).is_err());
+        assert!(experience_summary(&encoded(&[4])).is_err());
     }
 }
