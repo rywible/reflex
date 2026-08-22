@@ -11,6 +11,7 @@ const MAX_REPLAY_BATCH: usize = 16_384;
 const TRAINING_EPOCHS: usize = 8;
 const MAX_SELECTION_USES: u8 = 3;
 const MIN_SELECTION_CASES: usize = 8;
+const MIN_REPLAY_CASES: usize = 8;
 const MAX_SPECIALISTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -147,12 +148,7 @@ impl LearningState {
     }
 
     pub(crate) fn learn(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
-        for example in examples.iter_mut() {
-            example.role = *self
-                .roles
-                .entry(example.corpus_key)
-                .or_insert_with(|| assign_role(example.corpus_key));
-        }
+        self.assign_new_corpus_roles(examples);
         let selection = bounded_corpus(examples, true);
         if self.champion.is_some() {
             let predecessor = if self.predecessor_is_bootstrap {
@@ -194,6 +190,54 @@ impl LearningState {
         }
         self.finish_selection(examples);
         decision
+    }
+
+    fn assign_new_corpus_roles(&mut self, examples: &mut [TrainingExample]) {
+        let mut unseen = examples
+            .iter()
+            .map(|example| example.corpus_key)
+            .filter(|key| !self.roles.contains_key(key))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        unseen.sort_unstable_by_key(|key| {
+            (
+                !matches!(assign_role(*key), CorpusRole::Selection { .. }),
+                *key,
+            )
+        });
+        let current_selection = self
+            .roles
+            .values()
+            .filter(|role| matches!(role, CorpusRole::Selection { .. }))
+            .count();
+        let total_cases = self.roles.len().saturating_add(unseen.len());
+        let minimum_replay = if self.champion.is_some() {
+            0
+        } else {
+            MIN_REPLAY_CASES
+        };
+        let maximum_selection = total_cases.saturating_sub(minimum_replay);
+        let target_selection = total_cases
+            .div_ceil(5)
+            .max(MIN_SELECTION_CASES)
+            .min(maximum_selection);
+        let new_selection = target_selection
+            .saturating_sub(current_selection)
+            .min(unseen.len());
+        for (index, key) in unseen.into_iter().enumerate() {
+            self.roles.insert(
+                key,
+                if index < new_selection {
+                    CorpusRole::Selection { uses: 0 }
+                } else {
+                    CorpusRole::Replay
+                },
+            );
+        }
+        for example in examples {
+            example.role = self.roles[&example.corpus_key];
+        }
     }
 
     fn finish_selection(&mut self, examples: &mut [TrainingExample]) {
@@ -1304,6 +1348,38 @@ mod tests {
         assert_ne!(
             revision_digest(&challenger),
             revision_digest(&FtrlModel::zero())
+        );
+    }
+
+    #[test]
+    fn initial_learning_reserves_exact_disjoint_minimum_corpora() {
+        let examples = |count: u8| {
+            (0..count)
+                .map(|key| example(key, usize::from(key % 2), key % 2 == 0, CorpusRole::Replay))
+                .collect::<Vec<_>>()
+        };
+        let mut sufficient = examples(16);
+        let mut state = LearningState::default();
+        state.assign_new_corpus_roles(&mut sufficient);
+        let selection = sufficient
+            .iter()
+            .filter(|example| matches!(example.role, CorpusRole::Selection { .. }))
+            .count();
+        let replay = sufficient.len() - selection;
+        assert_eq!((selection, replay), (8, 8));
+
+        let mut insufficient = examples(15);
+        let mut state = LearningState::default();
+        state.assign_new_corpus_roles(&mut insufficient);
+        let selection = insufficient
+            .iter()
+            .filter(|example| matches!(example.role, CorpusRole::Selection { .. }))
+            .count();
+        assert_eq!((selection, insufficient.len() - selection), (7, 8));
+        assert_eq!(
+            state.learn(&mut insufficient),
+            PromotionDecision::Reject,
+            "fewer than sixteen claims cannot satisfy both disjoint minimum cohorts"
         );
     }
 

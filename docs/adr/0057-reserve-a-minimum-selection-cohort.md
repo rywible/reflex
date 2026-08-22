@@ -1,0 +1,5 @@
+# Reserve a minimum Selection cohort
+
+The Learning Module assigns new correctness-claim groups deterministically so an initial challenger receives at least eight Replay cases and is evaluated on at least eight disjoint Selection cases; larger corpora approach a one-fifth Selection share. Persisted Replay cases never return to Selection, and Selection cases rotate into Replay after bounded use, so only fresh operational evidence can replenish the promotion gate.
+
+A fixed hash lottery preserved disjointness but made the minimum eight-case promotion rule operationally unpredictable: small domains commonly needed around forty claims before any Model Revision could be promoted, and a causal experiment could silently compare two Bootstrap revisions. An exact minimum cohort permits meaningful learning from sixteen diverse claims without training on the promotion evidence. The changed assignment schedule advances the Runtime revision so interrupted Sessions cannot silently resume under different learning semantics.
