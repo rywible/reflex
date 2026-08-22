@@ -1,0 +1,390 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v11",
+  "status": "development-only; no 2026 exposure",
+  "source_report": {
+    "content_sha256": "460c2be38a73178498061af3183713c460c80eceab5232944e6c57e3dc7dc798",
+    "file_sha256": "0e8d02735b44d59073c878c3fc9083afd91dbc81a195defc9a4968a60174a482",
+    "path": "/tmp/reflex-lean-public-optimizer-development-v11.json"
+  },
+  "host": {
+    "git_revision": "16b8c582325fdcb4659eb83e8e2408460be3f840",
+    "git_dirty": false,
+    "build_profile": "release",
+    "target_arch": "aarch64",
+    "target_features": "neon",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "total_memory_bytes": 67306029056,
+    "available_memory_bytes": 63302569984,
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "limits": {
+    "training_verification_requests": 1024,
+    "evaluation_verification_requests": 128
+  },
+  "training": {
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18734751763,
+      "verification_requests": 1024,
+      "durable_bytes": 5832756,
+      "elapsed_ns": 73725830484,
+      "cpu_ns": 74055517815
+    },
+    "learning": {
+      "generation": 1,
+      "champion_present": true
+    },
+    "bundle_sha256": "ae59e86fe6e058ecfce658cbd7dd6a9f4f9cf9c2653a29682b97c1f916cab9f1"
+  },
+  "phase_zero": {
+    "proof_substitution_attempts": 295,
+    "accepted_proof_substitutions": 13,
+    "reconstructed_attempts": 295,
+    "ambiguous_attempts": 26,
+    "unmatched_attempts": 0,
+    "accepted_refuted_collision_groups": 0,
+    "accepted_refuted_collision_fraction_ppm": 0
+  },
+  "treatments": [
+    {
+      "treatment": "bootstrap",
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "candidate_verification_curve": [
+        {
+          "request_budget": 1,
+          "reached": true,
+          "observed_requests": 1,
+          "strict_discoveries": 1,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 4,
+          "reached": true,
+          "observed_requests": 4,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 8,
+          "reached": true,
+          "observed_requests": 8,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 16,
+          "reached": true,
+          "observed_requests": 16,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 32,
+          "reached": true,
+          "observed_requests": 32,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 64,
+          "reached": true,
+          "observed_requests": 64,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        },
+        {
+          "request_budget": 128,
+          "reached": false,
+          "observed_requests": 124,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 3520114608
+        }
+      ],
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 17360236791,
+        "verification_requests": 128,
+        "durable_bytes": 816162,
+        "elapsed_ns": 43210974219,
+        "cpu_ns": 43257699036
+      },
+      "bundle_sha256": "9acb214cab5c124433786cf48a83a616f184cc88c1cb541962eb0caf19c1305c"
+    },
+    {
+      "treatment": "full",
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "candidate_verification_curve": [
+        {
+          "request_budget": 1,
+          "reached": true,
+          "observed_requests": 1,
+          "strict_discoveries": 1,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 4,
+          "reached": true,
+          "observed_requests": 4,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 8,
+          "reached": true,
+          "observed_requests": 8,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 16,
+          "reached": true,
+          "observed_requests": 16,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 32,
+          "reached": true,
+          "observed_requests": 32,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 64,
+          "reached": true,
+          "observed_requests": 64,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        },
+        {
+          "request_budget": 128,
+          "reached": false,
+          "observed_requests": 82,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8376061501
+        }
+      ],
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19015864872,
+        "verification_requests": 128,
+        "durable_bytes": 6827744,
+        "elapsed_ns": 53450812424,
+        "cpu_ns": 53549266751
+      },
+      "bundle_sha256": "4c00710a4ea61b2ab2e6af17fd760dd6144cf0a48ca8d983f19c7256ac46ed52"
+    },
+    {
+      "treatment": "no-model",
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "candidate_verification_curve": [
+        {
+          "request_budget": 1,
+          "reached": true,
+          "observed_requests": 1,
+          "strict_discoveries": 1,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 4,
+          "reached": true,
+          "observed_requests": 4,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 8,
+          "reached": true,
+          "observed_requests": 8,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 16,
+          "reached": true,
+          "observed_requests": 16,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 32,
+          "reached": true,
+          "observed_requests": 32,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 64,
+          "reached": true,
+          "observed_requests": 64,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        },
+        {
+          "request_budget": 128,
+          "reached": false,
+          "observed_requests": 82,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 2468641546
+        }
+      ],
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19015835037,
+        "verification_requests": 128,
+        "durable_bytes": 6473380,
+        "elapsed_ns": 47590623616,
+        "cpu_ns": 47639204688
+      },
+      "bundle_sha256": "3195d7aa670aa15c4f4a0eadf9f40eaed52add70ddc9709bea07db7f1ad5b5b4"
+    },
+    {
+      "treatment": "no-derived",
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "candidate_verification_curve": [
+        {
+          "request_budget": 1,
+          "reached": true,
+          "observed_requests": 1,
+          "strict_discoveries": 1,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 4,
+          "reached": true,
+          "observed_requests": 4,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 8,
+          "reached": true,
+          "observed_requests": 8,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 16,
+          "reached": true,
+          "observed_requests": 16,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 32,
+          "reached": true,
+          "observed_requests": 32,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 64,
+          "reached": true,
+          "observed_requests": 64,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        },
+        {
+          "request_budget": 128,
+          "reached": false,
+          "observed_requests": 82,
+          "strict_discoveries": 4,
+          "cpu_ns_through_completed_batch": 8272925213
+        }
+      ],
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19015864872,
+        "verification_requests": 128,
+        "durable_bytes": 6827777,
+        "elapsed_ns": 53221082418,
+        "cpu_ns": 53319540500
+      },
+      "bundle_sha256": "5aec8c9e34060a66a05fe9624f37837773805f51f337eecfa13b67474fbb8e40"
+    }
+  ],
+  "strict_improvements": [
+    {
+      "observer_sequence": 2,
+      "artifact_key": "0bd57c6367b1b5c865b1a81e669006dea1acd04f440b11ba0ff465a038bd2cb4",
+      "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "seed_proof_nodes": 401,
+      "proof_nodes": 1,
+      "proof_nodes_removed": 400
+    },
+    {
+      "observer_sequence": 2,
+      "artifact_key": "338e4bfdf2044c78aa45aae73426f71b5e5b0e95bc513b962b207ef2dd52d54d",
+      "declaration": "Matrix.det_updateCol_eq_zero",
+      "seed_proof_nodes": 599,
+      "proof_nodes": 1,
+      "proof_nodes_removed": 598
+    },
+    {
+      "observer_sequence": 2,
+      "artifact_key": "5050d35d79073049b87d626a909294fdb8ad613e133991e13c07d30ab551a8a7",
+      "declaration": "hfdifferential_apply",
+      "seed_proof_nodes": 8167,
+      "proof_nodes": 1,
+      "proof_nodes_removed": 8166
+    },
+    {
+      "observer_sequence": 2,
+      "artifact_key": "381ca9d12728e0b4aa49feb92f3a35dbd98d575568960ebffae84c65d35b597e",
+      "declaration": "Matrix.fromCols_mul_fromRows",
+      "seed_proof_nodes": 3759,
+      "proof_nodes": 1,
+      "proof_nodes_removed": 3758
+    }
+  ],
+  "gates": {
+    "full_has_more_improvements": false,
+    "full_noninferior_after_16_requests": true,
+    "full_uses_less_cpu_per_improvement": false
+  },
+  "fixed_experience": {
+    "schema": "reflex-lean-model-feature-development-v8",
+    "content_sha256": "11bd9c6d8cf119e15d75076a9fa7b2d3dfe446d9470afc9f814754a75e9f3633",
+    "examples": 1008,
+    "features": 24,
+    "heads": 7,
+    "accepted": 13,
+    "replay_claims": 8,
+    "selection_claims": 8,
+    "structural_promotes": false,
+    "balanced_selection_accepted_within_claim_at_k": [
+      6,
+      6,
+      7,
+      7,
+      7,
+      7,
+      7
+    ],
+    "budgets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ]
+  }
+}
+
