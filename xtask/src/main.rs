@@ -16,8 +16,10 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod build;
 mod causal;
 mod harness;
+mod performance;
 
 use harness::{
     AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_json,
@@ -154,8 +156,20 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             causal::materialize_audit(&arguments)
         }
+        Some("build-native") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            build::build_native(&arguments)
+        }
+        Some("perf-smoke") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            performance::run(&arguments)
+        }
+        Some("instrumentation-overhead") => {
+            let arguments = arguments.collect::<Vec<_>>();
+            performance::run_instrumentation_overhead(&arguments)
+        }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit> [--output PATH]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|build-native|perf-smoke|instrumentation-overhead> [arguments]"
                 .into(),
         ),
     }

@@ -852,6 +852,14 @@ The first implementation slice is deliberately end to end:
 
 The early steps form a runnable vertical spine, but the production Reference Domain is not complete until all eleven steps pass. Every step uses final seams and durable formats. Temporarily inactive behavior is represented by valid production states—such as the Bootstrap Revision—not alternative interfaces or disposable implementations.
 
+## Production build and measurement profiles
+
+Production binaries use optimization level 3, fat link-time optimization, one code-generation unit, abort-on-panic behavior, and no incremental compilation. `production` strips symbols; `profiling` retains line tables with otherwise identical optimization settings. Host-native builds are explicit and reproducible on the recorded host through `cargo run --release -p xtask -- build-native`, which writes only to `target/native` and applies `-Ctarget-cpu=native`. Reflex source remains safe Rust; the compiler may autovectorize for the selected target.
+
+`perf-smoke` is the bounded development diagnostic. It records the embedded build profile and flags, session wall and process CPU time, externally sampled process-tree CPU time and peak resident memory, semantic outcome, and recovery validity. It permits a dirty tree and labels its report development-only. It must never be presented as confirmation evidence or replace a frozen equal-budget protocol.
+
+The private Runtime phase recorder is disabled by default and cannot be selected through the consumer or Domain Definition interfaces. Repository tooling activates it in child processes only through an internal environment variable. It takes coarse timestamps around setup, generation, selection, Verification, Measurement/Admission, consolidation, training, and finalization, while hot loops contribute only batch aggregate counters. `instrumentation-overhead` alternates disabled and enabled assignments in paired order and rejects median session-wall or process-CPU overhead of 1% or more.
+
 ## Performance gates before expansion
 
 Before adding binary arity, Lean, Wrela, a tensor framework, reduced precision, or a custom scheduler, measure:

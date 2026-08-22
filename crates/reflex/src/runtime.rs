@@ -17,6 +17,7 @@ use crate::domain::{
     VerificationReplayRequest, VerificationRequest,
 };
 use crate::durability;
+use crate::instrumentation::{Phase, Recorder};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
@@ -160,6 +161,8 @@ where
     D: DomainDefinition,
     O: for<'a> FnMut(ParetoUpdate<'a, D>) -> ControlFlow<()>,
 {
+    let mut instrumentation = Recorder::from_environment();
+    let setup_started = instrumentation.start();
     let goal_evaluator = GoalEvaluator::new(domain, &request.goals)?;
     let bundle_codec = RestartBundleCodec::new(domain, request);
     let recovered_bundle = request
@@ -353,6 +356,7 @@ where
     let mut durable_budget_exhausted = false;
     let mut resident_budget_exhausted = initial_delivery.resource_exhausted();
     let mut operator_scratch = <D::Operators as OperatorAlgebra<D>>::Scratch::default();
+    instrumentation.finish(Phase::Setup, setup_started);
 
     while !stopped_by_observer
         && !success_conditions_satisfied
@@ -360,6 +364,8 @@ where
         && !resident_budget_exhausted
         && !frontier.is_empty()
     {
+        instrumentation.epoch();
+        let generation_started = instrumentation.start();
         let resident_before_epoch = worker_resident_bytes
             .saturating_add(resident_state_bytes(
                 &known,
@@ -511,6 +517,8 @@ where
         )?;
         application_bytes = application_bytes.saturating_add(derived_bytes);
         choice_window_exhausted |= derived_truncated;
+        instrumentation.generated(candidates.len());
+        instrumentation.finish(Phase::Generation, generation_started);
         test_fault_point("candidate-created");
         if resource_meter
             .search_time_exhausted()
@@ -519,6 +527,7 @@ where
             time_exhausted = true;
             break;
         }
+        let selection_started = instrumentation.start();
         candidates = retain_novel_candidates(
             domain,
             &known,
@@ -533,6 +542,8 @@ where
             pinned_model.as_ref(),
             &mut candidates,
         );
+        instrumentation.selected(candidates.len());
+        instrumentation.finish(Phase::Selection, selection_started);
         if candidates.is_empty() {
             resident_budget_exhausted |= choice_window_exhausted;
             break;
@@ -561,13 +572,16 @@ where
         if candidates.is_empty() {
             break;
         }
+        instrumentation.verified(candidates.len());
         verification_requests +=
             u64::try_from(candidates.len()).map_err(|_| SessionError::Resource)?;
         let parent_keys = frontier
             .iter()
             .map(|(artifact, _)| artifact.key())
             .collect::<Vec<_>>();
+        let verification_started = instrumentation.start();
         let verification = verify_candidates(domain, &roots, &origins, &parent_keys, candidates)?;
+        instrumentation.finish(Phase::Verification, verification_started);
         test_fault_point("verdict-recorded");
         let experience_checkpoint_state = ledger.checkpoint_entries();
         ledger.append_entries(verification.experience);
@@ -621,6 +635,7 @@ where
             time_exhausted = true;
             break;
         }
+        let measurement_admission_started = instrumentation.start();
         let accepted_origins = verification
             .accepted
             .iter()
@@ -661,8 +676,10 @@ where
         if admitted.is_empty() {
             frontier.clear();
             resident_budget_exhausted |= choice_window_exhausted;
+            instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
             break;
         }
+        instrumentation.admitted(admitted.len());
         let mut epoch = EpochTransition::begin(&mut known, &mut frontier, &mut ledger);
         for (artifact, origin) in admitted {
             epoch.admit(artifact, origin);
@@ -734,6 +751,7 @@ where
             break;
         }
         epoch.commit();
+        instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
         pareto = proposed_pareto;
         checkpoint = proposed_checkpoint;
         stopped_by_observer = delivery.stopped();
@@ -774,6 +792,7 @@ where
     {
         completion = Completion::ResourceEnvelopeExhausted;
     }
+    let consolidation_started = instrumentation.start();
     let consolidation_live = worker_resident_bytes.saturating_add(resident_state_bytes(
         &known,
         &roots,
@@ -869,6 +888,8 @@ where
     } else if completion != Completion::StoppedByObserver {
         completion = Completion::ResourceEnvelopeExhausted;
     }
+    instrumentation.finish(Phase::Consolidation, consolidation_started);
+    let training_started = instrumentation.start();
     let learning_live = worker_resident_bytes.saturating_add(resident_state_bytes(
         &known,
         &roots,
@@ -899,6 +920,8 @@ where
     } else {
         completion = Completion::ResourceEnvelopeExhausted;
     }
+    instrumentation.finish(Phase::Training, training_started);
+    let finalization_started = instrumentation.start();
     let provisional_checkpoint = bundle_codec.seal(
         &seed_cursor,
         &known,
@@ -946,6 +969,7 @@ where
         .submit(checkpoint.clone())
         .map_err(SessionError::Durability)?;
     durability.finish().map_err(SessionError::Durability)?;
+    instrumentation.finish(Phase::Finalization, finalization_started);
     let target = request.bundle.target().to_path_buf();
     Ok(SessionOutcome {
         completion,

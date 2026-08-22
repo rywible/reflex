@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use reflex::Completion;
@@ -16,6 +17,9 @@ pub(super) struct HostEnvironment {
     pub(super) git_dirty: bool,
     pub(super) rustc: String,
     pub(super) cargo: String,
+    pub(super) build_profile: &'static str,
+    pub(super) rustflags: &'static str,
+    pub(super) target_features: &'static str,
     pub(super) target_arch: &'static str,
     pub(super) target_os: &'static str,
     pub(super) cpu_description: String,
@@ -27,6 +31,8 @@ pub(super) struct ChildCapture {
     pub(super) stdout: String,
     pub(super) stderr: String,
     pub(super) timed_out: bool,
+    pub(super) process_tree_cpu_ns: u64,
+    pub(super) peak_process_tree_resident_bytes: u64,
 }
 
 pub(super) fn require_release(protocol: &str) -> Result<(), AnyError> {
@@ -43,6 +49,9 @@ pub(super) fn environment() -> Result<HostEnvironment, AnyError> {
         git_dirty: !command_output("git", &["status", "--porcelain"])?.is_empty(),
         rustc: command_output("rustc", &["-Vv"])?,
         cargo: command_output("cargo", &["-Vv"])?,
+        build_profile: env!("REFLEX_BUILD_PROFILE"),
+        rustflags: env!("REFLEX_BUILD_RUSTFLAGS"),
+        target_features: env!("REFLEX_BUILD_TARGET_FEATURES"),
         target_arch: std::env::consts::ARCH,
         target_os: std::env::consts::OS,
         cpu_description: cpu_description(),
@@ -76,31 +85,50 @@ pub(super) fn capture_child(
     evidence_prefix: &Path,
     timeout: Option<Duration>,
 ) -> Result<ChildCapture, AnyError> {
+    capture_child_with_environment(executable, arguments, evidence_prefix, timeout, &[])
+}
+
+pub(super) fn capture_child_with_environment(
+    executable: &Path,
+    arguments: &[OsString],
+    evidence_prefix: &Path,
+    timeout: Option<Duration>,
+    environment: &[(OsString, OsString)],
+) -> Result<ChildCapture, AnyError> {
     let stdout_path = evidence_prefix.with_extension("child.stdout");
     let stderr_path = evidence_prefix.with_extension("child.stderr");
     let stdout_file = std::fs::File::create(&stdout_path)?;
     let stderr_file = std::fs::File::create(&stderr_path)?;
+    let clock_ticks_per_second = clock_ticks_per_second().ok();
+    let child_cpu_before = completed_child_cpu_ticks().ok();
     let mut child = Command::new(executable)
         .args(arguments)
+        .envs(environment.iter().cloned())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()?;
-    let timed_out = if let Some(timeout) = timeout {
-        let started = Instant::now();
-        loop {
-            if child.try_wait()?.is_some() {
-                break false;
-            }
-            if started.elapsed() >= timeout {
-                child.kill()?;
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(25));
+    let started = Instant::now();
+    let mut peak_process_tree_resident_bytes = 0;
+    let timed_out = loop {
+        peak_process_tree_resident_bytes =
+            peak_process_tree_resident_bytes.max(process_tree_resident_bytes(child.id()));
+        if child.try_wait()?.is_some() {
+            break false;
         }
-    } else {
-        false
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            child.kill()?;
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     };
     let status = child.wait()?;
+    let child_cpu_after = completed_child_cpu_ticks().ok();
+    let process_tree_cpu_ns = child_cpu_before
+        .zip(child_cpu_after)
+        .zip(clock_ticks_per_second)
+        .map_or(0, |((before, after), frequency)| {
+            ticks_to_nanoseconds(after.saturating_sub(before), frequency)
+        });
     let stdout = std::fs::read_to_string(&stdout_path)?;
     let stderr = std::fs::read_to_string(&stderr_path)?;
     std::fs::remove_file(stdout_path)?;
@@ -110,7 +138,82 @@ pub(super) fn capture_child(
         stdout,
         stderr,
         timed_out,
+        process_tree_cpu_ns,
+        peak_process_tree_resident_bytes,
     })
+}
+
+fn process_tree_resident_bytes(root: u32) -> u64 {
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    let mut total = 0_u64;
+    while let Some(process) = pending.pop() {
+        if !seen.insert(process) {
+            continue;
+        }
+        let root = format!("/proc/{process}");
+        if let Ok(status) = std::fs::read_to_string(format!("{root}/status")) {
+            total = total.saturating_add(parse_resident_bytes(&status));
+        }
+        if let Ok(children) = std::fs::read_to_string(format!("{root}/task/{process}/children")) {
+            pending.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<u32>().ok()),
+            );
+        }
+    }
+    total
+}
+
+fn parse_resident_bytes(status: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("VmRSS:")?.trim();
+            let kibibytes = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+            Some(kibibytes.saturating_mul(1024))
+        })
+        .unwrap_or(0)
+}
+
+fn completed_child_cpu_ticks() -> Result<u64, AnyError> {
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    parse_completed_child_cpu_ticks(&stat)
+        .ok_or_else(|| "cannot parse completed child CPU ticks from /proc/self/stat".into())
+}
+
+fn parse_completed_child_cpu_ticks(stat: &str) -> Option<u64> {
+    let fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    let values = fields
+        .skip(13)
+        .take(2)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(values[0].saturating_add(values[1]))
+}
+
+fn clock_ticks_per_second() -> Result<u64, AnyError> {
+    static VALUE: OnceLock<Result<u64, String>> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            command_output("getconf", &["CLK_TCK"])
+                .and_then(|value| value.parse().map_err(Into::into))
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(Into::into)
+}
+
+fn ticks_to_nanoseconds(ticks: u64, ticks_per_second: u64) -> u64 {
+    u64::try_from(
+        u128::from(ticks)
+            .saturating_mul(1_000_000_000)
+            .checked_div(u128::from(ticks_per_second))
+            .unwrap_or(u128::MAX),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 pub(super) fn hash_json(value: &impl Serialize) -> Result<String, AnyError> {
@@ -180,4 +283,28 @@ fn cpu_description() -> String {
             })
         })
         .unwrap_or_else(|| "unavailable".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_completed_child_cpu_ticks, parse_resident_bytes, ticks_to_nanoseconds};
+
+    #[test]
+    fn linux_resident_parser_uses_current_rss_in_bytes() {
+        let status = "Name:\tworker\nVmPeak:\t900 kB\nVmRSS:\t123 kB\nVmHWM:\t456 kB\n";
+        assert_eq!(parse_resident_bytes(status), 123 * 1024);
+        assert_eq!(parse_resident_bytes("Name:\tworker\n"), 0);
+    }
+
+    #[test]
+    fn linux_stat_parser_reads_completed_descendant_ticks() {
+        let stat = "7 (name with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 17 19 20";
+        assert_eq!(parse_completed_child_cpu_ticks(stat), Some(30));
+    }
+
+    #[test]
+    fn clock_ticks_convert_without_floating_point() {
+        assert_eq!(ticks_to_nanoseconds(25, 100), 250_000_000);
+        assert_eq!(ticks_to_nanoseconds(u64::MAX, 0), u64::MAX);
+    }
 }
