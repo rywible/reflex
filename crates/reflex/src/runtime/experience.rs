@@ -258,6 +258,12 @@ pub(super) struct CandidateFateCheckpoint {
     capacity: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct MeasurementCheckpoint {
+    len: usize,
+    capacity: usize,
+}
+
 impl ExperienceLedger {
     pub(super) fn from_parts(
         entries: Vec<ExperienceEntry>,
@@ -317,6 +323,18 @@ impl ExperienceLedger {
         fates: impl IntoIterator<Item = CandidateFateObservation>,
     ) {
         self.candidate_fates.extend(fates);
+    }
+
+    pub(super) fn checkpoint_measurements(&self) -> MeasurementCheckpoint {
+        MeasurementCheckpoint {
+            len: self.measurements.len(),
+            capacity: self.measurements.capacity(),
+        }
+    }
+
+    pub(super) fn rollback_measurements(&mut self, checkpoint: MeasurementCheckpoint) {
+        self.measurements.truncate(checkpoint.len);
+        self.measurements.shrink_to(checkpoint.capacity);
     }
 
     #[cfg(feature = "internal-experiments")]

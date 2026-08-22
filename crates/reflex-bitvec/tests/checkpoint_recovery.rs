@@ -3,16 +3,20 @@ use std::ops::ControlFlow;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use reflex::internal_experiments::inspect_experience_segment;
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, improve,
 };
 use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
+use reflex_bundle::{CanonicalBundle, SegmentKind};
 
 const HELPER_ENV: &str = "REFLEX_CHECKPOINT_CRASH_HELPER";
 const TARGET_ENV: &str = "REFLEX_CHECKPOINT_CRASH_TARGET";
 const PAUSE_ENV: &str = "REFLEX_CHECKPOINT_INITIAL_PAUSE_MS";
 const LOOP_ENV: &str = "REFLEX_CHECKPOINT_CRASH_LOOP";
+const COHORT_ENV: &str = "REFLEX_CHECKPOINT_COHORT_HELPER";
+const SOURCE_ENV: &str = "REFLEX_CHECKPOINT_CRASH_SOURCE";
 #[cfg(debug_assertions)]
 const FAULT_PHASE_ENV: &str = "REFLEX_INTERNAL_TEST_FAULT_PHASE";
 #[cfg(debug_assertions)]
@@ -122,6 +126,100 @@ fn interrupted_resume_retains_elapsed_resource_usage() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn refuted_cohort_checkpoint_recovers_the_deferred_tail() {
+    let directory = std::env::temp_dir().join(format!(
+        "reflex-cohort-recovery-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let uninterrupted_path = directory.join("uninterrupted.bundle");
+    let interrupted_path = directory.join("interrupted.bundle");
+    improve(
+        BitVecDomain::unary_u8(),
+        cohort_request(BundlePlan::Fresh {
+            target: uninterrupted_path.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(FAULT_PHASE_ENV, "cohort-published")
+        .env(FAULT_OCCURRENCE_ENV, "1")
+        .env(TARGET_ENV, &interrupted_path)
+        .status()
+        .unwrap();
+    assert!(
+        !status.success() && status.code().is_none(),
+        "the helper must abort immediately after publishing a refuted cohort"
+    );
+    improve(
+        BitVecDomain::unary_u8(),
+        cohort_request(BundlePlan::Resume {
+            source: interrupted_path.clone(),
+            target: interrupted_path.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        experience_identities(&interrupted_path),
+        experience_identities(&uninterrupted_path),
+        "Resume must decide the exact deferred Candidate tail retained by the uninterrupted run"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn interrupted_recovery_preserves_exact_search_frontier_membership() {
+    let directory = std::env::temp_dir().join(format!(
+        "reflex-frontier-recovery-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let original = directory.join("original.bundle");
+    let narrowed = directory.join("narrowed.bundle");
+    let recovered = directory.join("recovered.bundle");
+    let initial_status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(FAULT_PHASE_ENV, "atomic-rename")
+        .env(FAULT_OCCURRENCE_ENV, "1")
+        .env(TARGET_ENV, &original)
+        .status()
+        .unwrap();
+    assert!(!initial_status.success() && initial_status.code().is_none());
+    let expected_frontier_count = narrow_initial_frontier(&original, &narrowed);
+
+    let recovery_status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(SOURCE_ENV, &narrowed)
+        .env(FAULT_PHASE_ENV, "atomic-rename")
+        .env(FAULT_OCCURRENCE_ENV, "1")
+        .env(TARGET_ENV, &recovered)
+        .status()
+        .unwrap();
+    assert!(!recovery_status.success() && recovery_status.code().is_none());
+    assert_eq!(
+        recovery_frontier_count(&recovered),
+        expected_frontier_count,
+        "interrupted recovery must not schedule retained Artifacts absent from the sealed Search Frontier"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn randomized_process_kills_always_leave_restart_complete_state() {
     let directory = std::env::temp_dir().join(format!(
         "reflex-randomized-kills-{}-{}",
@@ -223,8 +321,8 @@ fn deterministic_faults_across_randomized_mutation_phases_recover_exactly() {
             .status()
             .unwrap();
         assert!(
-            !status.success(),
-            "fault phase {phase} must kill the helper"
+            !status.success() && status.code().is_none(),
+            "fault phase {phase} must abort the helper rather than merely exit unsuccessfully"
         );
         assert!(
             target.is_file(),
@@ -283,11 +381,34 @@ fn checkpoint_crash_helper() {
     }
     #[cfg(debug_assertions)]
     if std::env::var_os(FAULT_PHASE_ENV).is_some() {
-        improve(
-            BitVecDomain::unary_u8(),
-            request(BundlePlan::Fresh { target }),
-            |_| ControlFlow::Continue(()),
-        )
+        if std::env::var_os(COHORT_ENV).is_some() {
+            let bundle = std::env::var_os(SOURCE_ENV).map_or(
+                BundlePlan::Fresh {
+                    target: target.clone(),
+                },
+                |source| BundlePlan::Resume {
+                    source: source.into(),
+                    target,
+                },
+            );
+            improve(BitVecDomain::unary_u8(), cohort_request(bundle), |_| {
+                ControlFlow::Continue(())
+            })
+            .expect("the configured cohort fault must terminate this process");
+            panic!("configured private cohort fault was not reached");
+        }
+        let bundle = std::env::var_os(SOURCE_ENV).map_or(
+            BundlePlan::Fresh {
+                target: target.clone(),
+            },
+            |source| BundlePlan::Resume {
+                source: source.into(),
+                target,
+            },
+        );
+        improve(BitVecDomain::unary_u8(), request(bundle), |_| {
+            ControlFlow::Continue(())
+        })
         .expect("the configured private fault phase must terminate this process");
         panic!("configured private fault phase was not reached");
     }
@@ -314,6 +435,124 @@ fn checkpoint_crash_helper() {
             ControlFlow::Continue(())
         },
     );
+}
+
+fn cohort_request(bundle: BundlePlan) -> ImprovementRequest<BitVecDomain> {
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let seeds = (225..=228).map(multi_choice_seed);
+    ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(NonEmpty::try_from_iter(seeds).unwrap()),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+            NonZeroU64::new(1_000).unwrap(),
+        ),
+        bundle,
+    )
+    .unwrap()
+}
+
+fn multi_choice_seed(constant: u8) -> Expression {
+    Expression::xor(
+        Expression::xor(Expression::input(), Expression::constant(constant)),
+        Expression::constant(1),
+    )
+}
+
+fn experience_identities(path: &std::path::Path) -> Vec<([u8; 32], [u8; 32], u8)> {
+    let bundle = CanonicalBundle::decode(&std::fs::read(path).unwrap(), 64 * 1024 * 1024).unwrap();
+    let experience = inspect_experience_segment(bundle.segment(SegmentKind::Experience)).unwrap();
+    experience
+        .attempts
+        .into_iter()
+        .map(|attempt| {
+            let verdict = match attempt.verdict {
+                reflex::internal_experiments::ExperienceVerdictInspection::Accepted => 0,
+                reflex::internal_experiments::ExperienceVerdictInspection::Refuted => 1,
+                reflex::internal_experiments::ExperienceVerdictInspection::Unknown => 2,
+            };
+            (attempt.candidate_key, attempt.claim_digest, verdict)
+        })
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+fn narrow_initial_frontier(source: &std::path::Path, target: &std::path::Path) -> u64 {
+    let bundle =
+        CanonicalBundle::decode(&std::fs::read(source).unwrap(), 64 * 1024 * 1024).unwrap();
+    let recovery = bundle.segment(SegmentKind::Recovery);
+    let pareto_count =
+        usize::try_from(u64::from_le_bytes(recovery[..8].try_into().unwrap())).unwrap();
+    let frontier_count_offset = 8 + pareto_count * 32;
+    let frontier_count = usize::try_from(u64::from_le_bytes(
+        recovery[frontier_count_offset..frontier_count_offset + 8]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert!(frontier_count > 1);
+    let frontier_start = frontier_count_offset + 8;
+    let frontier_end = frontier_start + frontier_count * 32;
+    let removed_key = &recovery[frontier_end - 32..frontier_end];
+    let deferred_count =
+        u64::from_le_bytes(recovery[frontier_end..frontier_end + 8].try_into().unwrap());
+    assert_eq!(
+        deferred_count, 0,
+        "the first checkpoint has no deferred work"
+    );
+    let pending_count_offset = frontier_end + 8;
+    let pending_count = usize::try_from(u64::from_le_bytes(
+        recovery[pending_count_offset..pending_count_offset + 8]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let pending_start = pending_count_offset + 8;
+    let pending_end = pending_start + pending_count * 32;
+    assert_eq!(pending_end, recovery.len());
+
+    let mut narrowed = Vec::with_capacity(recovery.len() - 64);
+    narrowed.extend_from_slice(&recovery[..frontier_count_offset]);
+    narrowed.extend_from_slice(&(frontier_count as u64 - 1).to_le_bytes());
+    narrowed.extend_from_slice(&recovery[frontier_start..frontier_end - 32]);
+    narrowed.extend_from_slice(&0_u64.to_le_bytes());
+    let retained_pending = recovery[pending_start..pending_end]
+        .chunks_exact(32)
+        .filter(|key| *key != removed_key)
+        .collect::<Vec<_>>();
+    narrowed.extend_from_slice(&(retained_pending.len() as u64).to_le_bytes());
+    for key in retained_pending {
+        narrowed.extend_from_slice(key);
+    }
+    let encoded = CanonicalBundle::new(
+        bundle.identity().to_vec(),
+        bundle.segment(SegmentKind::Session).to_vec(),
+        bundle.segment(SegmentKind::Revisions).to_vec(),
+        bundle.segment(SegmentKind::Artifacts).to_vec(),
+        bundle.segment(SegmentKind::Experience).to_vec(),
+        narrowed,
+    )
+    .encode();
+    std::fs::write(target, encoded).unwrap();
+    frontier_count as u64 - 1
+}
+
+fn recovery_frontier_count(path: &std::path::Path) -> u64 {
+    let bundle = CanonicalBundle::decode(&std::fs::read(path).unwrap(), 64 * 1024 * 1024).unwrap();
+    let recovery = bundle.segment(SegmentKind::Recovery);
+    let pareto_count = u64::from_le_bytes(recovery[..8].try_into().unwrap());
+    let frontier_offset = 8 + usize::try_from(pareto_count).unwrap() * 32;
+    u64::from_le_bytes(
+        recovery[frontier_offset..frontier_offset + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 fn crash_checkpoint(label: &str) -> std::path::PathBuf {

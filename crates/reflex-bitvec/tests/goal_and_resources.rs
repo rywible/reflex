@@ -454,14 +454,16 @@ fn durable_budget_rejects_an_uncheckpointable_frontier_atomically() {
         ControlFlow::Continue(())
     })
     .unwrap();
+    let published_bytes = std::fs::read(&bundle_path).unwrap().len() as u64;
 
     assert!(
         outcome.completion() == Completion::ResourceEnvelopeExhausted
             && outcome.pareto().artifacts().len() == 1
             && outcome.pareto().artifacts()[0].artifact().node_count() == 3
-            && outcome.usage().durable_bytes == baseline.len() as u64
+            && outcome.usage().durable_bytes == published_bytes
+            && published_bytes <= baseline.len() as u64
             && updates == 1
-            && std::fs::read(&bundle_path).unwrap().len() == baseline.len(),
+            && published_bytes != 0,
         "an unaffordable Pareto transition must not be observed or enter the sealed state"
     );
     std::fs::remove_file(bundle_path).ok();

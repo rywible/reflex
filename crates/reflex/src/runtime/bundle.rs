@@ -1,13 +1,10 @@
 use std::path::Path;
 
 use crate::domain::DomainDefinition;
-use crate::knowledge::KnowledgeState;
-use crate::learning::LearningState;
 use crate::resource::ResourceEnvelopeGuard;
-use crate::session::{ImprovementRequest, SessionError, VerifiedArtifact};
+use crate::session::{ImprovementRequest, SessionError};
 
-use super::experience::ExperienceLedger;
-use super::{RecoveredBundle, SessionSeal};
+use super::{RecoveredBundle, RestartBundleState, SessionSeal};
 
 /// Semantic Domain Bundle encoding and recovery behind one restart-complete
 /// interface. Canonical framing is delegated to the private `reflex-bundle`
@@ -37,30 +34,12 @@ impl<'a, D: DomainDefinition> RestartBundleCodec<'a, D> {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "restart-complete sealing names each independently revised state family"
-    )]
     pub(super) fn seal(
         &self,
         seed_cursor: &[u8],
-        artifacts: &[VerifiedArtifact<D>],
-        pareto: &[VerifiedArtifact<D>],
-        ledger: &ExperienceLedger,
-        knowledge: &KnowledgeState,
-        learning: &LearningState,
+        state: RestartBundleState<'_, D>,
         session_seal: SessionSeal,
     ) -> Result<Vec<u8>, SessionError<D::Error>> {
-        super::encode_bundle(
-            self.domain,
-            self.request,
-            seed_cursor,
-            artifacts,
-            pareto,
-            ledger,
-            knowledge,
-            learning,
-            session_seal,
-        )
+        super::encode_bundle(self.domain, self.request, seed_cursor, state, session_seal)
     }
 }

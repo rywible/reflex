@@ -16,6 +16,66 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use reflex_bundle::{CanonicalBundle, SegmentKind};
 
 #[test]
+fn verification_is_cohorted_before_the_envelope_is_exhausted() {
+    let directory = std::env::temp_dir().join(format!(
+        "reflex-verification-cohort-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let bundle = directory.join("cohorted.bundle");
+
+    improve(
+        BitVecDomain::unary_u8(),
+        request(
+            vec![
+                multi_choice_seed(225),
+                multi_choice_seed(226),
+                multi_choice_seed(227),
+                multi_choice_seed(228),
+            ],
+            50,
+            BundlePlan::Fresh {
+                target: bundle.clone(),
+            },
+        ),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    let snapshot = snapshot(&bundle);
+    let verified = snapshot
+        .candidate_fates
+        .iter()
+        .filter_map(|fate| match fate.outcome {
+            CandidateFateOutcomeInspection::Verified { .. } => {
+                Some((fate.epoch, fate.verification_batch_size.unwrap()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        verified.len() > 8,
+        "fixture must exercise more than one cohort"
+    );
+    assert!(
+        verified.iter().all(|(_, batch_size)| *batch_size <= 8),
+        "one correctness-claim pair should be reconsidered after at most eight checks"
+    );
+    assert!(
+        verified
+            .iter()
+            .map(|(epoch, _)| *epoch)
+            .collect::<BTreeSet<_>>()
+            .len()
+            >= 2,
+        "the envelope must contain more than one admission-feedback step"
+    );
+
+    std::fs::remove_dir_all(directory).ok();
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one public-path scenario compares training, constrained allocation, and sufficient-budget semantics"

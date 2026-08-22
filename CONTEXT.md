@@ -32,6 +32,10 @@ _Avoid_: Test suite, learned verifier, optimizer
 The per-batch portion of the Resource Envelope granted to a Verification Kernel, including worker lanes, resident memory, elapsed time, and CPU time; external usage and failure are charged before the batch outcome is interpreted.
 _Avoid_: Separate verifier budget, advisory timeout
 
+**Verification Cohort**:
+The bounded set of selected Candidates sent through one Verification batch and one Admission feedback step before search allocation is reconsidered.
+_Avoid_: Training batch, Verification budget, Candidate queue
+
 **Verification Record**:
 The replayable evidence binding a Correctness Claim and its assumptions to the exact semantics and Verification Kernel revision that accepted it.
 _Avoid_: Test result, confidence score, benchmark report

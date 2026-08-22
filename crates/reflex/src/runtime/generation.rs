@@ -1,195 +1,86 @@
-use std::collections::HashMap;
-
-use crate::StructuralLocation;
-
-pub(super) struct ClaimCompleteBatch<A> {
-    pub(super) groups: Vec<Vec<A>>,
-    pub(super) truncated: bool,
-    pub(super) working_metadata_bytes: u64,
-}
-
-pub(super) fn group_locations(
-    locations: &[StructuralLocation],
-    claim_by_artifact: &[[u8; 32]],
-) -> Vec<Vec<StructuralLocation>> {
-    let mut indexes = HashMap::new();
-    let mut groups = Vec::<Vec<StructuralLocation>>::new();
-    for location in locations {
-        let claim = *claim_by_artifact
-            .get(location.artifact_index())
-            .expect("generated structural locations refer to the Search Frontier");
-        let next_index = indexes.len();
-        let index = *indexes.entry(claim).or_insert(next_index);
-        if index == groups.len() {
-            groups.push(Vec::new());
-        }
-        groups[index].push(*location);
-    }
-    groups
-}
-
-pub(super) fn fill_claim_complete<G, A, E>(
-    input_groups: &[G],
+pub(super) fn select_pending_parents<K: Copy + Eq>(
+    pending_indexes: &[usize],
+    claim_by_artifact: &[K],
     limit: usize,
-    mut fill: impl FnMut(&G, usize, &mut Vec<A>) -> Result<bool, E>,
-) -> Result<ClaimCompleteBatch<A>, E> {
-    assert!(!input_groups.is_empty());
-    assert!(input_groups.len() <= limit);
-
-    let base = limit / input_groups.len();
-    let remainder = limit % input_groups.len();
-    let mut groups = Vec::with_capacity(input_groups.len());
-    for (index, input) in input_groups.iter().enumerate() {
-        let group_limit = base + usize::from(index < remainder);
-        let (values, truncated) = fill_bounded(input, group_limit, &mut fill)?;
-        groups.push(GroupFill {
-            values,
-            truncated,
-            limit: group_limit,
-        });
+) -> Vec<usize> {
+    let claims = ordered_distinct_claims(pending_indexes, claim_by_artifact);
+    if claims.len() > limit {
+        return pending_indexes[..pending_indexes.len().min(limit)].to_vec();
     }
-
-    loop {
-        let used = groups.iter().map(|group| group.values.len()).sum::<usize>();
-        let remaining = limit - used;
-        if remaining == 0 {
-            break;
-        }
-        let expandable = groups
+    let mut selected = Vec::with_capacity(pending_indexes.len().min(limit));
+    for claim in claims {
+        if let Some(index) = pending_indexes
             .iter()
-            .filter(|group| group.values.len() == group.limit)
-            .count();
-        if expandable == 0 {
+            .find(|index| claim_by_artifact[**index] == claim)
+        {
+            selected.push(*index);
+        }
+    }
+    for index in pending_indexes {
+        if selected.len() == limit {
             break;
         }
-        let base_increase = remaining / expandable;
-        let increase_remainder = remaining % expandable;
-        let mut position = 0_usize;
-        for (index, group) in groups.iter_mut().enumerate() {
-            if group.values.len() != group.limit {
-                continue;
-            }
-            let increase = base_increase + usize::from(position < increase_remainder);
-            position += 1;
-            if increase == 0 {
-                continue;
-            }
-            let previous_len = group.values.len();
-            let expanded_limit = group.limit + increase;
-            group.values = Vec::new();
-            let (values, truncated) =
-                fill_bounded(&input_groups[index], expanded_limit, &mut fill)?;
-            assert!(values.len() >= previous_len);
-            group.values = values;
-            group.truncated = truncated;
-            group.limit = expanded_limit;
+        if !selected.contains(index) {
+            selected.push(*index);
         }
     }
-
-    let working_metadata_bytes =
-        (groups.capacity() as u64).saturating_mul(std::mem::size_of::<GroupFill<A>>() as u64);
-    Ok(ClaimCompleteBatch {
-        truncated: groups.iter().any(|group| group.truncated),
-        groups: groups.into_iter().map(|group| group.values).collect(),
-        working_metadata_bytes,
-    })
+    selected
 }
 
-fn fill_bounded<G, A, E>(
-    input: &G,
-    limit: usize,
-    fill: &mut impl FnMut(&G, usize, &mut Vec<A>) -> Result<bool, E>,
-) -> Result<(Vec<A>, bool), E> {
-    let mut values = Vec::with_capacity(limit);
-    let mut truncated = fill(input, limit, &mut values)?;
-    assert!(values.len() <= limit);
-    if values.len() == limit {
-        return Ok((values, truncated));
+pub(super) fn parent_capacity<K: Copy + Eq>(
+    choice_budget: usize,
+    operator_count: usize,
+    pending_indexes: &[usize],
+    claim_by_artifact: &[K],
+) -> usize {
+    const COMPLETE_CLAIM_FLOOR: usize = 8;
+    if choice_budget == 0 || operator_count == 0 {
+        return usize::MAX;
     }
-
-    let exact_len = values.len();
-    drop(values);
-    let mut exact = Vec::with_capacity(exact_len);
-    if exact_len != 0 {
-        truncated |= fill(input, exact_len, &mut exact)?;
-        assert_eq!(exact.len(), exact_len);
-    }
-    Ok((exact, truncated))
+    let ordinary = (choice_budget / operator_count).max(1);
+    let claims = ordered_distinct_claims(pending_indexes, claim_by_artifact);
+    let complete_claims = if claims.len() <= COMPLETE_CLAIM_FLOOR && claims.len() <= choice_budget {
+        claims.len()
+    } else {
+        0
+    };
+    ordinary.max(complete_claims)
 }
 
-struct GroupFill<A> {
-    values: Vec<A>,
-    truncated: bool,
-    limit: usize,
+fn ordered_distinct_claims<K: Copy + Eq>(
+    pending_indexes: &[usize],
+    claim_by_artifact: &[K],
+) -> Vec<K> {
+    let mut claims = Vec::new();
+    for index in pending_indexes {
+        let claim = claim_by_artifact[*index];
+        if !claims.contains(&claim) {
+            claims.push(claim);
+        }
+    }
+    claims
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fill_claim_complete, group_locations};
-    use crate::StructuralLocation;
+    use super::{parent_capacity, select_pending_parents};
 
     #[test]
-    fn unused_claim_capacity_is_redistributed_without_starving_any_claim() {
-        let groups = [0_usize, 1, 2];
-        let supplies = [10_usize, 1, 10];
+    fn pending_parent_selection_covers_claims_and_leaves_the_unprocessed_tail() {
+        let claims = [[1; 32], [1; 32], [2; 32], [1; 32]];
+        let pending = [0, 1, 2, 3];
 
-        let result = fill_claim_complete(&groups, 9, |claim, limit, output| {
-            let emitted = supplies[*claim].min(limit);
-            output.extend(std::iter::repeat_n(*claim, emitted));
-            Ok::<_, ()>(emitted < supplies[*claim])
-        })
-        .unwrap();
-
-        assert_eq!(
-            result.groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            [4, 1, 4]
-        );
-        assert!(result.groups.iter().map(Vec::capacity).sum::<usize>() <= 9);
-        assert!(result.truncated);
+        assert_eq!(select_pending_parents(&pending, &claims, 3), [0, 2, 1]);
+        assert_eq!(select_pending_parents(&pending, &claims, 1), [0]);
     }
 
     #[test]
-    fn candidate_fanout_remains_claim_complete_after_application_enumeration() {
-        let application_groups = vec![vec![0_usize], vec![1], vec![2]];
-        let candidate_supplies = [12_usize, 1, 6];
+    fn parent_capacity_covers_small_claim_sets_without_spreading_large_sets_too_thin() {
+        let two_claims = [[1; 32], [2; 32]];
+        let many_claims = (0_u8..32).map(|value| [value; 32]).collect::<Vec<_>>();
+        let many_indexes = (0..many_claims.len()).collect::<Vec<_>>();
 
-        let result = fill_claim_complete(&application_groups, 9, |applications, limit, output| {
-            let claim = applications[0];
-            let emitted = candidate_supplies[claim].min(limit);
-            output.extend(std::iter::repeat_n(claim, emitted));
-            Ok::<_, ()>(emitted < candidate_supplies[claim])
-        })
-        .unwrap();
-
-        assert_eq!(
-            result.groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            [4, 1, 4]
-        );
-        assert!(result.groups.iter().map(Vec::capacity).sum::<usize>() <= 9);
-    }
-
-    #[test]
-    fn structural_locations_are_grouped_by_claim_in_first_occurrence_order() {
-        let claims = [[1; 32], [2; 32], [1; 32]];
-        let locations = [
-            StructuralLocation::new(0, 5),
-            StructuralLocation::new(1, 6),
-            StructuralLocation::new(2, 7),
-        ];
-
-        let groups = group_locations(&locations, &claims);
-
-        assert_eq!(
-            groups
-                .iter()
-                .map(|group| {
-                    group
-                        .iter()
-                        .map(|location| location.artifact_index())
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>(),
-            [vec![0, 2], vec![1]]
-        );
+        assert_eq!(parent_capacity(8, 8, &[0, 1], &two_claims), 2);
+        assert_eq!(parent_capacity(60, 8, &many_indexes, &many_claims), 7);
     }
 }

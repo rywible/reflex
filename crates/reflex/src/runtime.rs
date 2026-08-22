@@ -20,8 +20,8 @@ use crate::durability;
 use crate::instrumentation::{Phase, Recorder};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
-    AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, FtrlModel,
-    LearningState, compare_forecasts, derive_targets,
+    AttemptObservation, ConsequenceKind, ConsequenceObservation, FEATURE_COUNT, Features,
+    FtrlModel, LearningState, compare_forecasts, derive_targets,
 };
 use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
 use crate::policy::{AllocationQueue, OperationalPartition, operational_ranked_selections};
@@ -32,6 +32,7 @@ use crate::session::{
 };
 
 mod bundle;
+mod cohort;
 mod epoch;
 mod experience;
 mod generation;
@@ -64,6 +65,9 @@ type ClaimedVerdicts<D> = Vec<(ClaimOf<D>, Verdict<EvidenceOf<D>>)>;
 struct RecoveredBundle<D: DomainDefinition> {
     artifacts: Vec<StoredArtifact<D>>,
     pareto_keys: Vec<ArtifactKey>,
+    frontier_keys: Vec<ArtifactKey>,
+    deferred_candidates: Vec<DeferredCandidate<D>>,
+    pending_parent_keys: Vec<ArtifactKey>,
     ledger: ExperienceLedger,
     revisions: Option<RevisionIds>,
     interrupted_usage: Option<ResourceUsage>,
@@ -77,6 +81,9 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
         Self {
             artifacts: Vec::new(),
             pareto_keys: Vec::new(),
+            frontier_keys: Vec::new(),
+            deferred_candidates: Vec::new(),
+            pending_parent_keys: Vec::new(),
             ledger: ExperienceLedger::default(),
             revisions: None,
             interrupted_usage: None,
@@ -109,11 +116,76 @@ struct ProposedCandidate<D: DomainDefinition> {
     fate_index: usize,
     bootstrap_rank: CandidateRank,
     learned_rank: CandidateRank,
+    generated_in_epoch: bool,
+}
+
+struct SearchTailView<'a, D: DomainDefinition> {
+    frontier: &'a [(VerifiedArtifact<D>, usize)],
+    deferred_candidates: &'a [ProposedCandidate<D>],
+    pending_parent_keys: &'a [ArtifactKey],
+}
+
+struct RestartBundleState<'a, D: DomainDefinition> {
+    artifacts: &'a [VerifiedArtifact<D>],
+    pareto: &'a [VerifiedArtifact<D>],
+    search_tail: SearchTailView<'a, D>,
+    ledger: &'a ExperienceLedger,
+    knowledge: &'a KnowledgeState,
+    learning: &'a LearningState,
+}
+
+impl<'a, D: DomainDefinition> RestartBundleState<'a, D> {
+    const fn new(
+        artifacts: &'a [VerifiedArtifact<D>],
+        pareto: &'a [VerifiedArtifact<D>],
+        search_tail: SearchTailView<'a, D>,
+        ledger: &'a ExperienceLedger,
+        knowledge: &'a KnowledgeState,
+        learning: &'a LearningState,
+    ) -> Self {
+        Self {
+            artifacts,
+            pareto,
+            search_tail,
+            ledger,
+            knowledge,
+            learning,
+        }
+    }
+}
+
+impl<'a, D: DomainDefinition> SearchTailView<'a, D> {
+    const fn new(
+        frontier: &'a [(VerifiedArtifact<D>, usize)],
+        deferred_candidates: &'a [ProposedCandidate<D>],
+        pending_parent_keys: &'a [ArtifactKey],
+    ) -> Self {
+        Self {
+            frontier,
+            deferred_candidates,
+            pending_parent_keys,
+        }
+    }
+}
+
+struct DeferredCandidate<D: DomainDefinition> {
+    artifact: D::Artifact,
+    parent_key: ArtifactKey,
+    operator_symbol: Vec<u8>,
+    proposal_features: ProposalFeatures,
+    proposal_limit: u32,
+    protected_derived: bool,
+}
+
+struct GenerationParents<'a, D: DomainDefinition> {
+    artifacts: &'a [&'a D::Artifact],
+    frontier_indexes: &'a [usize],
 }
 
 struct NovelCandidateBatch<D: DomainDefinition> {
     candidates: Vec<ProposedCandidate<D>>,
     fates: Vec<CandidateFateObservation>,
+    fate_is_new_generation: Vec<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +225,7 @@ const DURABILITY_STACK_BYTES: usize = 512 * 1024;
 const CHOICES_PER_VERIFICATION: u64 = 8;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
-const RUNTIME_REVISION: u64 = 8;
+const RUNTIME_REVISION: u64 = 10;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -569,8 +641,13 @@ where
         .map(|source| bundle_codec.recover(source, resource_meter, worker_resident_bytes))
         .transpose()?
         .unwrap_or_default();
+    let recovered_has_search_tail = !recovered_bundle.deferred_candidates.is_empty()
+        || !recovered_bundle.pending_parent_keys.is_empty();
     let recovered_resident_bytes = recovered_bundle.resident_bytes;
     let recovered_keys = recovered_bundle.pareto_keys;
+    let recovered_frontier_keys = recovered_bundle.frontier_keys;
+    let recovered_deferred = recovered_bundle.deferred_candidates;
+    let recovered_pending_parent_keys = recovered_bundle.pending_parent_keys;
     let recovered_stored = recovered_bundle.artifacts;
     let mut ledger = recovered_bundle.ledger;
     let mut knowledge = recovered_bundle.knowledge;
@@ -636,11 +713,14 @@ where
             .map_err(|()| SessionError::Resource)?;
         let probe = bundle_codec.seal(
             &seed_cursor,
-            &[],
-            &[],
-            &ledger,
-            &knowledge,
-            &learning,
+            RestartBundleState::new(
+                &[],
+                &[],
+                SearchTailView::new(&[], &[], &[]),
+                &ledger,
+                &knowledge,
+                &learning,
+            ),
             SessionSeal::Interrupted(usage),
         )?;
         if !resource_meter.checkpoint_fits(probe.len() as u64) {
@@ -790,39 +870,110 @@ where
     extend_unique(&mut known, roots.iter().cloned());
     let initial_goal_frontiers = goal_evaluator.frontiers(&known);
     let mut pareto = GoalEvaluator::<D>::pareto_from_frontiers(&initial_goal_frontiers);
+    let resuming_interrupted = recovered_bundle.interrupted_usage.is_some();
+    let restoring_search_tail = resuming_interrupted || recovered_has_search_tail;
+    let mut frontier = if restoring_search_tail {
+        recovered_frontier_keys
+            .into_iter()
+            .map(|key| {
+                let artifact = known
+                    .iter()
+                    .find(|artifact| artifact.key() == key)
+                    .cloned()
+                    .ok_or(SessionError::CorruptBundle)?;
+                let origin = roots
+                    .iter()
+                    .position(|root| root.key() == artifact.inner.origin_key)
+                    .ok_or(SessionError::CorruptBundle)?;
+                Ok((artifact, origin))
+            })
+            .collect::<Result<Vec<_>, SessionError<D::Error>>>()?
+    } else {
+        let mut selected_frontier = roots
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(origin, artifact)| (artifact, origin))
+            .collect::<Vec<_>>();
+        for artifact in recovered {
+            if let Some(origin) = roots
+                .iter()
+                .position(|root| root.key() == artifact.inner.origin_key)
+                && pinned_knowledge.schedules(artifact.key().0)
+                && !selected_frontier
+                    .iter()
+                    .any(|(scheduled, _)| scheduled.key() == artifact.key())
+            {
+                selected_frontier.push((artifact, origin));
+            }
+        }
+        selected_frontier
+    };
+    let mut deferred_candidates = recovered_deferred
+        .into_iter()
+        .map(|deferred| {
+            let source_index = frontier
+                .iter()
+                .position(|(parent, _)| parent.key() == deferred.parent_key)
+                .ok_or(SessionError::CorruptBundle)?;
+            let operator_is_known = domain.operators().catalog().iter().any(|descriptor| {
+                descriptor.symbol().as_str().as_bytes() == deferred.operator_symbol
+            }) || pinned_knowledge
+                .resolve_operator(&deferred.operator_symbol)
+                .is_some();
+            if !operator_is_known {
+                return Err(SessionError::CorruptBundle);
+            }
+            Ok(ProposedCandidate {
+                candidate: Candidate {
+                    source_index,
+                    artifact: deferred.artifact,
+                    proposal_features: deferred.proposal_features,
+                },
+                operator_symbol: deferred.operator_symbol,
+                features: Features([0.0; FEATURE_COUNT]),
+                epoch: 0,
+                proposal_limit: deferred.proposal_limit,
+                protected_derived: deferred.protected_derived,
+                allocation_queue: AllocationQueue::Bootstrap,
+                fate_index: usize::MAX,
+                bootstrap_rank: CandidateRank::absent(),
+                learned_rank: CandidateRank::absent(),
+                generated_in_epoch: false,
+            })
+        })
+        .collect::<Result<Vec<_>, SessionError<D::Error>>>()?;
+    let mut pending_parent_keys = if restoring_search_tail {
+        recovered_pending_parent_keys
+    } else {
+        frontier
+            .iter()
+            .map(|(artifact, _)| artifact.key())
+            .collect()
+    };
+    if pending_parent_keys
+        .iter()
+        .any(|key| !frontier.iter().any(|(artifact, _)| artifact.key() == *key))
+    {
+        return Err(SessionError::CorruptBundle);
+    }
     let initial_usage = resource_meter
         .usage(verification_requests, 0)
         .map_err(|()| SessionError::Resource)?;
     let mut checkpoint = bundle_codec.seal(
         &seed_cursor,
-        &known,
-        &pareto,
-        &ledger,
-        &knowledge,
-        &learning,
+        RestartBundleState::new(
+            &known,
+            &pareto,
+            SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+            &ledger,
+            &knowledge,
+            &learning,
+        ),
         SessionSeal::Interrupted(initial_usage),
     )?;
     if !resource_meter.checkpoint_fits(checkpoint.len() as u64) {
         return Err(SessionError::Resource);
-    }
-    let mut frontier = roots
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(origin, artifact)| (artifact, origin))
-        .collect::<Vec<_>>();
-    let resuming_interrupted = recovered_bundle.interrupted_usage.is_some();
-    for artifact in recovered {
-        if let Some(origin) = roots
-            .iter()
-            .position(|root| root.key() == artifact.inner.origin_key)
-            && (resuming_interrupted || pinned_knowledge.schedules(artifact.key().0))
-            && !frontier
-                .iter()
-                .any(|(scheduled, _)| scheduled.key() == artifact.key())
-        {
-            frontier.push((artifact, origin));
-        }
     }
     let operators = domain
         .operators()
@@ -830,18 +981,24 @@ where
         .iter()
         .map(crate::OperatorDescriptor::operator)
         .collect::<Vec<_>>();
-    let initial_resident = worker_resident_bytes.saturating_add(resident_state_bytes(
-        &known,
-        &roots,
-        &pareto,
-        &frontier,
-        &recovered_keys,
-        &operators,
-        &checkpoint,
-        &ledger,
-        &knowledge,
-        &learning,
-    ));
+    let initial_resident = worker_resident_bytes
+        .saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ))
+        .saturating_add(cohort::recovery_resident_bytes(
+            domain,
+            &deferred_candidates,
+            &pending_parent_keys,
+        ));
     if !resource_meter.reserve(
         ResidentReservation::live(initial_resident).with_transient(checkpoint.capacity() as u64),
     ) {
@@ -909,7 +1066,12 @@ where
             )
             .saturating_add(
                 (frontier.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
-            );
+            )
+            .saturating_add(cohort::recovery_resident_bytes(
+                domain,
+                &deferred_candidates,
+                &pending_parent_keys,
+            ));
         if !resource_meter.reserve(ResidentReservation::live(resident_before_epoch)) {
             resident_budget_exhausted = true;
             break;
@@ -937,8 +1099,14 @@ where
             .iter()
             .map(|(_, origin)| *origin)
             .collect::<Vec<_>>();
+        let pending_parent_indexes = frontier
+            .iter()
+            .enumerate()
+            .filter(|(_, (artifact, _))| pending_parent_keys.contains(&artifact.key()))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
         let mut candidates = Vec::new();
-        let mut application_bytes = 0_u64;
+        let mut application_bytes = vector_bytes(&pending_parent_indexes);
         let mut choice_window_exhausted = false;
         let available_resident = resource_meter.available_resident(resident_before_epoch);
         let generation_limit = usize::try_from(
@@ -961,22 +1129,76 @@ where
             resident_budget_exhausted = true;
             break;
         }
-        let candidate_epoch = selection_epoch;
-        selection_epoch = selection_epoch
-            .checked_add(1)
-            .ok_or(SessionError::CorruptBundle)?;
-        let has_derived = pinned_knowledge
-            .operators()
-            .iter()
-            .any(crate::knowledge::DerivedOperator::active);
+        let catalog = domain.operators().catalog();
+        let has_derived = !pending_parent_indexes.is_empty()
+            && pinned_knowledge
+                .operators()
+                .iter()
+                .any(crate::knowledge::DerivedOperator::active);
         let derived_budget = if has_derived {
             generation_limit.div_ceil(4)
         } else {
             0
         };
-        let mut primitive_budget = generation_limit.saturating_sub(derived_budget);
-        let catalog = domain.operators().catalog();
-        for (operator_index, descriptor) in catalog.iter().enumerate() {
+        let primitive_budget = generation_limit.saturating_sub(derived_budget);
+        let primitive_parent_capacity = generation::parent_capacity(
+            primitive_budget,
+            catalog.len(),
+            &pending_parent_indexes,
+            &parent_claims,
+        );
+        let derived_parent_capacity = if has_derived {
+            derived_budget.max(1)
+        } else {
+            usize::MAX
+        };
+        let parent_capacity = generation_limit
+            .min(primitive_parent_capacity)
+            .min(derived_parent_capacity);
+        let generation_parent_indexes = generation::select_pending_parents(
+            &pending_parent_indexes,
+            &parent_claims,
+            parent_capacity,
+        );
+        let generation_parents = generation_parent_indexes
+            .iter()
+            .map(|index| parents[*index])
+            .collect::<Vec<_>>();
+        application_bytes = application_bytes
+            .saturating_add(vector_bytes(&generation_parent_indexes))
+            .saturating_add(vector_bytes(&generation_parents));
+        let candidate_epoch = selection_epoch;
+        selection_epoch = selection_epoch
+            .checked_add(1)
+            .ok_or(SessionError::CorruptBundle)?;
+        candidates.append(&mut deferred_candidates);
+        let carried_candidate_count = candidates.len();
+        for candidate in &mut candidates {
+            candidate.epoch = candidate_epoch;
+            let operator = std::str::from_utf8(&candidate.operator_symbol)
+                .expect("canonical Operator symbols are UTF-8");
+            let parent = parent_summaries
+                .get(candidate.candidate.source_index)
+                .expect("deferred Candidates retain a Search Frontier parent");
+            candidate.features = opportunity_features(
+                domain,
+                *parent,
+                &candidate.candidate.artifact,
+                operator_feature_values(operator),
+                candidate_epoch,
+                candidate.candidate.proposal_features,
+            );
+            candidate.fate_index = usize::MAX;
+            candidate.bootstrap_rank = CandidateRank::absent();
+            candidate.learned_rank = CandidateRank::absent();
+            candidate.generated_in_epoch = false;
+        }
+        let mut remaining_primitive_budget = primitive_budget;
+        for (parent_position, (parent, source_index)) in generation_parents
+            .iter()
+            .zip(&generation_parent_indexes)
+            .enumerate()
+        {
             if resource_meter
                 .search_time_exhausted()
                 .map_err(|()| SessionError::Resource)?
@@ -984,158 +1206,79 @@ where
                 time_exhausted = true;
                 break;
             }
-            if primitive_budget == 0 {
-                break;
-            }
-            let operators_left = catalog.len() - operator_index;
-            let operator_limit = primitive_budget.div_ceil(operators_left);
-            let locations = root_locations(domain, &parents);
-            let location_groups = generation::group_locations(&locations, &parent_claims);
-            let claim_complete =
-                location_groups.len() > 1 && location_groups.len() <= operator_limit;
-            let (operator_candidate_groups, operator_transient_bytes, truncated) = if claim_complete
-            {
-                let application_batch = generation::fill_claim_complete(
-                    &location_groups,
-                    operator_limit,
-                    |selected_locations, limit, applications| {
-                        let mut writer = ApplicationWriter::with_limit(applications, limit);
-                        domain.operators().enumerate_legal(
-                            OperatorEnumerationBatch::new(
-                                &parents,
-                                selected_locations,
-                                std::slice::from_ref(&descriptor.operator()),
-                            ),
-                            &mut writer,
-                            &mut operator_scratch,
-                        )?;
-                        Ok::<_, D::Error>(writer.overflowed())
-                    },
-                )
-                .map_err(SessionError::Domain)?;
-                let candidate_batch = generation::fill_claim_complete(
-                    &application_batch.groups,
-                    operator_limit,
-                    |applications, limit, candidates| {
-                        let mut writer = CandidateWriter::with_limit(candidates, limit);
-                        domain.operators().apply_batch(
-                            applications,
-                            &mut writer,
-                            &mut operator_scratch,
-                        )?;
-                        Ok::<_, D::Error>(writer.overflowed())
-                    },
-                )
-                .map_err(SessionError::Domain)?;
-                let transient_bytes = vector_bytes(&locations)
-                    .saturating_add(vector_bytes(&parent_claims))
-                    .saturating_add(grouped_vector_bytes(&location_groups))
-                    .saturating_add(grouped_vector_bytes(&application_batch.groups))
-                    .saturating_add(grouped_vector_bytes(&candidate_batch.groups))
-                    .saturating_add(application_batch.working_metadata_bytes)
-                    .saturating_add(candidate_batch.working_metadata_bytes);
-                let truncated = application_batch.truncated || candidate_batch.truncated;
-                (candidate_batch.groups, transient_bytes, truncated)
-            } else {
-                let mut applications = Vec::new();
-                let mut application_writer =
-                    ApplicationWriter::with_limit(&mut applications, operator_limit);
-                domain
-                    .operators()
-                    .enumerate_legal(
-                        OperatorEnumerationBatch::new(
-                            &parents,
-                            &locations,
-                            std::slice::from_ref(&descriptor.operator()),
-                        ),
-                        &mut application_writer,
-                        &mut operator_scratch,
-                    )
-                    .map_err(SessionError::Domain)?;
-                let application_truncated = application_writer.overflowed();
-                let mut operator_candidates = Vec::new();
-                let mut candidate_writer =
-                    CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
-                domain
-                    .operators()
-                    .apply_batch(&applications, &mut candidate_writer, &mut operator_scratch)
-                    .map_err(SessionError::Domain)?;
-                let truncated = application_truncated || candidate_writer.overflowed();
-                let transient_bytes = vector_bytes(&locations)
-                    .saturating_add(vector_bytes(&parent_claims))
-                    .saturating_add(grouped_vector_bytes(&location_groups))
-                    .saturating_add(vector_bytes(&applications))
-                    .saturating_add(vector_bytes(&operator_candidates));
-                (vec![operator_candidates], transient_bytes, truncated)
-            };
-            choice_window_exhausted |= truncated;
-            if resource_meter
-                .search_time_exhausted()
-                .map_err(|()| SessionError::Resource)?
-            {
-                time_exhausted = true;
-                break;
-            }
-            let operator_candidate_count = operator_candidate_groups
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>();
-            primitive_budget = primitive_budget.saturating_sub(operator_candidate_count);
-            application_bytes = application_bytes.max(operator_transient_bytes);
-            let operator_features = operator_feature_values(descriptor.symbol().as_str());
-            for candidate in operator_candidate_groups.into_iter().flatten() {
-                let parent = parent_summaries
-                    .get(candidate.source_index)
-                    .ok_or(SessionError::InvalidSeed)?;
-                candidates.push(ProposedCandidate {
-                    features: opportunity_features(
-                        domain,
-                        *parent,
-                        &candidate.artifact,
-                        operator_features,
-                        candidate_epoch,
-                        candidate.proposal_features,
-                    ),
-                    candidate,
-                    operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
-                    epoch: candidate_epoch,
-                    proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
-                    protected_derived: false,
-                    allocation_queue: AllocationQueue::Bootstrap,
-                    fate_index: usize::MAX,
-                    bootstrap_rank: CandidateRank::absent(),
-                    learned_rank: CandidateRank::absent(),
-                });
-            }
+            let parents_left = generation_parents.len() - parent_position;
+            let parent_budget = remaining_primitive_budget.div_ceil(parents_left);
+            let before = candidates.len();
+            let parent_artifacts = [*parent];
+            let parent_indexes = [*source_index];
+            let (primitive_bytes, primitive_truncated) = append_primitive_candidates(
+                domain,
+                &GenerationParents {
+                    artifacts: &parent_artifacts,
+                    frontier_indexes: &parent_indexes,
+                },
+                &mut operator_scratch,
+                parent_budget,
+                candidate_epoch,
+                &mut candidates,
+            )?;
+            remaining_primitive_budget =
+                remaining_primitive_budget.saturating_sub(candidates.len() - before);
+            application_bytes = application_bytes.max(primitive_bytes);
+            choice_window_exhausted |= primitive_truncated;
         }
         if time_exhausted {
+            deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
             break;
         }
         if resource_meter
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?
         {
+            deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
             time_exhausted = true;
             break;
         }
-        let (derived_bytes, derived_truncated) = append_derived_candidates(
-            domain,
-            &parents,
-            &pinned_knowledge,
-            &mut operator_scratch,
-            derived_budget,
-            candidate_epoch,
-            &mut candidates,
-        )?;
-        application_bytes = application_bytes.max(derived_bytes);
-        choice_window_exhausted |= derived_truncated;
-        instrumentation.generated(candidates.len());
+        let mut remaining_derived_budget = derived_budget;
+        for (parent_position, (parent, source_index)) in generation_parents
+            .iter()
+            .zip(&generation_parent_indexes)
+            .enumerate()
+        {
+            let parents_left = generation_parents.len() - parent_position;
+            let parent_budget = remaining_derived_budget.div_ceil(parents_left);
+            let before = candidates.len();
+            let parent_artifacts = [*parent];
+            let parent_indexes = [*source_index];
+            let (derived_bytes, derived_truncated) = append_derived_candidates(
+                domain,
+                &GenerationParents {
+                    artifacts: &parent_artifacts,
+                    frontier_indexes: &parent_indexes,
+                },
+                &pinned_knowledge,
+                &mut operator_scratch,
+                parent_budget,
+                candidate_epoch,
+                &mut candidates,
+            )?;
+            remaining_derived_budget =
+                remaining_derived_budget.saturating_sub(candidates.len() - before);
+            application_bytes = application_bytes.max(derived_bytes);
+            choice_window_exhausted |= derived_truncated;
+        }
+        let processed_parent_keys = generation_parent_indexes
+            .iter()
+            .map(|index| frontier[*index].0.key())
+            .collect::<HashSet<_>>();
+        instrumentation.generated(candidates.len().saturating_sub(carried_candidate_count));
         instrumentation.finish(Phase::Generation, generation_started);
         test_fault_point("candidate-created");
         if resource_meter
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?
         {
+            deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
             time_exhausted = true;
             break;
         }
@@ -1150,15 +1293,31 @@ where
         )?;
         candidates = novel.candidates;
         let mut candidate_fates = novel.fates;
+        let fate_is_new_generation = novel.fate_is_new_generation;
+        let mut covered_claims = ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.claim_digest)
+            .collect::<Vec<_>>();
+        covered_claims.sort_unstable();
+        covered_claims.dedup();
         let remaining = usize::try_from(remaining_verifications).unwrap_or(usize::MAX);
-        order_by_learned_potential(
+        let cohort_limit = cohort::limit(
+            remaining,
+            verification_workers.worker_lanes(),
+            &parent_claims,
+            &covered_claims,
+        );
+        deferred_candidates = order_by_learned_potential(
             &goal_evaluator,
             &frontier,
+            &covered_claims,
             pinned_model.as_ref(),
-            remaining,
+            cohort_limit,
             &mut candidates,
             &mut candidate_fates,
         );
+        drop(covered_claims);
         for (policy_rank, candidate) in candidates.iter().enumerate() {
             let fate = candidate_fates
                 .get_mut(candidate.fate_index)
@@ -1171,16 +1330,36 @@ where
             fate.bootstrap_rank = candidate.bootstrap_rank;
             fate.learned_rank = candidate.learned_rank;
         }
+        candidate_fates =
+            retain_transaction_fates(&mut candidates, candidate_fates, fate_is_new_generation);
         instrumentation.selected(candidates.len());
         instrumentation.finish(Phase::Selection, selection_started);
         if candidates.is_empty() {
+            pending_parent_keys.retain(|key| !processed_parent_keys.contains(key));
             ledger.append_candidate_fates(candidate_fates);
+            if !pending_parent_keys.is_empty() {
+                continue;
+            }
             resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
+        let deferred_resident =
+            cohort::recovery_resident_bytes(domain, &deferred_candidates, &pending_parent_keys);
         let transient_bytes = application_bytes
             .saturating_add(vector_bytes(&candidates))
-            .saturating_add(candidate_pipeline_reserve(domain, &candidates));
+            .saturating_add(candidate_pipeline_reserve(domain, &candidates))
+            .saturating_add(vector_bytes(&candidate_fates))
+            .saturating_add(deferred_resident);
+        let prospective_durable = (checkpoint.len() as u64)
+            .saturating_add(candidate_pipeline_reserve(domain, &candidates))
+            .saturating_add(deferred_resident)
+            .saturating_add(vector_bytes(&candidate_fates));
+        if !resource_meter.checkpoint_fits(prospective_durable) {
+            deferred_candidates =
+                cohort::rollback_unverified_generation(candidates, deferred_candidates);
+            durable_budget_exhausted = true;
+            break;
+        }
         let verification_resident = ResidentReservation::live(resident_before_epoch)
             .with_transient(transient_bytes)
             .peak_bytes();
@@ -1189,7 +1368,8 @@ where
                 .with_transient(checkpoint.capacity() as u64)
                 .with_pending_durability(durability.pending_bytes()),
         ) {
-            ledger.append_candidate_fates(candidate_fates);
+            deferred_candidates =
+                cohort::rollback_unverified_generation(candidates, deferred_candidates);
             resident_budget_exhausted = true;
             break;
         }
@@ -1197,7 +1377,8 @@ where
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?
         {
-            ledger.append_candidate_fates(candidate_fates);
+            deferred_candidates =
+                cohort::rollback_unverified_generation(candidates, deferred_candidates);
             time_exhausted = true;
             break;
         }
@@ -1255,6 +1436,8 @@ where
         test_fault_point("verdict-recorded");
         let experience_checkpoint_state = ledger.checkpoint_entries();
         let candidate_fate_checkpoint = ledger.checkpoint_candidate_fates();
+        let measurement_checkpoint = ledger.checkpoint_measurements();
+        pending_parent_keys.retain(|key| !processed_parent_keys.contains(key));
         ledger.append_entries(verification.experience);
         ledger.append_candidate_fates(candidate_fates);
         test_fault_point("experience-appended");
@@ -1263,18 +1446,20 @@ where
             .map_err(|()| SessionError::Resource)?;
         let experience_checkpoint = bundle_codec.seal(
             &seed_cursor,
-            &known,
-            &pareto,
-            &ledger,
-            &knowledge,
-            &learning,
+            RestartBundleState::new(
+                &known,
+                &pareto,
+                SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+                &ledger,
+                &knowledge,
+                &learning,
+            ),
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
         if !resource_meter.checkpoint_fits(experience_checkpoint.len() as u64) {
             ledger.rollback_entries(experience_checkpoint_state);
             ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-            durable_budget_exhausted = true;
-            break;
+            return Err(SessionError::Resource);
         }
         let experience_live = worker_resident_bytes.saturating_add(resident_state_bytes(
             &known,
@@ -1288,6 +1473,7 @@ where
             &knowledge,
             &learning,
         ));
+        let experience_live = experience_live.saturating_add(deferred_resident);
         if !resource_meter.reserve(
             ResidentReservation::live(experience_live)
                 .with_transient(experience_checkpoint.capacity() as u64)
@@ -1295,19 +1481,7 @@ where
         ) {
             ledger.rollback_entries(experience_checkpoint_state);
             ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-            resident_budget_exhausted = true;
-            break;
-        }
-        checkpoint = experience_checkpoint;
-        durability
-            .submit(checkpoint.clone())
-            .map_err(SessionError::Durability)?;
-        if resource_meter
-            .search_time_exhausted()
-            .map_err(|()| SessionError::Resource)?
-        {
-            time_exhausted = true;
-            break;
+            return Err(SessionError::Resource);
         }
         let measurement_admission_started = instrumentation.start();
         let accepted_origins = verification
@@ -1348,14 +1522,74 @@ where
         }
         test_fault_point("admission-completed");
         if admitted.is_empty() {
-            frontier.clear();
-            resident_budget_exhausted |= choice_window_exhausted;
+            let cohort_usage = resource_meter
+                .usage(verification_requests, checkpoint.len() as u64)
+                .map_err(|()| SessionError::Resource)?;
+            let cohort_checkpoint = bundle_codec.seal(
+                &seed_cursor,
+                RestartBundleState::new(
+                    &known,
+                    &pareto,
+                    SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+                    &ledger,
+                    &knowledge,
+                    &learning,
+                ),
+                SessionSeal::Interrupted(cohort_usage),
+            )?;
+            let cohort_live = worker_resident_bytes
+                .saturating_add(resident_state_bytes(
+                    &known,
+                    &roots,
+                    &pareto,
+                    &frontier,
+                    &recovered_keys,
+                    &operators,
+                    &cohort_checkpoint,
+                    &ledger,
+                    &knowledge,
+                    &learning,
+                ))
+                .saturating_add(deferred_resident);
+            let cohort_reservation = ResidentReservation::live(cohort_live)
+                .with_transient(cohort_checkpoint.capacity() as u64)
+                .with_pending_durability(durability.pending_bytes());
+            if !resource_meter.checkpoint_fits(cohort_checkpoint.len() as u64) {
+                ledger.rollback_entries(experience_checkpoint_state);
+                ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+                ledger.rollback_measurements(measurement_checkpoint);
+                return Err(SessionError::Resource);
+            }
+            if !resource_meter.reserve(cohort_reservation) {
+                ledger.rollback_entries(experience_checkpoint_state);
+                ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+                ledger.rollback_measurements(measurement_checkpoint);
+                return Err(SessionError::Resource);
+            }
+            durability
+                .submit(cohort_checkpoint.clone())
+                .and_then(|()| durability.barrier().map(|_| ()))
+                .map_err(SessionError::Durability)?;
+            test_fault_point("cohort-published");
+            checkpoint = cohort_checkpoint;
             instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
-            break;
+            time_exhausted = resource_meter
+                .search_time_exhausted()
+                .map_err(|()| SessionError::Resource)?;
+            if time_exhausted {
+                break;
+            }
+            if deferred_candidates.is_empty() && pending_parent_keys.is_empty() {
+                frontier.clear();
+                resident_budget_exhausted |= choice_window_exhausted;
+                break;
+            }
+            continue;
         }
         instrumentation.admitted(admitted.len());
         let mut epoch = EpochTransition::begin(&mut known, &mut frontier, &mut ledger);
         for (artifact, origin) in admitted {
+            pending_parent_keys.push(artifact.key());
             epoch.admit(artifact, origin);
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
@@ -1376,16 +1610,22 @@ where
             .map_err(|()| SessionError::Resource)?;
         let proposed_checkpoint = bundle_codec.seal(
             &seed_cursor,
-            epoch.known(),
-            &proposed_pareto,
-            epoch.ledger(),
-            &knowledge,
-            &learning,
+            RestartBundleState::new(
+                epoch.known(),
+                &proposed_pareto,
+                SearchTailView::new(epoch.frontier(), &deferred_candidates, &pending_parent_keys),
+                epoch.ledger(),
+                &knowledge,
+                &learning,
+            ),
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
         if !resource_meter.checkpoint_fits(proposed_checkpoint.len() as u64) {
-            durable_budget_exhausted = true;
-            break;
+            drop(epoch);
+            ledger.rollback_entries(experience_checkpoint_state);
+            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+            ledger.rollback_measurements(measurement_checkpoint);
+            return Err(SessionError::Resource);
         }
         let proposed_live = worker_resident_bytes.saturating_add(resident_state_bytes(
             epoch.known(),
@@ -1399,23 +1639,35 @@ where
             &knowledge,
             &learning,
         ));
+        let proposed_live = proposed_live.saturating_add(cohort::recovery_resident_bytes(
+            domain,
+            &deferred_candidates,
+            &pending_parent_keys,
+        ));
         let proposed_reservation = ResidentReservation::live(proposed_live)
             .with_transient(proposed_checkpoint.capacity() as u64)
             .with_pending_durability(durability.pending_bytes());
         if !resource_meter.reserve(proposed_reservation) {
-            resident_budget_exhausted = true;
-            break;
+            drop(epoch);
+            ledger.rollback_entries(experience_checkpoint_state);
+            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+            ledger.rollback_measurements(measurement_checkpoint);
+            return Err(SessionError::Resource);
         }
         durability
             .submit(proposed_checkpoint.clone())
             .and_then(|()| durability.barrier().map(|_| ()))
             .map_err(SessionError::Durability)?;
         test_fault_point("pareto-published");
+        epoch.commit();
+        instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
+        pareto = proposed_pareto;
+        checkpoint = proposed_checkpoint;
         let delivery = deliver_delta(
             &mut observer,
             &mut sequence,
             &previous_keys,
-            &proposed_pareto,
+            &pareto,
             &goal_evaluator.affected(&previous_goal_frontiers, &proposed_goal_frontiers),
             resource_meter,
             proposed_reservation.peak_bytes(),
@@ -1424,10 +1676,6 @@ where
             resident_budget_exhausted = true;
             break;
         }
-        epoch.commit();
-        instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
-        pareto = proposed_pareto;
-        checkpoint = proposed_checkpoint;
         stopped_by_observer = delivery.stopped();
         success_conditions_satisfied =
             goal_evaluator.success_satisfied(&goal_evaluator.frontiers(&known));
@@ -1437,7 +1685,10 @@ where
         if verification_budget_exhausted {
             break;
         }
-        if choice_window_exhausted {
+        if choice_window_exhausted
+            && deferred_candidates.is_empty()
+            && pending_parent_keys.is_empty()
+        {
             resident_budget_exhausted = true;
             break;
         }
@@ -1467,18 +1718,24 @@ where
         completion = Completion::ResourceEnvelopeExhausted;
     }
     let consolidation_started = instrumentation.start();
-    let consolidation_live = worker_resident_bytes.saturating_add(resident_state_bytes(
-        &known,
-        &roots,
-        &pareto,
-        &frontier,
-        &recovered_keys,
-        &operators,
-        &checkpoint,
-        &ledger,
-        &knowledge,
-        &learning,
-    ));
+    let consolidation_live = worker_resident_bytes
+        .saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ))
+        .saturating_add(cohort::recovery_resident_bytes(
+            domain,
+            &deferred_candidates,
+            &pending_parent_keys,
+        ));
     let consolidation_transient = (ledger.len() as u64)
         .saturating_mul((std::mem::size_of::<DerivationObservation>() as u64).saturating_add(512))
         .saturating_add(4_096 * 64)
@@ -1486,6 +1743,7 @@ where
             bytes.saturating_add((entry.operator_symbol.capacity() as u64).saturating_mul(2))
         }));
     let can_consolidate = completion != Completion::StoppedByObserver
+        && !durable_budget_exhausted
         && !resource_meter
             .time_exhausted()
             .map_err(|()| SessionError::Resource)?
@@ -1546,7 +1804,12 @@ where
             ))
             .saturating_sub(ledger.resident_bytes())
             .saturating_add(ledger.resident_bytes_with_consequences(&proposed_consequences))
-            .saturating_add(knowledge.resident_bytes());
+            .saturating_add(knowledge.resident_bytes())
+            .saturating_add(cohort::recovery_resident_bytes(
+                domain,
+                &deferred_candidates,
+                &pending_parent_keys,
+            ));
         let promoted_transient = (observations.len() as u64)
             .saturating_mul(std::mem::size_of::<DerivationObservation>() as u64);
         if resource_meter.reserve(
@@ -1564,24 +1827,31 @@ where
     }
     instrumentation.finish(Phase::Consolidation, consolidation_started);
     let training_started = instrumentation.start();
-    let learning_live = worker_resident_bytes.saturating_add(resident_state_bytes(
-        &known,
-        &roots,
-        &pareto,
-        &frontier,
-        &recovered_keys,
-        &operators,
-        &checkpoint,
-        &ledger,
-        &knowledge,
-        &learning,
-    ));
+    let learning_live = worker_resident_bytes
+        .saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ))
+        .saturating_add(cohort::recovery_resident_bytes(
+            domain,
+            &deferred_candidates,
+            &pending_parent_keys,
+        ));
     let learning_transient = (ledger.len() as u64)
         .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64)
         .saturating_add(LearningState::training_scratch_bytes(ledger.len()));
-    let can_train = !resource_meter
-        .time_exhausted()
-        .map_err(|()| SessionError::Resource)?
+    let can_train = !durable_budget_exhausted
+        && !resource_meter
+            .time_exhausted()
+            .map_err(|()| SessionError::Resource)?
         && resource_meter.reserve(
             ResidentReservation::live(learning_live)
                 .with_transient(learning_transient)
@@ -1596,13 +1866,21 @@ where
     }
     instrumentation.finish(Phase::Training, training_started);
     let finalization_started = instrumentation.start();
+    let (sealed_deferred, sealed_pending) = if completion == Completion::ResourceEnvelopeExhausted {
+        (&deferred_candidates[..], &pending_parent_keys[..])
+    } else {
+        (&[][..], &[][..])
+    };
     let provisional_checkpoint = bundle_codec.seal(
         &seed_cursor,
-        &known,
-        &pareto,
-        &ledger,
-        &knowledge,
-        &learning,
+        RestartBundleState::new(
+            &known,
+            &pareto,
+            SearchTailView::new(&frontier, sealed_deferred, sealed_pending),
+            &ledger,
+            &knowledge,
+            &learning,
+        ),
         SessionSeal::Completed(completion, provisional_usage),
     )?;
     let usage = resource_meter
@@ -1610,28 +1888,37 @@ where
         .map_err(|()| SessionError::Resource)?;
     checkpoint = bundle_codec.seal(
         &seed_cursor,
-        &known,
-        &pareto,
-        &ledger,
-        &knowledge,
-        &learning,
+        RestartBundleState::new(
+            &known,
+            &pareto,
+            SearchTailView::new(&frontier, sealed_deferred, sealed_pending),
+            &ledger,
+            &knowledge,
+            &learning,
+        ),
         SessionSeal::Completed(completion, usage),
     )?;
     if !resource_meter.checkpoint_fits(checkpoint.len() as u64) {
         return Err(SessionError::Resource);
     }
-    let final_live = worker_resident_bytes.saturating_add(resident_state_bytes(
-        &known,
-        &roots,
-        &pareto,
-        &frontier,
-        &recovered_keys,
-        &operators,
-        &checkpoint,
-        &ledger,
-        &knowledge,
-        &learning,
-    ));
+    let final_live = worker_resident_bytes
+        .saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ))
+        .saturating_add(cohort::recovery_resident_bytes(
+            domain,
+            &deferred_candidates,
+            &pending_parent_keys,
+        ));
     if !resource_meter.reserve(
         ResidentReservation::live(final_live)
             .with_transient(checkpoint.capacity() as u64)
@@ -1692,12 +1979,6 @@ fn resident_state_bytes<D: DomainDefinition, O>(
 
 fn vector_bytes<T>(values: &Vec<T>) -> u64 {
     (values.capacity() as u64).saturating_mul(std::mem::size_of::<T>() as u64)
-}
-
-fn grouped_vector_bytes<T>(groups: &Vec<Vec<T>>) -> u64 {
-    groups.iter().fold(vector_bytes(groups), |bytes, group| {
-        bytes.saturating_add(vector_bytes(group))
-    })
 }
 
 fn root_locations<D: DomainDefinition>(
@@ -1875,13 +2156,96 @@ fn operator_feature_values(operator_symbol: &str) -> [f32; 8] {
     values
 }
 
+fn append_primitive_candidates<D: DomainDefinition>(
+    domain: &D,
+    parents: &GenerationParents<'_, D>,
+    scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
+    limit: usize,
+    epoch: u64,
+    output: &mut Vec<ProposedCandidate<D>>,
+) -> Result<(u64, bool), SessionError<D::Error>> {
+    let mut application_bytes = 0_u64;
+    let mut truncated = false;
+    let mut remaining = limit;
+    let catalog = domain.operators().catalog();
+    let locations = root_locations(domain, parents.artifacts);
+    for (operator_index, descriptor) in catalog.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let operator_limit = remaining.div_ceil(catalog.len() - operator_index);
+        let mut applications = Vec::new();
+        let mut application_writer =
+            ApplicationWriter::with_limit(&mut applications, operator_limit);
+        domain
+            .operators()
+            .enumerate_legal(
+                OperatorEnumerationBatch::new(
+                    parents.artifacts,
+                    &locations,
+                    std::slice::from_ref(&descriptor.operator()),
+                ),
+                &mut application_writer,
+                scratch,
+            )
+            .map_err(SessionError::Domain)?;
+        truncated |= application_writer.overflowed();
+        let mut operator_candidates = Vec::new();
+        let mut candidate_writer =
+            CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
+        domain
+            .operators()
+            .apply_batch(&applications, &mut candidate_writer, scratch)
+            .map_err(SessionError::Domain)?;
+        truncated |= candidate_writer.overflowed();
+        application_bytes = application_bytes
+            .max(vector_bytes(&locations).saturating_add(vector_bytes(&applications)))
+            .max(vector_bytes(&operator_candidates));
+        remaining = remaining.saturating_sub(operator_candidates.len());
+        let operator_features = operator_feature_values(descriptor.symbol().as_str());
+        for mut candidate in operator_candidates {
+            let parent = parents
+                .artifacts
+                .get(candidate.source_index)
+                .ok_or(SessionError::InvalidSeed)?;
+            candidate.source_index = *parents
+                .frontier_indexes
+                .get(candidate.source_index)
+                .ok_or(SessionError::InvalidSeed)?;
+            output.push(ProposedCandidate {
+                features: opportunity_features(
+                    domain,
+                    StructuralSummary {
+                        node_count: structural_node_count(domain, parent),
+                    },
+                    &candidate.artifact,
+                    operator_features,
+                    epoch,
+                    candidate.proposal_features,
+                ),
+                candidate,
+                operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
+                epoch,
+                proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
+                protected_derived: false,
+                allocation_queue: AllocationQueue::Bootstrap,
+                fate_index: usize::MAX,
+                bootstrap_rank: CandidateRank::absent(),
+                learned_rank: CandidateRank::absent(),
+                generated_in_epoch: true,
+            });
+        }
+    }
+    Ok((application_bytes, truncated))
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Derived Operator expansion keeps its bounded multi-step provenance in one search transaction"
 )]
 fn append_derived_candidates<D: DomainDefinition>(
     domain: &D,
-    parents: &[&D::Artifact],
+    parents: &GenerationParents<'_, D>,
     knowledge: &KnowledgeRevision,
     scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
     remaining_verifications: usize,
@@ -1917,7 +2281,7 @@ fn append_derived_candidates<D: DomainDefinition>(
                 return Err(SessionError::CorruptBundle);
             };
             let stage_parents = if step_index == 0 {
-                parents[..parents.len().min(operator_limit)].to_vec()
+                parents.artifacts[..parents.artifacts.len().min(operator_limit)].to_vec()
             } else {
                 current
                     .iter()
@@ -1966,8 +2330,13 @@ fn append_derived_candidates<D: DomainDefinition>(
             .expect("canonical Derived Operator symbols are UTF-8");
         let operator_features = operator_feature_values(symbol);
         emitted = emitted.saturating_add(current.len());
-        for candidate in current {
+        for mut candidate in current {
             let parent = parents
+                .artifacts
+                .get(candidate.source_index)
+                .ok_or(SessionError::CorruptBundle)?;
+            candidate.source_index = *parents
+                .frontier_indexes
                 .get(candidate.source_index)
                 .ok_or(SessionError::CorruptBundle)?;
             output.push(ProposedCandidate {
@@ -1990,6 +2359,7 @@ fn append_derived_candidates<D: DomainDefinition>(
                 fate_index: usize::MAX,
                 bootstrap_rank: CandidateRank::absent(),
                 learned_rank: CandidateRank::absent(),
+                generated_in_epoch: true,
             });
         }
     }
@@ -1999,14 +2369,15 @@ fn append_derived_candidates<D: DomainDefinition>(
 fn order_by_learned_potential<D: DomainDefinition>(
     goals: &GoalEvaluator<'_, D>,
     frontier: &[(VerifiedArtifact<D>, usize)],
+    covered_claims: &[[u8; 32]],
     model: Option<&FtrlModel>,
     limit: usize,
     candidates: &mut Vec<ProposedCandidate<D>>,
     candidate_fates: &mut [CandidateFateObservation],
-) {
+) -> Vec<ProposedCandidate<D>> {
     rank_all_candidates(goals, frontier, model, candidates, candidate_fates);
     let (mut origin_exploration, remaining) =
-        partition_origin_exploration(frontier, std::mem::take(candidates), limit);
+        partition_origin_exploration(frontier, covered_claims, std::mem::take(candidates), limit);
     let (mut derived_exploration, mut unprotected) = partition_derived_exploration(remaining);
     for candidate in &mut origin_exploration {
         candidate.allocation_queue = AllocationQueue::ProtectedOrigin;
@@ -2036,7 +2407,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
         });
     }
     let Some(_) = model else {
-        apply_operational_order(
+        return apply_operational_order(
             origin_exploration,
             derived_exploration,
             unprotected,
@@ -2045,7 +2416,6 @@ fn order_by_learned_potential<D: DomainDefinition>(
             limit,
             candidates,
         );
-        return;
     };
     let mut learned = (0..unprotected.len()).collect::<Vec<_>>();
     learned.sort_unstable_by_key(|candidate| {
@@ -2062,7 +2432,7 @@ fn order_by_learned_potential<D: DomainDefinition>(
         Some(&learned),
         limit,
         candidates,
-    );
+    )
 }
 
 fn rank_all_candidates<D: DomainDefinition>(
@@ -2136,7 +2506,7 @@ fn apply_operational_order<D: DomainDefinition>(
     learned: Option<&[usize]>,
     limit: usize,
     output: &mut Vec<ProposedCandidate<D>>,
-) {
+) -> Vec<ProposedCandidate<D>> {
     let selections =
         operational_ranked_selections(origin.len(), derived.len(), bootstrap, learned, limit);
     let mut origin = origin.into_iter().map(Some).collect::<Vec<_>>();
@@ -2154,6 +2524,12 @@ fn apply_operational_order<D: DomainDefinition>(
         candidate.allocation_queue = selection.queue;
         candidate
     }));
+    origin
+        .into_iter()
+        .chain(derived)
+        .chain(unprotected)
+        .flatten()
+        .collect()
 }
 
 fn partition_derived_exploration<D: DomainDefinition>(
@@ -2166,6 +2542,7 @@ fn partition_derived_exploration<D: DomainDefinition>(
 
 fn partition_origin_exploration<D: DomainDefinition>(
     frontier: &[(VerifiedArtifact<D>, usize)],
+    covered_claims: &[[u8; 32]],
     candidates: Vec<ProposedCandidate<D>>,
     limit: usize,
 ) -> (Vec<ProposedCandidate<D>>, Vec<ProposedCandidate<D>>) {
@@ -2176,9 +2553,10 @@ fn partition_origin_exploration<D: DomainDefinition>(
                 .get(candidate.candidate.source_index)
                 .map(|(artifact, _)| artifact.inner.claim_digest)
         })
+        .filter(|claim| covered_claims.binary_search(claim).is_err())
         .collect::<BTreeSet<_>>();
     let protected = protected_origin_keys(origins, limit);
-    let mut selected: HashMap<[u8; 32], (usize, bool)> = HashMap::with_capacity(protected.len());
+    let mut selected: HashMap<[u8; 32], usize> = HashMap::with_capacity(protected.len());
     for (index, candidate) in candidates.iter().enumerate() {
         let Some(claim) = frontier
             .get(candidate.candidate.source_index)
@@ -2191,18 +2569,19 @@ fn partition_origin_exploration<D: DomainDefinition>(
         }
         selected
             .entry(claim)
-            .and_modify(|(selected_index, selected_is_derived)| {
-                if candidate.protected_derived && !*selected_is_derived {
+            .and_modify(|selected_index| {
+                let selected_candidate = &candidates[*selected_index];
+                if (candidate.protected_derived && !selected_candidate.protected_derived)
+                    || (candidate.protected_derived == selected_candidate.protected_derived
+                        && candidate.bootstrap_rank.value()
+                            < selected_candidate.bootstrap_rank.value())
+                {
                     *selected_index = index;
-                    *selected_is_derived = true;
                 }
             })
-            .or_insert((index, candidate.protected_derived));
+            .or_insert(index);
     }
-    let selected = selected
-        .into_values()
-        .map(|(index, _)| index)
-        .collect::<HashSet<_>>();
+    let selected = selected.into_values().collect::<HashSet<_>>();
     let mut exploration = Vec::with_capacity(protected.len());
     let mut unprotected = Vec::with_capacity(candidates.len().saturating_sub(protected.len()));
     for (index, candidate) in candidates.into_iter().enumerate() {
@@ -2274,6 +2653,7 @@ fn retain_novel_candidates<D: DomainDefinition>(
     let identity = domain.semantic_identity();
     let mut retained = Vec::with_capacity(candidates.len());
     let mut fates = Vec::with_capacity(candidates.len());
+    let mut fate_is_new_generation = Vec::with_capacity(candidates.len());
     for (generation_rank, mut candidate) in candidates.into_iter().enumerate() {
         let mut canonical = Vec::new();
         domain
@@ -2319,6 +2699,7 @@ fn retain_novel_candidates<D: DomainDefinition>(
             disposition,
             allocation_queue: None,
         });
+        fate_is_new_generation.push(candidate.generated_in_epoch);
         if novel {
             candidate.fate_index = fate_index;
             retained.push(candidate);
@@ -2327,7 +2708,31 @@ fn retain_novel_candidates<D: DomainDefinition>(
     Ok(NovelCandidateBatch {
         candidates: retained,
         fates,
+        fate_is_new_generation,
     })
+}
+
+fn retain_transaction_fates<D: DomainDefinition>(
+    selected: &mut [ProposedCandidate<D>],
+    fates: Vec<CandidateFateObservation>,
+    mut retained: Vec<bool>,
+) -> Vec<CandidateFateObservation> {
+    assert_eq!(fates.len(), retained.len());
+    for candidate in selected.iter() {
+        retained[candidate.fate_index] = true;
+    }
+    let mut remapped = vec![usize::MAX; fates.len()];
+    let mut compact = Vec::with_capacity(retained.iter().filter(|retain| **retain).count());
+    for (old_index, (fate, retain)) in fates.into_iter().zip(retained).enumerate() {
+        if retain {
+            remapped[old_index] = compact.len();
+            compact.push(fate);
+        }
+    }
+    for candidate in selected {
+        candidate.fate_index = remapped[candidate.fate_index];
+    }
+    compact
 }
 
 fn materialize<D: DomainDefinition>(
@@ -2743,6 +3148,91 @@ fn decode_bundle<D: DomainDefinition>(
         }
         pareto_keys.push(key);
     }
+    let frontier_count = usize::try_from(read_bundle_u64(&mut recovery)?)
+        .map_err(|_| SessionError::CorruptBundle)?;
+    if frontier_count > recovery.len().saturating_div(32) {
+        return Err(SessionError::CorruptBundle);
+    }
+    let mut frontier_keys = Vec::with_capacity(frontier_count);
+    for _ in 0..frontier_count {
+        let key = ArtifactKey(
+            take_bundle(&mut recovery, 32)?
+                .try_into()
+                .expect("exactly 32 Search Frontier key bytes were taken"),
+        );
+        if frontier_keys.contains(&key) {
+            return Err(SessionError::CorruptBundle);
+        }
+        frontier_keys.push(key);
+    }
+    let deferred_count = usize::try_from(read_bundle_u64(&mut recovery)?)
+        .map_err(|_| SessionError::CorruptBundle)?;
+    if deferred_count > recovery.len().saturating_div(85) {
+        return Err(SessionError::CorruptBundle);
+    }
+    let mut deferred_candidates = Vec::with_capacity(deferred_count);
+    for _ in 0..deferred_count {
+        let artifact = domain
+            .structure()
+            .decode_canonical(take_sized(&mut recovery)?, &mut structure_scratch)
+            .map_err(|_| SessionError::CorruptBundle)?;
+        let parent_key = ArtifactKey(
+            take_bundle(&mut recovery, 32)?
+                .try_into()
+                .expect("exactly 32 parent-key bytes were taken"),
+        );
+        let operator_symbol = take_sized(&mut recovery)?.to_vec();
+        let proposal_limit = u32::from_le_bytes(
+            take_bundle(&mut recovery, 4)?
+                .try_into()
+                .expect("exactly four proposal-limit bytes were taken"),
+        );
+        let protected_derived = match take_bundle(&mut recovery, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(SessionError::CorruptBundle),
+        };
+        let mut proposal_features = ProposalFeatures::default().as_array();
+        for feature in &mut proposal_features {
+            *feature = f32::from_bits(u32::from_le_bytes(
+                take_bundle(&mut recovery, 4)?
+                    .try_into()
+                    .expect("exactly four proposal-feature bytes were taken"),
+            ));
+        }
+        if proposal_limit == 0
+            || operator_symbol.is_empty()
+            || std::str::from_utf8(&operator_symbol).is_err()
+            || proposal_features.iter().any(|feature| !feature.is_finite())
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        deferred_candidates.push(DeferredCandidate {
+            artifact,
+            parent_key,
+            operator_symbol,
+            proposal_features: ProposalFeatures::new(proposal_features),
+            proposal_limit,
+            protected_derived,
+        });
+    }
+    let pending_count = usize::try_from(read_bundle_u64(&mut recovery)?)
+        .map_err(|_| SessionError::CorruptBundle)?;
+    if pending_count > recovery.len().saturating_div(32) {
+        return Err(SessionError::CorruptBundle);
+    }
+    let mut pending_parent_keys = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        let key = ArtifactKey(
+            take_bundle(&mut recovery, 32)?
+                .try_into()
+                .expect("exactly 32 pending-parent-key bytes were taken"),
+        );
+        if pending_parent_keys.contains(&key) {
+            return Err(SessionError::CorruptBundle);
+        }
+        pending_parent_keys.push(key);
+    }
     if !recovery.is_empty() {
         return Err(SessionError::CorruptBundle);
     }
@@ -2903,6 +3393,12 @@ fn decode_bundle<D: DomainDefinition>(
         .keys()
         .map(|key| key.0)
         .collect::<BTreeSet<_>>();
+    if frontier_keys
+        .iter()
+        .any(|key| !recovered_index.contains_key(key))
+    {
+        return Err(SessionError::CorruptBundle);
+    }
     let primitive_symbols = domain
         .operators()
         .catalog()
@@ -2918,6 +3414,9 @@ fn decode_bundle<D: DomainDefinition>(
     Ok(RecoveredBundle {
         artifacts: recovered,
         pareto_keys,
+        frontier_keys,
+        deferred_candidates,
+        pending_parent_keys,
         ledger,
         revisions: Some(revisions),
         interrupted_usage,
@@ -3613,11 +4112,14 @@ fn persist_setup_interruption<D: DomainDefinition>(
     }
     let interrupted = bundle_codec.seal(
         seed_cursor,
-        &[],
-        &[],
-        ledger,
-        knowledge,
-        learning,
+        RestartBundleState::new(
+            &[],
+            &[],
+            SearchTailView::new(&[], &[], &[]),
+            ledger,
+            knowledge,
+            learning,
+        ),
         SessionSeal::Interrupted(usage),
     )?;
     if !resource_meter.checkpoint_fits(interrupted.len() as u64)
@@ -3673,21 +4175,80 @@ fn publish_interrupted_bytes<D: DomainDefinition>(
     durability.finish().map_err(SessionError::Durability)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the canonical bundle encoder explicitly receives every restart-complete state segment"
-)]
+fn encode_recovery_segment<D: DomainDefinition>(
+    domain: &D,
+    pareto: &[VerifiedArtifact<D>],
+    search_tail: &SearchTailView<'_, D>,
+) -> Result<Vec<u8>, SessionError<D::Error>> {
+    let frontier = search_tail.frontier;
+    let deferred_candidates = search_tail.deferred_candidates;
+    let pending_parent_keys = search_tail.pending_parent_keys;
+    let mut recovery = Vec::with_capacity(
+        32_usize
+            .saturating_add(pareto.len().saturating_mul(32))
+            .saturating_add(frontier.len().saturating_mul(32))
+            .saturating_add(
+                deferred_candidates
+                    .len()
+                    .saturating_mul(std::mem::size_of::<DeferredCandidate<D>>()),
+            ),
+    );
+    push_u64(&mut recovery, pareto.len() as u64);
+    for artifact in pareto {
+        recovery.extend_from_slice(artifact.key().as_bytes());
+    }
+    push_u64(&mut recovery, frontier.len() as u64);
+    for (artifact, _) in frontier {
+        recovery.extend_from_slice(artifact.key().as_bytes());
+    }
+    push_u64(&mut recovery, deferred_candidates.len() as u64);
+    let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
+    for candidate in deferred_candidates {
+        let parent_key = frontier
+            .get(candidate.candidate.source_index)
+            .ok_or(SessionError::CorruptBundle)?
+            .0
+            .key();
+        let mut canonical = Vec::new();
+        domain
+            .structure()
+            .encode_canonical(
+                &candidate.candidate.artifact,
+                &mut canonical,
+                &mut structure_scratch,
+            )
+            .map_err(SessionError::Domain)?;
+        push_bytes(&mut recovery, &canonical);
+        recovery.extend_from_slice(parent_key.as_bytes());
+        push_bytes(&mut recovery, &candidate.operator_symbol);
+        recovery.extend_from_slice(&candidate.proposal_limit.to_le_bytes());
+        recovery.push(u8::from(candidate.protected_derived));
+        for feature in candidate.candidate.proposal_features.as_array() {
+            recovery.extend_from_slice(&feature.to_bits().to_le_bytes());
+        }
+    }
+    push_u64(&mut recovery, pending_parent_keys.len() as u64);
+    for key in pending_parent_keys {
+        recovery.extend_from_slice(key.as_bytes());
+    }
+    Ok(recovery)
+}
+
 fn encode_bundle<D: DomainDefinition>(
     domain: &D,
     request: &ImprovementRequest<D>,
     seed_cursor: &[u8],
-    artifacts: &[VerifiedArtifact<D>],
-    pareto: &[VerifiedArtifact<D>],
-    ledger: &ExperienceLedger,
-    knowledge: &KnowledgeState,
-    learning: &LearningState,
+    state: RestartBundleState<'_, D>,
     session_seal: SessionSeal,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
+    let RestartBundleState {
+        artifacts,
+        pareto,
+        search_tail,
+        ledger,
+        knowledge,
+        learning,
+    } = state;
     let mut artifact_payload = Vec::new();
     push_u64(&mut artifact_payload, artifacts.len() as u64);
     let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
@@ -3740,11 +4301,7 @@ fn encode_bundle<D: DomainDefinition>(
     push_bytes(&mut revisions, &encoded_knowledge);
     push_bytes(&mut revisions, &encoded_learning);
     test_fault_point("revision-sealed");
-    let mut recovery = Vec::with_capacity(8 + pareto.len() * 32);
-    push_u64(&mut recovery, pareto.len() as u64);
-    for artifact in pareto {
-        recovery.extend_from_slice(artifact.key().as_bytes());
-    }
+    let recovery = encode_recovery_segment(domain, pareto, &search_tail)?;
     let encoded_experience = ledger.encode();
     let session = encode_session(domain, request, seed_cursor, session_seal)?;
     let bundle = CanonicalBundle::new(
