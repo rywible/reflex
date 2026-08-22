@@ -837,6 +837,8 @@ Performance tests measure complete Improvement Sessions in addition to kernels. 
 
 Scientific claims about Reflex use the same public Improvement Session path under the private Experimental Harness. Experiment Specifications, sealed corpora, equal Resource Envelopes, independent process-level replicates, competitive baselines, causal ablations, predeclared analysis, and complete reporting follow [`docs/EXPERIMENTS.md`](./EXPERIMENTS.md). None of those controls appear in the consumer or Domain Definition interfaces.
 
+The non-default `internal-experiments` build feature exposes repository tooling to private retained-Experience analysis without extending the normal consumer surface. The model-feature gate decodes a completed Domain Bundle through the same compatibility and integrity checks as recovery, replays canonical parent and Candidate structure in-process, preserves claim-level Replay/Selection roles, consequences, example order, FTRL hyperparameters, and training epochs, and requests no new Verification labels. It must reproduce the persisted baseline champion before a paired representation result is admissible.
+
 Isolated Rust `unsafe` kernels require:
 
 - a safe Rust reference implementation;

@@ -103,6 +103,15 @@ struct StructuralSummary {
     node_count: f32,
 }
 
+#[cfg(feature = "internal-experiments")]
+struct ShapeSummary<C> {
+    node_count: f32,
+    depth: f32,
+    leaf_fraction: f32,
+    constructor_frequencies: Vec<f32>,
+    root_constructor: Option<C>,
+}
+
 struct ReadSeeds<D: DomainDefinition> {
     seeds: Vec<Seed<D>>,
     encoded_cursor: Vec<u8>,
@@ -167,6 +176,79 @@ where
             &scheduler,
             requirements,
         )
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+pub(crate) fn compare_candidate_features<D: DomainDefinition>(
+    domain: &D,
+    request: &ImprovementRequest<D>,
+    source: &std::path::Path,
+) -> Result<crate::internal_experiments::CandidateFeatureComparison, SessionError<D::Error>> {
+    let resource_meter =
+        ResourceEnvelopeGuard::start(&request.resources).map_err(|()| SessionError::Resource)?;
+    let recovered = decode_bundle(domain, request, source, &resource_meter, 0)?;
+    let feature_started = cpu_time::ProcessTime::now();
+    let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
+    let identity = domain.semantic_identity();
+    let mut parent_summaries = HashMap::with_capacity(recovered.artifacts.len());
+    for artifact in &recovered.artifacts {
+        let mut canonical = Vec::new();
+        domain
+            .structure()
+            .encode_canonical(&artifact.artifact, &mut canonical, &mut structure_scratch)
+            .map_err(SessionError::Domain)?;
+        let key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
+        let summary =
+            shape_summary(domain, &artifact.artifact).map_err(|()| SessionError::CorruptBundle)?;
+        if parent_summaries.insert(key, summary).is_some() {
+            return Err(SessionError::CorruptBundle);
+        }
+    }
+    let baseline_attempts = recovered.ledger.attempts();
+    let mut structural_attempts = baseline_attempts.clone();
+    for (entry, attempt) in recovered
+        .ledger
+        .entries()
+        .iter()
+        .zip(&mut structural_attempts)
+    {
+        let parent = parent_summaries
+            .get(&entry.parent_key)
+            .ok_or(SessionError::CorruptBundle)?;
+        let candidate = domain
+            .structure()
+            .decode_canonical(&entry.canonical_candidate, &mut structure_scratch)
+            .map_err(|_| SessionError::CorruptBundle)?;
+        let candidate =
+            shape_summary(domain, &candidate).map_err(|()| SessionError::CorruptBundle)?;
+        let operator =
+            std::str::from_utf8(&entry.operator_symbol).map_err(|_| SessionError::CorruptBundle)?;
+        attempt.features = structural_opportunity_features(parent, &candidate, operator);
+    }
+    let feature_extraction_cpu = feature_started.elapsed();
+    let comparison = recovered
+        .learning
+        .compare_feature_sets(
+            &baseline_attempts,
+            &structural_attempts,
+            recovered.ledger.consequences(),
+        )
+        .map_err(|()| SessionError::CorruptBundle)?;
+    Ok(crate::internal_experiments::CandidateFeatureComparison {
+        examples: baseline_attempts.len(),
+        replay_claims: comparison.replay_claims,
+        selection_claims: comparison.selection_claims,
+        baseline_selection_loss: comparison.baseline_loss,
+        structural_selection_loss: comparison.structural_loss,
+        baseline_training_cpu: comparison.baseline_training_cpu,
+        structural_training_cpu: comparison.structural_training_cpu,
+        feature_extraction_cpu,
+        baseline_model_revision: comparison.baseline_revision,
+        structural_model_revision: comparison.structural_revision,
+        model_bytes: comparison.model_bytes,
+        baseline_reproduces_champion: comparison.baseline_reproduces_champion,
+        structural_promotes_over_baseline: comparison.structural_promotes,
     })
 }
 
@@ -1270,6 +1352,114 @@ fn opportunity_features<D: DomainDefinition>(
 
 fn structural_node_count<D: DomainDefinition>(domain: &D, artifact: &D::Artifact) -> f32 {
     f32::from(u16::try_from(domain.structure().view(artifact).node_count()).unwrap_or(u16::MAX))
+}
+
+#[cfg(feature = "internal-experiments")]
+fn shape_summary<D: DomainDefinition>(
+    domain: &D,
+    artifact: &D::Artifact,
+) -> Result<ShapeSummary<<D::Structure as StructuralProtocol<D>>::Constructor>, ()> {
+    let view = domain.structure().view(artifact);
+    let node_count = view.node_count();
+    let mut depths = Vec::with_capacity(node_count);
+    let mut constructor_counts = vec![0.0_f32; domain.structure().schema().constructors.len()];
+    let mut children = Vec::new();
+    let mut leaves = 0.0_f32;
+    for node in 0..node_count {
+        let constructor = view.node_constructor(node).ok_or(())?;
+        let constructor_index = domain
+            .structure()
+            .schema()
+            .constructors
+            .iter()
+            .position(|descriptor| *descriptor.constructor() == constructor)
+            .ok_or(())?;
+        constructor_counts[constructor_index] += 1.0;
+        if !view.write_children(node, &mut children) || children.iter().any(|child| *child >= node)
+        {
+            return Err(());
+        }
+        if children.is_empty() {
+            leaves += 1.0;
+        }
+        let depth = children
+            .iter()
+            .filter_map(|child| depths.get(*child))
+            .copied()
+            .max()
+            .unwrap_or(0_u32)
+            .saturating_add(1);
+        depths.push(depth);
+    }
+    let node_count_f32 = bounded_usize_f32(node_count);
+    if node_count != 0 {
+        for count in &mut constructor_counts {
+            *count /= node_count_f32;
+        }
+    }
+    Ok(ShapeSummary {
+        node_count: node_count_f32,
+        depth: depths.last().copied().map_or(0.0, bounded_u32_f32),
+        leaf_fraction: if node_count == 0 {
+            0.0
+        } else {
+            leaves / node_count_f32
+        },
+        constructor_frequencies: constructor_counts,
+        root_constructor: node_count
+            .checked_sub(1)
+            .and_then(|root| view.node_constructor(root)),
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+fn structural_opportunity_features<C: Copy + Eq>(
+    parent: &ShapeSummary<C>,
+    candidate: &ShapeSummary<C>,
+    operator_symbol: &str,
+) -> Features {
+    const NODE_SCALE: f32 = 11.512_936;
+    const DEPTH_SCALE: f32 = 11.090_37;
+    let signed_log_ratio = |parent: f32, candidate: f32, scale: f32| {
+        ((parent + 1.0).ln() - (candidate + 1.0).ln()).clamp(-scale, scale) / scale
+    };
+    let mut values = [0.0; crate::learning::FEATURE_COUNT];
+    values[0] = 1.0;
+    values[1] = parent.node_count.ln_1p() / NODE_SCALE;
+    values[2] = candidate.node_count.ln_1p() / NODE_SCALE;
+    values[3] = signed_log_ratio(parent.node_count, candidate.node_count, NODE_SCALE);
+    values[4] = parent.depth.ln_1p() / DEPTH_SCALE;
+    values[5] = candidate.depth.ln_1p() / DEPTH_SCALE;
+    values[6] = signed_log_ratio(parent.depth, candidate.depth, DEPTH_SCALE);
+    values[7] = parent.leaf_fraction;
+    values[8] = candidate.leaf_fraction;
+    values[9] = parent.leaf_fraction - candidate.leaf_fraction;
+    values[10] = parent
+        .constructor_frequencies
+        .iter()
+        .zip(&candidate.constructor_frequencies)
+        .map(|(parent, candidate)| (parent - candidate).abs())
+        .sum::<f32>()
+        / 2.0;
+    values[11] = f32::from(
+        parent.root_constructor.is_some() && parent.root_constructor == candidate.root_constructor,
+    );
+    let digest = Sha256::digest(operator_symbol.as_bytes());
+    let bucket = 12 + usize::from(digest[0] % 4);
+    values[bucket] = if digest[1] & 1 == 0 { 1.0 } else { -1.0 };
+    Features(values)
+}
+
+#[cfg(feature = "internal-experiments")]
+fn bounded_usize_f32(value: usize) -> f32 {
+    bounded_u32_f32(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+#[cfg(feature = "internal-experiments")]
+fn bounded_u32_f32(value: u32) -> f32 {
+    let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
+    let low = u16::try_from(value & u32::from(u16::MAX)).unwrap_or(u16::MAX);
+    f32::from(high) * 65_536.0 + f32::from(low)
 }
 
 fn operator_feature_bucket(operator_symbol: &str) -> usize {

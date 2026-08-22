@@ -5,6 +5,7 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reflex::internal_experiments::compare_candidate_features;
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, ParetoUpdate, Preference, ResourceEnvelope, ResourceUsage, improve,
@@ -126,6 +127,30 @@ struct BundleSummary {
     knowledge_revision: String,
     model_revision: String,
     segment_logical_bytes: Vec<SegmentLogicalBytes>,
+}
+
+#[derive(Serialize)]
+struct FeatureDevelopmentReport {
+    schema: &'static str,
+    status: &'static str,
+    retained_bundle_sha256: String,
+    examples: usize,
+    replay_claims: usize,
+    selection_claims: usize,
+    feature_count: usize,
+    head_count: usize,
+    baseline_selection_loss: [f32; 7],
+    structural_selection_loss: [f32; 7],
+    baseline_training_cpu_ns: u64,
+    structural_training_cpu_ns: u64,
+    feature_extraction_cpu_ns: u64,
+    baseline_model_revision: String,
+    structural_model_revision: String,
+    model_bytes: usize,
+    baseline_reproduces_champion: bool,
+    structural_promotes_over_baseline: bool,
+    host: HostEnvironment,
+    content_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -297,6 +322,81 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
         segment_logical_bytes,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+pub fn feature_development(arguments: &[String]) -> Result<(), AnyError> {
+    const SCHEMA: &str = "reflex-lean-model-feature-development-v1";
+    require_release("lean-model-feature-development")?;
+    let host = environment()?;
+    require_clean(&host, SCHEMA)?;
+    let values = parse_flag_values(
+        arguments,
+        &["--bundle", "--lake", "--december-root", "--output"],
+        "lean-model-feature-development",
+    )?;
+    let bundle = values
+        .get("--bundle")
+        .map(PathBuf::from)
+        .ok_or("lean-model-feature-development requires --bundle PATH")?;
+    let lake = values
+        .get("--lake")
+        .map(PathBuf::from)
+        .ok_or("lean-model-feature-development requires --lake PATH")?;
+    let december_root = values
+        .get("--december-root")
+        .map(PathBuf::from)
+        .ok_or("lean-model-feature-development requires --december-root PATH")?;
+    let output = values
+        .get("--output")
+        .map(PathBuf::from)
+        .ok_or("lean-model-feature-development requires --output PATH")?;
+    require_absent(&output, "Lean model-feature Development report")?;
+    let domain = LeanDomain::new(
+        LeanWorkerConfig::pinned(lake, december_root),
+        LeanCorpus::default(),
+    )?;
+    let request = request(
+        LeanSeedScope {
+            start: 0,
+            count: 16,
+        },
+        1_024,
+        BundlePlan::Resume {
+            source: bundle.clone(),
+            target: bundle.clone(),
+        },
+    )?;
+    let comparison = compare_candidate_features(&domain, &request, &bundle)?;
+    let duration_ns = |duration: Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    let mut report = FeatureDevelopmentReport {
+        schema: SCHEMA,
+        status: "development-only; fixed retained Experience; no Verification requests; no 2026 exposure",
+        retained_bundle_sha256: hash_file(&bundle)?,
+        examples: comparison.examples,
+        replay_claims: comparison.replay_claims,
+        selection_claims: comparison.selection_claims,
+        feature_count: 16,
+        head_count: 7,
+        baseline_selection_loss: comparison.baseline_selection_loss,
+        structural_selection_loss: comparison.structural_selection_loss,
+        baseline_training_cpu_ns: duration_ns(comparison.baseline_training_cpu),
+        structural_training_cpu_ns: duration_ns(comparison.structural_training_cpu),
+        feature_extraction_cpu_ns: duration_ns(comparison.feature_extraction_cpu),
+        baseline_model_revision: hex(&comparison.baseline_model_revision),
+        structural_model_revision: hex(&comparison.structural_model_revision),
+        model_bytes: comparison.model_bytes,
+        baseline_reproduces_champion: comparison.baseline_reproduces_champion,
+        structural_promotes_over_baseline: comparison.structural_promotes_over_baseline,
+        host,
+        content_sha256: String::new(),
+    };
+    report.content_sha256 = hash_json(&report)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string(&report)?);
     Ok(())
 }
 

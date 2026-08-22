@@ -212,8 +212,8 @@ fn run() -> Result<(), AnyError> {
             let arguments = arguments.collect::<Vec<_>>();
             lean_optimizer_audit::development_child(&arguments)
         }
-        Some("lean-bundle-summary") =>
-            lean_optimizer_audit::bundle_summary(&arguments.collect::<Vec<_>>()),
+        Some("lean-bundle-summary") => lean_bundle_summary(arguments),
+        Some("lean-model-feature-development") => lean_model_features(arguments),
         Some("lean-temporal-audit-freeze") => {
             let arguments = arguments.collect::<Vec<_>>();
             lean_audit::freeze(&arguments)
@@ -235,10 +235,18 @@ fn run() -> Result<(), AnyError> {
             lean_audit_confirm::finalize(&arguments)
         }
         _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-bundle-summary|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
+            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-bundle-summary|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-model-feature-development|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
                 .into(),
         ),
     }
+}
+
+fn lean_model_features(arguments: impl Iterator<Item = String>) -> Result<(), AnyError> {
+    lean_optimizer_audit::feature_development(&arguments.collect::<Vec<_>>())
+}
+
+fn lean_bundle_summary(arguments: impl Iterator<Item = String>) -> Result<(), AnyError> {
+    lean_optimizer_audit::bundle_summary(&arguments.collect::<Vec<_>>())
 }
 
 fn parse_output(arguments: &[String]) -> Result<PathBuf, AnyError> {

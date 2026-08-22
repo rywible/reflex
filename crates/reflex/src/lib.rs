@@ -8,6 +8,9 @@ pub mod session;
 
 mod durability;
 mod instrumentation;
+#[cfg(feature = "internal-experiments")]
+#[doc(hidden)]
+pub mod internal_experiments;
 mod knowledge;
 mod learning;
 mod resource;

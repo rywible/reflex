@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+internal-experiments = []
+
 [dependencies]
 atomic-write-file = "0.3.0"
 cpu-time = "1.0.0"

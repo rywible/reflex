@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 cpu-time = "1.0"
-reflex = { path = "../crates/reflex" }
+reflex = { path = "../crates/reflex", features = ["internal-experiments"] }
 reflex-bitvec = { path = "../crates/reflex-bitvec" }
 reflex-bundle = { path = "../crates/reflex-bundle" }
 reflex-lean = { path = "../crates/reflex-lean" }

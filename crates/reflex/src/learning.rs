@@ -106,6 +106,21 @@ pub(crate) struct LearningState {
     roles: BTreeMap<[u8; 32], CorpusRole>,
 }
 
+#[cfg(feature = "internal-experiments")]
+pub(crate) struct PairedModelComparison {
+    pub(crate) replay_claims: usize,
+    pub(crate) selection_claims: usize,
+    pub(crate) baseline_loss: [f32; HEAD_COUNT],
+    pub(crate) structural_loss: [f32; HEAD_COUNT],
+    pub(crate) baseline_training_cpu: std::time::Duration,
+    pub(crate) structural_training_cpu: std::time::Duration,
+    pub(crate) baseline_revision: [u8; 32],
+    pub(crate) structural_revision: [u8; 32],
+    pub(crate) model_bytes: usize,
+    pub(crate) baseline_reproduces_champion: bool,
+    pub(crate) structural_promotes: bool,
+}
+
 impl LearningState {
     pub(crate) fn pinned_model(&self) -> Option<&FtrlModel> {
         self.champion.as_ref()
@@ -190,6 +205,76 @@ impl LearningState {
         }
         self.finish_selection(examples);
         decision
+    }
+
+    #[cfg(feature = "internal-experiments")]
+    pub(crate) fn compare_feature_sets(
+        &self,
+        baseline_attempts: &[AttemptObservation],
+        structural_attempts: &[AttemptObservation],
+        consequences: &[ConsequenceObservation],
+    ) -> Result<PairedModelComparison, ()> {
+        if baseline_attempts.len() != structural_attempts.len() || self.champion.is_none() {
+            return Err(());
+        }
+        let mut baseline = derive_targets(baseline_attempts, consequences);
+        let mut structural = derive_targets(structural_attempts, consequences);
+        for (baseline, structural) in baseline.iter_mut().zip(&mut structural) {
+            if baseline.key != structural.key
+                || baseline.corpus_key != structural.corpus_key
+                || baseline.targets != structural.targets
+            {
+                return Err(());
+            }
+            let role = self.roles.get(&baseline.corpus_key).copied().ok_or(())?;
+            baseline.role = role;
+            structural.role = role;
+        }
+        let baseline_replay = bounded_corpus(&baseline, false);
+        let structural_replay = bounded_corpus(&structural, false);
+        let baseline_selection = bounded_corpus(&baseline, true);
+        let structural_selection = bounded_corpus(&structural, true);
+        let train = |replay: &[&TrainingExample]| {
+            let started = cpu_time::ProcessTime::now();
+            let mut model = FtrlModel::zero();
+            for _ in 0..TRAINING_EPOCHS {
+                for example in replay {
+                    model.update(example);
+                }
+            }
+            (model, started.elapsed())
+        };
+        let (baseline_model, baseline_training_cpu) = train(&baseline_replay);
+        let (structural_model, structural_training_cpu) = train(&structural_replay);
+        let baseline_loss = losses(&baseline_model, &baseline_selection);
+        let structural_loss = losses(&structural_model, &structural_selection);
+        let replay_claims = baseline_replay
+            .iter()
+            .map(|example| example.corpus_key)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let selection_claims = baseline_selection
+            .iter()
+            .map(|example| example.corpus_key)
+            .collect::<BTreeSet<_>>()
+            .len();
+        Ok(PairedModelComparison {
+            replay_claims,
+            selection_claims,
+            baseline_loss,
+            structural_loss,
+            baseline_training_cpu,
+            structural_training_cpu,
+            baseline_revision: revision_digest(&baseline_model),
+            structural_revision: revision_digest(&structural_model),
+            model_bytes: baseline_model.encode().len(),
+            baseline_reproduces_champion: self
+                .champion
+                .as_ref()
+                .is_some_and(|champion| champion.encode() == baseline_model.encode()),
+            structural_promotes: promotion_from_losses(baseline_loss, structural_loss)
+                == PromotionDecision::Promote,
+        })
     }
 
     fn assign_new_corpus_roles(&mut self, examples: &mut [TrainingExample]) {
@@ -773,6 +858,13 @@ pub(crate) fn compare_models(
     }
     let champion_loss = losses(champion, selection);
     let challenger_loss = losses(challenger, selection);
+    promotion_from_losses(champion_loss, challenger_loss)
+}
+
+fn promotion_from_losses(
+    champion_loss: [f32; HEAD_COUNT],
+    challenger_loss: [f32; HEAD_COUNT],
+) -> PromotionDecision {
     let improved = challenger_loss
         .iter()
         .zip(champion_loss)
