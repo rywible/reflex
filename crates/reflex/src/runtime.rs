@@ -53,6 +53,7 @@ use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
 const OPERATOR_FEATURE_START: usize = 5;
 const OPERATOR_FEATURE_END: usize = 13;
+const MIN_ONLINE_TRAINING_EXAMPLES: usize = 32;
 
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
@@ -371,7 +372,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 18;
+const RUNTIME_REVISION: u64 = 19;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -910,7 +911,7 @@ where
     let mut knowledge = recovered_bundle.knowledge;
     let pinned_knowledge = knowledge.pinned_revision().clone();
     let mut learning = recovered_bundle.learning;
-    let pinned_model = learning.pinned_model().cloned();
+    let mut active_model = learning.pinned_model().cloned();
     let recovered_revisions = recovered_bundle.revisions;
     let prior_usage = recovered_bundle.interrupted_usage.unwrap_or_default();
     if recovered_bundle.interrupted_usage.is_some() {
@@ -1621,7 +1622,7 @@ where
             parent_ranks.as_slice(),
             &frontier,
             &covered_claims,
-            pinned_model.as_ref(),
+            active_model.as_ref(),
             cohort_limit,
             &mut candidates,
             &mut candidate_fates,
@@ -1779,6 +1780,7 @@ where
         };
         instrumentation.finish(Phase::Verification, verification_started);
         test_fault_point("verdict-recorded");
+        let experience_before_cohort = ledger.len();
         let experience_checkpoint_state = ledger.checkpoint_entries();
         let candidate_fate_checkpoint = ledger.checkpoint_candidate_fates();
         let measurement_checkpoint = ledger.checkpoint_measurements();
@@ -1867,6 +1869,31 @@ where
         }
         test_fault_point("admission-completed");
         if admitted.is_empty() {
+            let online_learning_live = worker_resident_bytes
+                .saturating_add(resident_state_bytes(
+                    &known,
+                    &roots,
+                    &pareto,
+                    &frontier,
+                    &recovered_keys,
+                    &operators,
+                    &checkpoint,
+                    &ledger,
+                    &knowledge,
+                    &learning,
+                ))
+                .saturating_add(deferred_resident);
+            let training_started = instrumentation.start();
+            let proposed_learning = online_learning_candidate(
+                &ledger,
+                &learning,
+                experience_before_cohort,
+                resource_meter,
+                online_learning_live,
+                durability.pending_bytes(),
+            );
+            instrumentation.finish(Phase::Training, training_started);
+            let checkpoint_learning = proposed_learning.as_ref().unwrap_or(&learning);
             let cohort_usage = resource_meter
                 .usage(verification_requests, checkpoint.len() as u64)
                 .map_err(|()| SessionError::Resource)?;
@@ -1878,7 +1905,7 @@ where
                     SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
                     &ledger,
                     &knowledge,
-                    &learning,
+                    checkpoint_learning,
                 ),
                 SessionSeal::Interrupted(cohort_usage),
             )?;
@@ -1893,11 +1920,16 @@ where
                     &cohort_checkpoint,
                     &ledger,
                     &knowledge,
-                    &learning,
+                    checkpoint_learning,
                 ))
                 .saturating_add(deferred_resident);
+            let replaced_learning_bytes = proposed_learning
+                .as_ref()
+                .map_or(0, |_| learning.resident_bytes());
             let cohort_reservation = ResidentReservation::live(cohort_live)
-                .with_transient(cohort_checkpoint.capacity() as u64)
+                .with_transient(
+                    (cohort_checkpoint.capacity() as u64).saturating_add(replaced_learning_bytes),
+                )
                 .with_pending_durability(durability.pending_bytes());
             if !resource_meter.checkpoint_fits(cohort_checkpoint.len() as u64) {
                 ledger.rollback_entries(experience_checkpoint_state);
@@ -1916,6 +1948,10 @@ where
                 .and_then(|()| durability.barrier().map(|_| ()))
                 .map_err(SessionError::Durability)?;
             test_fault_point("cohort-published");
+            if let Some(proposed_learning) = proposed_learning {
+                learning = proposed_learning;
+                active_model = learning.pinned_model().cloned();
+            }
             checkpoint = cohort_checkpoint;
             instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
             time_exhausted = resource_meter
@@ -1953,6 +1989,35 @@ where
             &admitted_attempts,
             staged_consequences,
         );
+        let online_learning_live = worker_resident_bytes
+            .saturating_add(resident_state_bytes(
+                epoch.known(),
+                &roots,
+                &proposed_pareto,
+                epoch.frontier(),
+                &recovered_keys,
+                &operators,
+                &checkpoint,
+                epoch.ledger(),
+                &knowledge,
+                &learning,
+            ))
+            .saturating_add(cohort::recovery_resident_bytes(
+                domain,
+                &deferred_candidates,
+                &pending_parents,
+            ));
+        let training_started = instrumentation.start();
+        let proposed_learning = online_learning_candidate(
+            epoch.ledger(),
+            &learning,
+            experience_before_cohort,
+            resource_meter,
+            online_learning_live,
+            durability.pending_bytes(),
+        );
+        instrumentation.finish(Phase::Training, training_started);
+        let checkpoint_learning = proposed_learning.as_ref().unwrap_or(&learning);
         let checkpoint_usage = resource_meter
             .usage(verification_requests, checkpoint.len() as u64)
             .map_err(|()| SessionError::Resource)?;
@@ -1964,7 +2029,7 @@ where
                 SearchTailView::new(epoch.frontier(), &deferred_candidates, &pending_parents),
                 epoch.ledger(),
                 &knowledge,
-                &learning,
+                checkpoint_learning,
             ),
             SessionSeal::Interrupted(checkpoint_usage),
         )?;
@@ -1985,15 +2050,20 @@ where
             &proposed_checkpoint,
             epoch.ledger(),
             &knowledge,
-            &learning,
+            checkpoint_learning,
         ));
         let proposed_live = proposed_live.saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
             &pending_parents,
         ));
+        let replaced_learning_bytes = proposed_learning
+            .as_ref()
+            .map_or(0, |_| learning.resident_bytes());
         let proposed_reservation = ResidentReservation::live(proposed_live)
-            .with_transient(proposed_checkpoint.capacity() as u64)
+            .with_transient(
+                (proposed_checkpoint.capacity() as u64).saturating_add(replaced_learning_bytes),
+            )
             .with_pending_durability(durability.pending_bytes());
         if !resource_meter.reserve(proposed_reservation) {
             drop(epoch);
@@ -2008,6 +2078,10 @@ where
             .map_err(SessionError::Durability)?;
         test_fault_point("pareto-published");
         epoch.commit();
+        if let Some(proposed_learning) = proposed_learning {
+            learning = proposed_learning;
+            active_model = learning.pinned_model().cloned();
+        }
         goal_evaluator.extend_parent_ranks(&frontier, &mut parent_ranks);
         instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
         pareto = proposed_pareto;
@@ -2441,6 +2515,49 @@ fn candidate_generation_limit(
 
 fn generation_refill_limit(inventory_target: usize, deferred_candidates: usize) -> usize {
     inventory_target.saturating_sub(deferred_candidates)
+}
+
+fn online_training_due(previous_examples: usize, current_examples: usize) -> bool {
+    fn checkpoint(examples: usize) -> u32 {
+        if examples < MIN_ONLINE_TRAINING_EXAMPLES {
+            0
+        } else {
+            usize::BITS - examples.leading_zeros()
+        }
+    }
+
+    checkpoint(current_examples) > checkpoint(previous_examples)
+}
+
+fn learning_transient_bytes(ledger: &ExperienceLedger, learning: &LearningState) -> u64 {
+    (ledger.len() as u64)
+        .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64)
+        .saturating_add(LearningState::training_scratch_bytes(ledger.len()))
+        .saturating_add(learning.resident_bytes())
+}
+
+fn online_learning_candidate(
+    ledger: &ExperienceLedger,
+    learning: &LearningState,
+    previous_examples: usize,
+    resource_meter: &ResourceEnvelopeGuard,
+    live_bytes: u64,
+    pending_durability: u64,
+) -> Option<LearningState> {
+    if !online_training_due(previous_examples, ledger.len())
+        || !resource_meter.reserve(
+            ResidentReservation::live(live_bytes)
+                .with_transient(learning_transient_bytes(ledger, learning))
+                .with_pending_durability(pending_durability),
+        )
+    {
+        return None;
+    }
+    let mut challenger = learning.clone();
+    let attempts = ledger.attempts();
+    let mut examples = derive_targets(&attempts, ledger.consequences());
+    let _promotion = challenger.learn(&mut examples);
+    Some(challenger)
 }
 
 fn moved_tail_transaction_peak(stable_live: u64, prospective_tail: u64, transient: u64) -> u64 {
@@ -4988,8 +5105,8 @@ mod tests {
     use super::{
         ENUMERATION_COMPLETE, PendingParent, append_proposal_features, candidate_generation_limit,
         commit_pending_progress, fixed_resident_categories, generation_refill_limit,
-        moved_tail_transaction_peak, operator_feature_values, protected_origin_keys,
-        sort_prefix_by,
+        moved_tail_transaction_peak, online_training_due, operator_feature_values,
+        protected_origin_keys, sort_prefix_by,
     };
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
@@ -5053,6 +5170,17 @@ mod tests {
         assert_eq!(generation_refill_limit(144, 144), 0);
         assert_eq!(generation_refill_limit(144, 136), 8);
         assert_eq!(generation_refill_limit(144, 0), 144);
+    }
+
+    #[test]
+    fn online_training_runs_at_logarithmic_experience_checkpoints() {
+        assert!(!online_training_due(0, 31));
+        assert!(online_training_due(0, 32));
+        assert!(online_training_due(31, 40));
+        assert!(!online_training_due(32, 63));
+        assert!(online_training_due(63, 64));
+        assert!(online_training_due(40, 80));
+        assert!(!online_training_due(64, 64));
     }
 
     #[test]

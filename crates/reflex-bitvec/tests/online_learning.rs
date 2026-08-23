@@ -175,6 +175,12 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
             .count(),
         trained_snapshot.candidate_fates.len(),
     );
+    assert!(
+        trained_snapshot.attempts.iter().any(|attempt| {
+            attempt.allocation_queue == CandidateAllocationQueueInspection::Learned
+        }),
+        "a Model Revision promoted from one Verification Cohort must guide a later cohort in the same Improvement Session"
+    );
 
     std::fs::copy(&trained, &constrained).unwrap();
     std::fs::copy(&trained, &learned_full).unwrap();
