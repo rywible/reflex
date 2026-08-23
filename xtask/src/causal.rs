@@ -487,8 +487,8 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     build_training_bundles(&full, &bootstrap_revision)?;
     let no_model = work.join("no-model.bundle");
     let no_derived = work.join("no-derived.bundle");
-    ablate_bundle(&full, &no_model, Some(&bootstrap_revision), false)?;
-    ablate_bundle(&full, &no_derived, None, true)?;
+    ablate_causal_bundle(&full, &no_model, Some(&bootstrap_revision), false)?;
+    ablate_causal_bundle(&full, &no_derived, None, true)?;
     validate_treatment_bundle(&no_model)?;
     validate_treatment_bundle(&no_derived)?;
 
@@ -1586,13 +1586,23 @@ fn validate_treatment_bundle(path: &Path) -> Result<(), AnyError> {
     Ok(())
 }
 
-pub(super) fn ablate_bundle(
+fn ablate_causal_bundle(
     source: &Path,
     target: &Path,
     model_template: Option<&Path>,
     derived: bool,
 ) -> Result<(), AnyError> {
-    let mut bundle = CanonicalBundle::decode(&std::fs::read(source)?, RESIDENT_BYTES)?;
+    ablate_bundle(source, target, model_template, derived, RESIDENT_BYTES)
+}
+
+pub(super) fn ablate_bundle(
+    source: &Path,
+    target: &Path,
+    model_template: Option<&Path>,
+    derived: bool,
+    maximum_logical_bytes: u64,
+) -> Result<(), AnyError> {
+    let mut bundle = CanonicalBundle::decode(&std::fs::read(source)?, maximum_logical_bytes)?;
     let identity = bundle.identity().to_vec();
     let artifacts = bundle.segment(SegmentKind::Artifacts).to_vec();
     let revisions = bundle.segment(SegmentKind::Revisions);
@@ -1604,7 +1614,8 @@ pub(super) fn ablate_bundle(
     }
     let mut model_id: [u8; 32] = revisions[32..64].try_into()?;
     if let Some(template) = model_template {
-        let template_bundle = CanonicalBundle::decode(&std::fs::read(template)?, RESIDENT_BYTES)?;
+        let template_bundle =
+            CanonicalBundle::decode(&std::fs::read(template)?, maximum_logical_bytes)?;
         let template_revisions = template_bundle.segment(SegmentKind::Revisions);
         model_id = template_revisions[32..64].try_into()?;
         let mut template_input = &template_revisions[64..];
@@ -1874,8 +1885,12 @@ mod tests {
         let no_derived = directory.join("no-derived.bundle");
         build_training_bundles(&full, &bootstrap).unwrap();
         let bootstrap_revision = revision_ids(&std::fs::read(&bootstrap).unwrap()).unwrap().1;
-        ablate_bundle(&full, &no_model, Some(&bootstrap), false).unwrap();
-        ablate_bundle(&full, &no_derived, None, true).unwrap();
+        assert!(
+            ablate_bundle(&full, &no_model, Some(&bootstrap), false, 1).is_err(),
+            "the caller-owned logical limit must govern ablation imports"
+        );
+        ablate_bundle(&full, &no_model, Some(&bootstrap), false, RESIDENT_BYTES).unwrap();
+        ablate_bundle(&full, &no_derived, None, true, RESIDENT_BYTES).unwrap();
         validate_treatment_bundle(&no_model).unwrap();
         validate_treatment_bundle(&no_derived).unwrap();
         assert_eq!(

@@ -31,7 +31,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v24";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v25";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -750,13 +750,13 @@ fn run_treatments(
         &prepared.heldout_seed_nodes,
         &bootstrap_bundle,
     )?;
-    crate::causal::ablate_bundle(
+    ablate_lean_bundle(
         &training_bundle,
         &no_model_seed,
         Some(&bootstrap_template_bundle),
         false,
     )?;
-    crate::causal::ablate_bundle(&training_bundle, &no_derived_seed, None, true)?;
+    ablate_lean_bundle(&training_bundle, &no_derived_seed, None, true)?;
     let full = run_forked_treatment(
         "full",
         &prepared.config,
@@ -805,6 +805,21 @@ fn run_treatments(
         no_derived,
         bootstrap,
     })
+}
+
+fn ablate_lean_bundle(
+    source: &Path,
+    target: &Path,
+    model_template: Option<&Path>,
+    derived: bool,
+) -> Result<(), AnyError> {
+    crate::causal::ablate_bundle(
+        source,
+        target,
+        model_template,
+        derived,
+        RUNTIME_RESIDENT_BYTES,
+    )
 }
 
 fn development_domain_resources(

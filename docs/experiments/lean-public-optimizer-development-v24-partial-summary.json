@@ -1,0 +1,57 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v24-partial-summary-v1",
+  "status": "development-only; activation passed; counterfactual protocol incomplete",
+  "training_artifacts": 32,
+  "heldout_artifacts": 8,
+  "training": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 1024,
+    "candidate_verification_requests": 992,
+    "candidate_fates": 2058,
+    "candidates_generated": 1640,
+    "candidates_selected": 992,
+    "accepted_attempts": 30,
+    "accepted_claims": 27,
+    "refuted_attempts": 962,
+    "artifacts_admitted": 30,
+    "model_generation": 1,
+    "elapsed_seconds": 237.738927622,
+    "cpu_seconds": 238.454873809,
+    "peak_resident_bytes": 19412296413,
+    "durable_bytes": 98370253,
+    "epochs": 121,
+    "resource_refusal": "verification-budget"
+  },
+  "bootstrap": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 128,
+    "candidate_verification_requests": 120,
+    "accepted_attempts": 4,
+    "accepted_claims": 4,
+    "refuted_attempts": 116,
+    "artifacts_admitted": 4,
+    "elapsed_seconds": 56.056253826,
+    "cpu_seconds": 56.134785320,
+    "peak_resident_bytes": 18189476351,
+    "durable_bytes": 59343723,
+    "resource_refusal": "verification-budget"
+  },
+  "registered_envelope": {
+    "runtime_resident_bytes": 34359738368,
+    "durable_bytes": 1073741824,
+    "training_elapsed_seconds": 600,
+    "training_verification_requests": 1024,
+    "evaluation_verification_requests": 128
+  },
+  "training_bundle": {
+    "encoded_bytes": 98370253,
+    "logical_bytes": 450307376,
+    "durable_size_bound": 478651124,
+    "sha256": "1eb15fd82269cdc8ef49aee0180f57d5621a9b88eca8368ab93f9cde09c0b4e0",
+    "phase_sha256": "725bf0fe76918a2c1026ca3cce1cbc997d144c16c2814fc56b12a2c17b91ecc6"
+  },
+  "bootstrap_bundle_sha256": "ba8beed862f362981e06ea3abca22c02387a5a25a655ec72eaf9ad8d12807c54",
+  "bootstrap_phase_sha256": "3dfe3cb8f403c24fcc655179ae1ddd29845adc070963f0530805d774d44687cc",
+  "failure": "shared ablation helper decoded a valid Lean bundle under the BitVec harness's 256 MiB logical limit",
+  "decision": "make the ablation logical decode limit caller-owned and rerun as v25"
+}
