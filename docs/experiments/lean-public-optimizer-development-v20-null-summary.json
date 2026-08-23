@@ -32,6 +32,6 @@
   "training_bundle_sha256": "170dcecddfd2acc1b9bafb602a59c3a5ab48bd477aca0e0673e2786631dfc945",
   "preflight_file_sha256": "019a327edbe9914d9112067ae492d42104a410d85067c762c6b426284f89c567",
   "preflight_content_sha256": "ab61f7a4209720db90c34ad46b7a8d84140cd98fc706e7f7ee9672e4fbb370f7",
-  "diagnosis": "bounded primitive enumeration discarded alternatives after the first materialized page",
-  "decision": "fix restart-complete primitive pagination before rerunning breadth"
+  "diagnosis": "bounded primitive enumeration discarded alternatives after the first materialized page, while generation also compounded a large deferred inventory before its next Verification cohort",
+  "decision": "fix restart-complete primitive pagination and bounded inventory refill before rerunning breadth"
 }

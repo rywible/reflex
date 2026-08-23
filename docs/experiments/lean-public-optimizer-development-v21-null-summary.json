@@ -1,0 +1,42 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v21-null-summary-v1",
+  "status": "development-only; activation-null; treatments not run",
+  "training_artifacts": 32,
+  "heldout_artifacts": 8,
+  "training": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 72,
+    "candidate_verification_requests": 40,
+    "candidate_fates": 316,
+    "candidates_generated": 460,
+    "candidates_selected": 48,
+    "accepted_attempts": 2,
+    "refuted_attempts": 38,
+    "artifacts_admitted": 2,
+    "model_generation": 0,
+    "elapsed_seconds": 46.83634525,
+    "cpu_seconds": 46.871746198,
+    "peak_resident_bytes": 18396148842,
+    "durable_bytes": 78483851
+  },
+  "registered_envelope": {
+    "runtime_resident_bytes": 34359738368,
+    "durable_bytes": 1073741824,
+    "elapsed_seconds": 600,
+    "verification_requests": 1024
+  },
+  "candidate_fates": {
+    "novelty_filtered": 47,
+    "policy_deferred": 229
+  },
+  "verified_by_queue": {
+    "protected_origin": 32,
+    "protected_derived": 0,
+    "learned": 0,
+    "bootstrap": 8
+  },
+  "training_bundle_sha256": "fe27c0460b6b5b2fa39899704f8f90d75e754a939912f67c38a89cf0fb051997",
+  "phase_sha256": "ae6e3b9c421db5688b21ba12a9e75f6fd3e42206df376f8d22d7c8b33311f077",
+  "diagnosis": "generation compounded 229 deferred heavyweight Candidates before the next eight-Candidate Verification cohort",
+  "decision": "apply bounded inventory refill before another identical breadth treatment"
+}

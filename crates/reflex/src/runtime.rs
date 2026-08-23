@@ -342,7 +342,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 15;
+const RUNTIME_REVISION: u64 = 16;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1378,14 +1378,16 @@ where
         );
         let catalog = domain.operators().catalog();
         let available_resident = resource_meter.available_resident(resident_before_epoch);
-        let generation_limit = candidate_generation_limit(
+        let generation_inventory_target = candidate_generation_limit(
             cohort_limit,
             remaining_verifications,
             pending_parent_indexes.len(),
             catalog.len(),
             available_resident,
         );
-        if generation_limit == 0 {
+        let generation_limit =
+            generation_refill_limit(generation_inventory_target, deferred_candidates.len());
+        if generation_inventory_target == 0 && deferred_candidates.is_empty() {
             resident_budget_exhausted = true;
             break;
         }
@@ -1414,14 +1416,18 @@ where
             &pending_parent_indexes,
             &parent_claims,
         );
-        let parent_capacity = generation_limit
-            .min(primitive_parent_capacity)
-            .max(usize::from(primitive_budget == 0));
-        let generation_parent_indexes = generation::select_pending_parents(
-            &pending_parent_indexes,
-            &parent_claims,
-            parent_capacity,
-        );
+        let generation_parent_indexes = if generation_limit == 0 {
+            Vec::new()
+        } else {
+            let parent_capacity = generation_limit
+                .min(primitive_parent_capacity)
+                .max(usize::from(primitive_budget == 0));
+            generation::select_pending_parents(
+                &pending_parent_indexes,
+                &parent_claims,
+                parent_capacity,
+            )
+        };
         let generation_parents = generation_parent_indexes
             .iter()
             .map(|index| parents[*index])
@@ -2309,6 +2315,10 @@ fn candidate_generation_limit(
             .min(MAX_CANDIDATE_CHOICES),
     )
     .unwrap_or(usize::MAX)
+}
+
+fn generation_refill_limit(inventory_target: usize, deferred_candidates: usize) -> usize {
+    inventory_target.saturating_sub(deferred_candidates)
 }
 
 fn opportunity_features<D: DomainDefinition>(
@@ -4866,8 +4876,8 @@ mod tests {
 
     use super::{
         ENUMERATION_COMPLETE, PendingParent, append_proposal_features, candidate_generation_limit,
-        commit_pending_progress, fixed_resident_categories, operator_feature_values,
-        protected_origin_keys, sort_prefix_by,
+        commit_pending_progress, fixed_resident_categories, generation_refill_limit,
+        operator_feature_values, protected_origin_keys, sort_prefix_by,
     };
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
@@ -4923,6 +4933,14 @@ mod tests {
         assert_eq!(candidate_generation_limit(8, 10, 32, 8, u64::MAX), 80);
         assert_eq!(candidate_generation_limit(24, 1_008, 16, 9, 64 * 1024), 8);
         assert_eq!(candidate_generation_limit(0, 1_008, 16, 9, u64::MAX), 0);
+    }
+
+    #[test]
+    fn generation_refills_lookahead_only_after_deferred_inventory_drains() {
+        assert_eq!(generation_refill_limit(144, 229), 0);
+        assert_eq!(generation_refill_limit(144, 144), 0);
+        assert_eq!(generation_refill_limit(144, 136), 8);
+        assert_eq!(generation_refill_limit(144, 0), 144);
     }
 
     #[test]
