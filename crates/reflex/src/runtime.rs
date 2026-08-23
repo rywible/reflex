@@ -227,6 +227,90 @@ const CHOICES_PER_VERIFICATION: u64 = 8;
 const GENERATION_COHORT_LOOKAHEAD: u64 = 2;
 const MIN_CHOICE_RESIDENT_BYTES: u64 = 8 * 1024;
 const MAX_CANDIDATE_CHOICES: u64 = 16_384;
+
+pub(crate) struct DomainResourcePlan {
+    requirements: VerificationWorkerRequirements,
+    pub(crate) requested_worker_threads: usize,
+    pub(crate) external_worker_lanes: usize,
+    pub(crate) runtime_worker_lanes: usize,
+    pub(crate) runtime_stack_bytes: u64,
+    pub(crate) durability_stack_bytes: u64,
+    pub(crate) external_worker_bytes: u64,
+    pub(crate) operator_bytes: u64,
+    pub(crate) maximum_candidate_capacity: usize,
+    pub(crate) operator_scratch_bytes_per_lane: u64,
+    pub(crate) operator_scratch_bytes: u64,
+    pub(crate) fixed_resident_bytes: u64,
+}
+
+fn fixed_resident_categories(
+    runtime_worker_lanes: usize,
+    external_worker_bytes: u64,
+    operator_bytes: u64,
+    operator_scratch_bytes_per_lane: u64,
+) -> (u64, u64, u64, u64) {
+    let runtime_stack_bytes =
+        (runtime_worker_lanes as u64).saturating_mul(WORKER_STACK_BYTES as u64);
+    let durability_stack_bytes = DURABILITY_STACK_BYTES as u64;
+    let operator_scratch_bytes =
+        (runtime_worker_lanes as u64).saturating_mul(operator_scratch_bytes_per_lane);
+    let fixed_resident_bytes = runtime_stack_bytes
+        .saturating_add(durability_stack_bytes)
+        .saturating_add(external_worker_bytes)
+        .saturating_add(operator_bytes)
+        .saturating_add(operator_scratch_bytes);
+    (
+        runtime_stack_bytes,
+        durability_stack_bytes,
+        operator_scratch_bytes,
+        fixed_resident_bytes,
+    )
+}
+
+fn domain_resource_plan<D: DomainDefinition>(
+    domain: &D,
+    requested_worker_threads: usize,
+) -> Option<DomainResourcePlan> {
+    let requirements = domain.kernel().worker_requirements();
+    let runtime_worker_lanes = requested_worker_threads
+        .checked_sub(requirements.worker_lanes())
+        .filter(|lanes| *lanes != 0)?;
+    let external_worker_bytes = requirements.resident_bytes();
+    let operator_bytes = domain.operators().resident_bytes();
+    let maximum_candidate_capacity = usize::try_from(MAX_CANDIDATE_CHOICES).ok()?;
+    let operator_scratch_bytes_per_lane = domain
+        .operators()
+        .scratch_resident_bytes(maximum_candidate_capacity);
+    let (runtime_stack_bytes, durability_stack_bytes, operator_scratch_bytes, fixed_resident_bytes) =
+        fixed_resident_categories(
+            runtime_worker_lanes,
+            external_worker_bytes,
+            operator_bytes,
+            operator_scratch_bytes_per_lane,
+        );
+    Some(DomainResourcePlan {
+        requirements,
+        requested_worker_threads,
+        external_worker_lanes: requirements.worker_lanes(),
+        runtime_worker_lanes,
+        runtime_stack_bytes,
+        durability_stack_bytes,
+        external_worker_bytes,
+        operator_bytes,
+        maximum_candidate_capacity,
+        operator_scratch_bytes_per_lane,
+        operator_scratch_bytes,
+        fixed_resident_bytes,
+    })
+}
+
+#[cfg(feature = "internal-experiments")]
+pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
+    domain: &D,
+    requested_worker_threads: usize,
+) -> Option<DomainResourcePlan> {
+    domain_resource_plan(domain, requested_worker_threads)
+}
 const RUNTIME_REVISION: u64 = 14;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
@@ -243,30 +327,13 @@ where
 {
     let resource_meter =
         ResourceEnvelopeGuard::start(&request.resources).map_err(|()| SessionError::Resource)?;
-    let requirements = domain.kernel().worker_requirements();
-    let runtime_lanes = request
-        .resources
-        .worker_threads
-        .get()
-        .checked_sub(requirements.worker_lanes())
-        .filter(|lanes| *lanes != 0)
+    let resource_plan = domain_resource_plan(domain, request.resources.worker_threads.get())
         .ok_or(SessionError::Resource)?;
+    let requirements = resource_plan.requirements;
+    let runtime_lanes = resource_plan.runtime_worker_lanes;
     let scheduler =
         Scheduler::from_environment(runtime_lanes).map_err(|()| SessionError::Resource)?;
-    let maximum_candidate_capacity =
-        usize::try_from(MAX_CANDIDATE_CHOICES).map_err(|_| SessionError::Resource)?;
-    let worker_resident_bytes = (runtime_lanes as u64)
-        .saturating_mul(WORKER_STACK_BYTES as u64)
-        .saturating_add(DURABILITY_STACK_BYTES as u64)
-        .saturating_add(requirements.resident_bytes())
-        .saturating_add(domain.operators().resident_bytes())
-        .saturating_add(
-            (runtime_lanes as u64).saturating_mul(
-                domain
-                    .operators()
-                    .scratch_resident_bytes(maximum_candidate_capacity),
-            ),
-        );
+    let worker_resident_bytes = resource_plan.fixed_resident_bytes;
     if !resource_meter.reserve(ResidentReservation::live(worker_resident_bytes)) {
         return Err(SessionError::Resource);
     }
@@ -4621,8 +4688,8 @@ mod tests {
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
     use super::{
-        append_proposal_features, candidate_generation_limit, operator_feature_values,
-        protected_origin_keys, sort_prefix_by,
+        append_proposal_features, candidate_generation_limit, fixed_resident_categories,
+        operator_feature_values, protected_origin_keys, sort_prefix_by,
     };
     use crate::ProposalFeatures;
     use crate::learning::{FEATURE_COUNT, Features};
@@ -4676,6 +4743,17 @@ mod tests {
         assert_eq!(candidate_generation_limit(8, 10, 32, 8, u64::MAX), 80);
         assert_eq!(candidate_generation_limit(24, 1_008, 16, 9, 64 * 1024), 8);
         assert_eq!(candidate_generation_limit(0, 1_008, 16, 9, u64::MAX), 0);
+    }
+
+    #[test]
+    fn mandatory_resident_plan_decomposes_the_runtime_reservation_exactly() {
+        let (stacks, durability, scratch, fixed) =
+            fixed_resident_categories(5, 16 << 30, 1_000, 250);
+
+        assert_eq!(stacks, 10 << 20);
+        assert_eq!(durability, 512 << 10);
+        assert_eq!(scratch, 1_250);
+        assert_eq!(fixed, (16 << 30) + (10 << 20) + (512 << 10) + 2_250);
     }
 
     #[test]

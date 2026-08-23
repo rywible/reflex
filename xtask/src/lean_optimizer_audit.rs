@@ -8,7 +8,8 @@ use std::time::Duration;
 use reflex::internal_experiments::{
     CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
     CandidateNoveltyFilterReasonInspection, ExperienceVerdictInspection,
-    compare_candidate_features, inspect_experience_segment, inspect_session_segment,
+    compare_candidate_features, inspect_domain_resources, inspect_experience_segment,
+    inspect_session_segment,
 };
 use reflex::{
     BundlePlan, Direction, DomainDefinition, GoalSet, ImprovementRequest, NonEmpty,
@@ -30,7 +31,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v19";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v20";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -54,6 +55,7 @@ struct Arguments {
     heldout_artifacts: usize,
     training_verification_requests: u64,
     verification_requests: u64,
+    preflight_only: bool,
 }
 
 struct DevelopmentCorpus {
@@ -89,6 +91,22 @@ struct Usage {
     durable_bytes: u64,
     elapsed_ns: u64,
     cpu_ns: u64,
+}
+
+#[derive(Serialize)]
+struct DomainResources {
+    requested_worker_threads: usize,
+    external_worker_lanes: usize,
+    runtime_worker_lanes: usize,
+    runtime_stack_bytes: u64,
+    durability_stack_bytes: u64,
+    external_worker_bytes: u64,
+    operator_bytes: u64,
+    maximum_candidate_capacity: usize,
+    operator_scratch_bytes_per_lane: u64,
+    operator_scratch_bytes: u64,
+    fixed_resident_bytes: u64,
+    dynamic_headroom_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -311,6 +329,8 @@ struct Report {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
+    training_domain_resources: DomainResources,
+    heldout_domain_resources: DomainResources,
     phase_zero_information_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
@@ -335,11 +355,28 @@ struct ReportInputs {
     selected_artifacts: Vec<SelectedArtifact>,
     training_usage: Usage,
     training_learning: LearningSummary,
+    training_domain_resources: DomainResources,
+    heldout_domain_resources: DomainResources,
     phase_zero_information_audit: DonorAudit,
     full: TreatmentResult,
     no_model: TreatmentResult,
     no_derived: TreatmentResult,
     bootstrap: TreatmentResult,
+}
+
+#[derive(Serialize)]
+struct PreflightReport {
+    schema: &'static str,
+    status: &'static str,
+    training_artifacts: usize,
+    heldout_artifacts: usize,
+    selected_artifacts: Vec<SelectedArtifact>,
+    runtime_resident_limit_bytes: u64,
+    training_domain_resources: DomainResources,
+    heldout_domain_resources: DomainResources,
+    host: HostEnvironment,
+    host_isolation: HostIsolation,
+    content_sha256: String,
 }
 
 pub fn development(arguments: &[String]) -> Result<(), AnyError> {
@@ -629,6 +666,9 @@ fn development_once(arguments: &[String], isolation: HostIsolation) -> Result<()
     std::fs::create_dir_all(&arguments.work)?;
 
     let prepared = prepare_corpus(&arguments)?;
+    if arguments.preflight_only {
+        return write_preflight_report(&arguments, prepared, host, isolation);
+    }
     let inputs = run_treatments(&arguments, prepared, host, isolation)?;
     write_report(&arguments, inputs)
 }
@@ -647,6 +687,8 @@ fn run_treatments(
     let no_derived_seed = arguments.work.join("no-derived-seed.bundle");
     let no_derived_bundle = arguments.work.join("no-derived.bundle");
     let bootstrap_bundle = arguments.work.join("bootstrap.bundle");
+    let (training_domain_resources, heldout_domain_resources) =
+        development_domain_resources(&prepared)?;
     build_bootstrap_template(
         &prepared.config,
         prepared.training_corpus.clone(),
@@ -729,12 +771,85 @@ fn run_treatments(
         selected_artifacts: prepared.selected_artifacts,
         training_usage,
         training_learning,
+        training_domain_resources,
+        heldout_domain_resources,
         phase_zero_information_audit,
         full,
         no_model,
         no_derived,
         bootstrap,
     })
+}
+
+fn development_domain_resources(
+    prepared: &DevelopmentCorpus,
+) -> Result<(DomainResources, DomainResources), AnyError> {
+    Ok((
+        domain_resources(LeanDomain::new(
+            prepared.config.clone(),
+            prepared.training_corpus.clone(),
+        )?)?,
+        domain_resources(LeanDomain::new(
+            prepared.config.clone(),
+            prepared.heldout_corpus.clone(),
+        )?)?,
+    ))
+}
+
+fn domain_resources(domain: LeanDomain) -> Result<DomainResources, AnyError> {
+    let inspection = inspect_domain_resources(&domain, WORKER_THREADS)
+        .ok_or("Lean Domain cannot satisfy the registered worker allocation")?;
+    let resources = DomainResources {
+        requested_worker_threads: inspection.requested_worker_threads,
+        external_worker_lanes: inspection.external_worker_lanes,
+        runtime_worker_lanes: inspection.runtime_worker_lanes,
+        runtime_stack_bytes: inspection.runtime_stack_bytes,
+        durability_stack_bytes: inspection.durability_stack_bytes,
+        external_worker_bytes: inspection.external_worker_bytes,
+        operator_bytes: inspection.operator_bytes,
+        maximum_candidate_capacity: inspection.maximum_candidate_capacity,
+        operator_scratch_bytes_per_lane: inspection.operator_scratch_bytes_per_lane,
+        operator_scratch_bytes: inspection.operator_scratch_bytes,
+        fixed_resident_bytes: inspection.fixed_resident_bytes,
+        dynamic_headroom_bytes: RUNTIME_RESIDENT_BYTES
+            .saturating_sub(inspection.fixed_resident_bytes),
+    };
+    drop(domain);
+    Ok(resources)
+}
+
+fn write_preflight_report(
+    arguments: &Arguments,
+    prepared: DevelopmentCorpus,
+    host: HostEnvironment,
+    host_isolation: HostIsolation,
+) -> Result<(), AnyError> {
+    let training_domain_resources = domain_resources(LeanDomain::new(
+        prepared.config.clone(),
+        prepared.training_corpus,
+    )?)?;
+    let heldout_domain_resources =
+        domain_resources(LeanDomain::new(prepared.config, prepared.heldout_corpus)?)?;
+    let mut report = PreflightReport {
+        schema: "reflex-lean-public-optimizer-preflight-v1",
+        status: "development-only; corpus prepared and kernel-replayed; no Improvement Session",
+        training_artifacts: prepared.training,
+        heldout_artifacts: prepared.heldout,
+        selected_artifacts: prepared.selected_artifacts,
+        runtime_resident_limit_bytes: RUNTIME_RESIDENT_BYTES,
+        training_domain_resources,
+        heldout_domain_resources,
+        host,
+        host_isolation,
+        content_sha256: String::new(),
+    };
+    report.content_sha256 = hash_json(&report)?;
+    if let Some(parent) = arguments.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&arguments.output, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 fn build_bootstrap_template(
@@ -794,6 +909,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
+        training_domain_resources,
+        heldout_domain_resources,
         phase_zero_information_audit,
         full,
         no_model,
@@ -838,6 +955,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         selected_artifacts,
         training_usage,
         training_learning,
+        training_domain_resources,
+        heldout_domain_resources,
         phase_zero_information_audit,
         full,
         no_model,
@@ -2013,6 +2132,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
             "--heldout-artifacts",
             "--training-verification-requests",
             "--verification-requests",
+            "--mode",
         ],
         "lean-public-optimizer-development",
     )?;
@@ -2021,6 +2141,11 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
             .get(flag)
             .copied()
             .ok_or_else(|| format!("lean-public-optimizer-development requires {flag}").into())
+    };
+    let preflight_only = match values.get("--mode").copied().unwrap_or("run") {
+        "run" => false,
+        "preflight" => true,
+        mode => return Err(format!("unknown Lean optimizer Development mode {mode}").into()),
     };
     Ok(Arguments {
         lake: value("--lake")?.into(),
@@ -2033,6 +2158,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, AnyError> {
         heldout_artifacts: value("--heldout-artifacts")?.parse()?,
         training_verification_requests: value("--training-verification-requests")?.parse()?,
         verification_requests: value("--verification-requests")?.parse()?,
+        preflight_only,
     })
 }
 
@@ -2238,6 +2364,7 @@ mod tests {
             heldout_artifacts: 1,
             training_verification_requests: 1,
             verification_requests: 1,
+            preflight_only: false,
         };
 
         let september = [earlier_seed, earlier_peer];
@@ -2246,6 +2373,43 @@ mod tests {
 
         assert_eq!(heldout.len(), 1);
         assert_eq!(heldout[0].statement_hash, 2);
+    }
+
+    #[test]
+    fn preflight_mode_is_explicit_and_does_not_change_the_registered_budgets() {
+        let arguments = [
+            "--lake",
+            "/lake",
+            "--december-root",
+            "/mathlib",
+            "--september-catalog",
+            "/september",
+            "--december-catalog",
+            "/december",
+            "--work",
+            "/work",
+            "--output",
+            "/output",
+            "--training-artifacts",
+            "32",
+            "--heldout-artifacts",
+            "8",
+            "--training-verification-requests",
+            "1024",
+            "--verification-requests",
+            "128",
+            "--mode",
+            "preflight",
+        ]
+        .map(str::to_owned);
+
+        let parsed = parse(&arguments).unwrap();
+
+        assert!(parsed.preflight_only);
+        assert_eq!(parsed.training_artifacts, 32);
+        assert_eq!(parsed.heldout_artifacts, 8);
+        assert_eq!(parsed.training_verification_requests, 1_024);
+        assert_eq!(parsed.verification_requests, 128);
     }
 
     #[test]

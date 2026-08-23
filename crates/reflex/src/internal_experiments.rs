@@ -9,6 +9,48 @@ use std::time::Duration;
 
 use crate::{Completion, DomainDefinition, ImprovementRequest, ResourceUsage, SessionError};
 
+/// Repository-facing decomposition of mandatory resident resources before
+/// Seed ingestion or search-state allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DomainResourceInspection {
+    pub requested_worker_threads: usize,
+    pub external_worker_lanes: usize,
+    pub runtime_worker_lanes: usize,
+    pub runtime_stack_bytes: u64,
+    pub durability_stack_bytes: u64,
+    pub external_worker_bytes: u64,
+    pub operator_bytes: u64,
+    pub maximum_candidate_capacity: usize,
+    pub operator_scratch_bytes_per_lane: u64,
+    pub operator_scratch_bytes: u64,
+    pub fixed_resident_bytes: u64,
+}
+
+/// Computes the exact mandatory resident reservation used by the Runtime.
+///
+/// This excludes dynamic Artifacts, Experience, Frontier, and learning state;
+/// callers can subtract it from an experiment envelope before spending search.
+#[must_use]
+pub fn inspect_domain_resources<D: DomainDefinition>(
+    domain: &D,
+    requested_worker_threads: usize,
+) -> Option<DomainResourceInspection> {
+    let plan = crate::runtime::inspect_domain_resources(domain, requested_worker_threads)?;
+    Some(DomainResourceInspection {
+        requested_worker_threads: plan.requested_worker_threads,
+        external_worker_lanes: plan.external_worker_lanes,
+        runtime_worker_lanes: plan.runtime_worker_lanes,
+        runtime_stack_bytes: plan.runtime_stack_bytes,
+        durability_stack_bytes: plan.durability_stack_bytes,
+        external_worker_bytes: plan.external_worker_bytes,
+        operator_bytes: plan.operator_bytes,
+        maximum_candidate_capacity: plan.maximum_candidate_capacity,
+        operator_scratch_bytes_per_lane: plan.operator_scratch_bytes_per_lane,
+        operator_scratch_bytes: plan.operator_scratch_bytes,
+        fixed_resident_bytes: plan.fixed_resident_bytes,
+    })
+}
+
 /// Repository-facing projection of the durable Session envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionInspection {
