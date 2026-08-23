@@ -747,7 +747,7 @@ Production scheduling may be nondeterministic. The internal Experimental Harness
 
 ## Revisions and learning
 
-Each Campaign holds immutable references to exactly one Knowledge Revision and one Model Revision. Campaign execution never observes hot-swapped learned state or indexes.
+Each Campaign holds an immutable Knowledge Revision. One Verification Cohort pins exactly one immutable Model Revision; after the cohort and its learning evidence are restart-complete, an Operational Promotion may atomically change the Model Revision used by the next cohort in the same Campaign. No Candidate-scale work observes a hot-swapped model or index.
 
 The private Goal Evaluator is the one operational interpreter of a Goal Set. Validation, stable Goal IDs, Constraint eligibility, tiered Preference ordering, per-Goal Pareto membership, affected-Goal reporting, Success Conditions, and canonical checkpoint encoding cross this seam. It does not scalarize Preference and does not use Pareto membership as Search Frontier investment policy.
 
@@ -771,7 +771,7 @@ Each forecast carries calibration and uncertainty, not only a point estimate. Th
 
 Training consumes a versioned Replay Corpus and produces an immutable challenger. The first learned challenger uses purpose-built Rust FP32 FTRL/linear heads for Operator selection, cost prediction, and typed Potential outcomes. No generic tensor framework is foundational.
 
-Operational Selection uses a rotating Selection Corpus. Passing challengers are atomically promoted for future Campaigns; incomparable challengers may become Specialist Revisions. Scientific Corpora are inaccessible to production search, training, tuning, and promotion code paths.
+Operational Selection uses a rotating Selection Corpus. Passing Model challengers are atomically promoted for future Verification Cohorts, including later cohorts in the active Campaign; passing Knowledge challengers remain eligible for future Campaigns. Incomparable challengers may become Specialist Revisions. Scientific Corpora are inaccessible to production search, training, tuning, and promotion code paths.
 
 Knowledge Consolidation similarly produces immutable challenger Knowledge Revisions. Derived Operators become immediately eligible for initial exploration after verified consolidation, then ordinary evidence governs later allocation or deactivation.
 

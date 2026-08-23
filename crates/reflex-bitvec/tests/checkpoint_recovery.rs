@@ -3,7 +3,10 @@ use std::ops::ControlFlow;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use reflex::internal_experiments::inspect_experience_segment;
+use reflex::internal_experiments::{
+    CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
+    inspect_experience_segment,
+};
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
     OptimizationGoal, Preference, ResourceEnvelope, improve,
@@ -16,6 +19,7 @@ const TARGET_ENV: &str = "REFLEX_CHECKPOINT_CRASH_TARGET";
 const PAUSE_ENV: &str = "REFLEX_CHECKPOINT_INITIAL_PAUSE_MS";
 const LOOP_ENV: &str = "REFLEX_CHECKPOINT_CRASH_LOOP";
 const COHORT_ENV: &str = "REFLEX_CHECKPOINT_COHORT_HELPER";
+const ONLINE_COHORT_ENV: &str = "REFLEX_CHECKPOINT_ONLINE_COHORT_HELPER";
 const SOURCE_ENV: &str = "REFLEX_CHECKPOINT_CRASH_SOURCE";
 #[cfg(debug_assertions)]
 const FAULT_PHASE_ENV: &str = "REFLEX_INTERNAL_TEST_FAULT_PHASE";
@@ -388,6 +392,62 @@ fn deterministic_faults_across_randomized_mutation_phases_recover_exactly() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn online_promotion_checkpoint_recovers_the_exact_next_cohort_policy() {
+    let directory = std::env::temp_dir().join(format!(
+        "reflex-online-recovery-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let uninterrupted = directory.join("uninterrupted.bundle");
+    let interrupted = directory.join("interrupted.bundle");
+
+    improve(
+        BitVecDomain::unary_u8(),
+        online_cohort_request(BundlePlan::Fresh {
+            target: uninterrupted.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(ONLINE_COHORT_ENV, "1")
+        .env(FAULT_PHASE_ENV, "candidate-created")
+        .env(FAULT_OCCURRENCE_ENV, "2")
+        .env(TARGET_ENV, &interrupted)
+        .status()
+        .unwrap();
+    assert!(!status.success() && status.code().is_none());
+
+    improve(
+        BitVecDomain::unary_u8(),
+        online_cohort_request(BundlePlan::Resume {
+            source: interrupted.clone(),
+            target: interrupted.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    )
+    .unwrap();
+
+    let expected = allocation_trace(&uninterrupted);
+    assert!(expected.iter().any(|fate| {
+        matches!(
+            fate.outcome,
+            CandidateFateOutcomeInspection::Verified {
+                allocation_queue: CandidateAllocationQueueInspection::Learned,
+                ..
+            }
+        )
+    }));
+    assert_eq!(allocation_trace(&interrupted), expected);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn checkpoint_crash_helper() {
     if std::env::var_os(HELPER_ENV).is_none() {
         return;
@@ -417,7 +477,12 @@ fn checkpoint_crash_helper() {
                     target,
                 },
             );
-            improve(BitVecDomain::unary_u8(), cohort_request(bundle), |_| {
+            let request = if std::env::var_os(ONLINE_COHORT_ENV).is_some() {
+                online_cohort_request(bundle)
+            } else {
+                cohort_request(bundle)
+            };
+            improve(BitVecDomain::unary_u8(), request, |_| {
                 ControlFlow::Continue(())
             })
             .expect("the configured cohort fault must terminate this process");
@@ -484,6 +549,26 @@ fn cohort_request(bundle: BundlePlan) -> ImprovementRequest<BitVecDomain> {
     .unwrap()
 }
 
+fn online_cohort_request(bundle: BundlePlan) -> ImprovementRequest<BitVecDomain> {
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::new(NonEmpty::try_from_iter((1..=32).map(multi_choice_seed)).unwrap()),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+            NonZeroU64::new(512).unwrap(),
+        ),
+        bundle,
+    )
+    .unwrap()
+}
+
 fn multi_choice_seed(constant: u8) -> Expression {
     Expression::xor(
         Expression::xor(Expression::input(), Expression::constant(constant)),
@@ -506,6 +591,17 @@ fn experience_identities(path: &std::path::Path) -> Vec<([u8; 32], [u8; 32], u8)
             (attempt.candidate_key, attempt.claim_digest, verdict)
         })
         .collect()
+}
+
+fn allocation_trace(path: &std::path::Path) -> Vec<CandidateFateInspection> {
+    let bundle = CanonicalBundle::decode(&std::fs::read(path).unwrap(), 64 * 1024 * 1024).unwrap();
+    let mut fates = inspect_experience_segment(bundle.segment(SegmentKind::Experience))
+        .unwrap()
+        .candidate_fates;
+    for fate in &mut fates {
+        fate.verification_batch_cpu_ns = None;
+    }
+    fates
 }
 
 #[cfg(debug_assertions)]

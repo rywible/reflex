@@ -1830,7 +1830,7 @@ where
             ledger.rollback_candidate_fates(candidate_fate_checkpoint);
             return Err(SessionError::Resource);
         }
-        let measurement_admission_started = instrumentation.start();
+        let mut measurement_admission_started = instrumentation.start();
         let accepted_origins = verification
             .accepted
             .iter()
@@ -1883,6 +1883,7 @@ where
                     &learning,
                 ))
                 .saturating_add(deferred_resident);
+            instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
             let training_started = instrumentation.start();
             let proposed_learning = online_learning_candidate(
                 &ledger,
@@ -1893,58 +1894,67 @@ where
                 durability.pending_bytes(),
             );
             instrumentation.finish(Phase::Training, training_started);
-            let checkpoint_learning = proposed_learning.as_ref().unwrap_or(&learning);
+            measurement_admission_started = instrumentation.start();
             let cohort_usage = resource_meter
                 .usage(verification_requests, checkpoint.len() as u64)
                 .map_err(|()| SessionError::Resource)?;
-            let cohort_checkpoint = bundle_codec.seal(
-                &seed_cursor,
-                RestartBundleState::new(
-                    &known,
-                    &pareto,
-                    SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
-                    &ledger,
-                    &knowledge,
-                    checkpoint_learning,
-                ),
-                SessionSeal::Interrupted(cohort_usage),
-            )?;
-            let cohort_live = worker_resident_bytes
-                .saturating_add(resident_state_bytes(
-                    &known,
-                    &roots,
-                    &pareto,
-                    &frontier,
-                    &recovered_keys,
-                    &operators,
-                    &cohort_checkpoint,
-                    &ledger,
-                    &knowledge,
-                    checkpoint_learning,
-                ))
-                .saturating_add(deferred_resident);
-            let replaced_learning_bytes = proposed_learning
-                .as_ref()
-                .map_or(0, |_| learning.resident_bytes());
-            let cohort_reservation = ResidentReservation::live(cohort_live)
-                .with_transient(
-                    (cohort_checkpoint.capacity() as u64).saturating_add(replaced_learning_bytes),
-                )
-                .with_pending_durability(durability.pending_bytes());
-            if !resource_meter.checkpoint_fits(cohort_checkpoint.len() as u64) {
-                ledger.rollback_entries(experience_checkpoint_state);
-                ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-                ledger.rollback_measurements(measurement_checkpoint);
-                return Err(SessionError::Resource);
-            }
-            if !resource_meter.reserve(cohort_reservation) {
-                ledger.rollback_entries(experience_checkpoint_state);
-                ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-                ledger.rollback_measurements(measurement_checkpoint);
-                return Err(SessionError::Resource);
-            }
+            let selected = select_learning_checkpoint::<D::Error, _, _>(
+                &learning,
+                proposed_learning,
+                resource_meter,
+                |checkpoint_learning| {
+                    bundle_codec.seal(
+                        &seed_cursor,
+                        RestartBundleState::new(
+                            &known,
+                            &pareto,
+                            SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
+                            &ledger,
+                            &knowledge,
+                            checkpoint_learning,
+                        ),
+                        SessionSeal::Interrupted(cohort_usage),
+                    )
+                },
+                |checkpoint_learning, checkpoint_capacity, replaced_learning_bytes| {
+                    let cohort_live = worker_resident_bytes
+                        .saturating_add(resident_state_bytes(
+                            &known,
+                            &roots,
+                            &pareto,
+                            &frontier,
+                            &recovered_keys,
+                            &operators,
+                            &checkpoint,
+                            &ledger,
+                            &knowledge,
+                            checkpoint_learning,
+                        ))
+                        .saturating_sub(vector_bytes(&checkpoint))
+                        .saturating_add(checkpoint_capacity)
+                        .saturating_add(deferred_resident);
+                    ResidentReservation::live(cohort_live)
+                        .with_transient(
+                            checkpoint_capacity
+                                .max(vector_bytes(&checkpoint))
+                                .saturating_add(replaced_learning_bytes),
+                        )
+                        .with_pending_durability(durability.pending_bytes())
+                },
+            );
+            let (cohort_checkpoint, proposed_learning, _cohort_reservation) = match selected {
+                Ok(selected) => selected,
+                Err(error) => {
+                    ledger.rollback_entries(experience_checkpoint_state);
+                    ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+                    ledger.rollback_measurements(measurement_checkpoint);
+                    return Err(error);
+                }
+            };
+            let previous_checkpoint = std::mem::replace(&mut checkpoint, cohort_checkpoint);
+            drop(previous_checkpoint);
             durability
-                .submit(cohort_checkpoint.clone())
+                .submit(checkpoint.clone())
                 .and_then(|()| durability.barrier().map(|_| ()))
                 .map_err(SessionError::Durability)?;
             test_fault_point("cohort-published");
@@ -1952,7 +1962,6 @@ where
                 learning = proposed_learning;
                 active_model = learning.pinned_model().cloned();
             }
-            checkpoint = cohort_checkpoint;
             instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
             time_exhausted = resource_meter
                 .search_time_exhausted()
@@ -2007,6 +2016,7 @@ where
                 &deferred_candidates,
                 &pending_parents,
             ));
+        instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
         let training_started = instrumentation.start();
         let proposed_learning = online_learning_candidate(
             epoch.ledger(),
@@ -2017,63 +2027,76 @@ where
             durability.pending_bytes(),
         );
         instrumentation.finish(Phase::Training, training_started);
-        let checkpoint_learning = proposed_learning.as_ref().unwrap_or(&learning);
+        measurement_admission_started = instrumentation.start();
         let checkpoint_usage = resource_meter
             .usage(verification_requests, checkpoint.len() as u64)
             .map_err(|()| SessionError::Resource)?;
-        let proposed_checkpoint = bundle_codec.seal(
-            &seed_cursor,
-            RestartBundleState::new(
-                epoch.known(),
-                &proposed_pareto,
-                SearchTailView::new(epoch.frontier(), &deferred_candidates, &pending_parents),
-                epoch.ledger(),
-                &knowledge,
-                checkpoint_learning,
-            ),
-            SessionSeal::Interrupted(checkpoint_usage),
-        )?;
-        if !resource_meter.checkpoint_fits(proposed_checkpoint.len() as u64) {
-            drop(epoch);
-            ledger.rollback_entries(experience_checkpoint_state);
-            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-            ledger.rollback_measurements(measurement_checkpoint);
-            return Err(SessionError::Resource);
-        }
-        let proposed_live = worker_resident_bytes.saturating_add(resident_state_bytes(
-            epoch.known(),
-            &roots,
-            &proposed_pareto,
-            epoch.frontier(),
-            &recovered_keys,
-            &operators,
-            &proposed_checkpoint,
-            epoch.ledger(),
-            &knowledge,
-            checkpoint_learning,
-        ));
-        let proposed_live = proposed_live.saturating_add(cohort::recovery_resident_bytes(
-            domain,
-            &deferred_candidates,
-            &pending_parents,
-        ));
-        let replaced_learning_bytes = proposed_learning
-            .as_ref()
-            .map_or(0, |_| learning.resident_bytes());
-        let proposed_reservation = ResidentReservation::live(proposed_live)
-            .with_transient(
-                (proposed_checkpoint.capacity() as u64).saturating_add(replaced_learning_bytes),
-            )
-            .with_pending_durability(durability.pending_bytes());
-        if !resource_meter.reserve(proposed_reservation) {
-            drop(epoch);
-            ledger.rollback_entries(experience_checkpoint_state);
-            ledger.rollback_candidate_fates(candidate_fate_checkpoint);
-            ledger.rollback_measurements(measurement_checkpoint);
-            return Err(SessionError::Resource);
-        }
+        let selected = select_learning_checkpoint::<D::Error, _, _>(
+            &learning,
+            proposed_learning,
+            resource_meter,
+            |checkpoint_learning| {
+                bundle_codec.seal(
+                    &seed_cursor,
+                    RestartBundleState::new(
+                        epoch.known(),
+                        &proposed_pareto,
+                        SearchTailView::new(
+                            epoch.frontier(),
+                            &deferred_candidates,
+                            &pending_parents,
+                        ),
+                        epoch.ledger(),
+                        &knowledge,
+                        checkpoint_learning,
+                    ),
+                    SessionSeal::Interrupted(checkpoint_usage),
+                )
+            },
+            |checkpoint_learning, checkpoint_capacity, replaced_learning_bytes| {
+                let proposed_live = worker_resident_bytes
+                    .saturating_add(resident_state_bytes(
+                        epoch.known(),
+                        &roots,
+                        &proposed_pareto,
+                        epoch.frontier(),
+                        &recovered_keys,
+                        &operators,
+                        &checkpoint,
+                        epoch.ledger(),
+                        &knowledge,
+                        checkpoint_learning,
+                    ))
+                    .saturating_sub(vector_bytes(&checkpoint))
+                    .saturating_add(checkpoint_capacity)
+                    .saturating_add(cohort::recovery_resident_bytes(
+                        domain,
+                        &deferred_candidates,
+                        &pending_parents,
+                    ));
+                ResidentReservation::live(proposed_live)
+                    .with_transient(
+                        checkpoint_capacity
+                            .max(vector_bytes(&checkpoint))
+                            .saturating_add(replaced_learning_bytes),
+                    )
+                    .with_pending_durability(durability.pending_bytes())
+            },
+        );
+        let (proposed_checkpoint, proposed_learning, proposed_reservation) = match selected {
+            Ok(selected) => selected,
+            Err(error) => {
+                drop(epoch);
+                ledger.rollback_entries(experience_checkpoint_state);
+                ledger.rollback_candidate_fates(candidate_fate_checkpoint);
+                ledger.rollback_measurements(measurement_checkpoint);
+                return Err(error);
+            }
+        };
+        let previous_checkpoint = std::mem::replace(&mut checkpoint, proposed_checkpoint);
+        drop(previous_checkpoint);
         durability
-            .submit(proposed_checkpoint.clone())
+            .submit(checkpoint.clone())
             .and_then(|()| durability.barrier().map(|_| ()))
             .map_err(SessionError::Durability)?;
         test_fault_point("pareto-published");
@@ -2085,7 +2108,6 @@ where
         goal_evaluator.extend_parent_ranks(&frontier, &mut parent_ranks);
         instrumentation.finish(Phase::MeasurementAdmission, measurement_admission_started);
         pareto = proposed_pareto;
-        checkpoint = proposed_checkpoint;
         let delivery = deliver_delta(
             &mut observer,
             &mut sequence,
@@ -2558,6 +2580,40 @@ fn online_learning_candidate(
     let mut examples = derive_targets(&attempts, ledger.consequences());
     let _promotion = challenger.learn(&mut examples);
     Some(challenger)
+}
+
+fn select_learning_checkpoint<E, Seal, Reserve>(
+    incumbent: &LearningState,
+    challenger: Option<LearningState>,
+    resource_meter: &ResourceEnvelopeGuard,
+    mut seal: Seal,
+    mut reservation: Reserve,
+) -> Result<(Vec<u8>, Option<LearningState>, ResidentReservation), SessionError<E>>
+where
+    Seal: FnMut(&LearningState) -> Result<Vec<u8>, SessionError<E>>,
+    Reserve: FnMut(&LearningState, u64, u64) -> ResidentReservation,
+{
+    if let Some(challenger) = challenger {
+        let checkpoint = seal(&challenger)?;
+        let required = reservation(
+            &challenger,
+            checkpoint.capacity() as u64,
+            incumbent.resident_bytes(),
+        );
+        if resource_meter.checkpoint_fits(checkpoint.len() as u64)
+            && resource_meter.reserve(required)
+        {
+            return Ok((checkpoint, Some(challenger), required));
+        }
+    }
+
+    let checkpoint = seal(incumbent)?;
+    let required = reservation(incumbent, checkpoint.capacity() as u64, 0);
+    if !resource_meter.checkpoint_fits(checkpoint.len() as u64) || !resource_meter.reserve(required)
+    {
+        return Err(SessionError::Resource);
+    }
+    Ok((checkpoint, None, required))
 }
 
 fn moved_tail_transaction_peak(stable_live: u64, prospective_tail: u64, transient: u64) -> u64 {
@@ -5095,8 +5151,9 @@ fn test_fault_point(_: &str) {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{BTreeSet, HashSet};
-    #[cfg(feature = "internal-experiments")]
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::time::Duration;
 
     #[cfg(feature = "internal-experiments")]
@@ -5106,12 +5163,13 @@ mod tests {
         ENUMERATION_COMPLETE, PendingParent, append_proposal_features, candidate_generation_limit,
         commit_pending_progress, fixed_resident_categories, generation_refill_limit,
         moved_tail_transaction_peak, online_training_due, operator_feature_values,
-        protected_origin_keys, sort_prefix_by,
+        protected_origin_keys, select_learning_checkpoint, sort_prefix_by,
     };
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
-    use crate::ProposalFeatures;
-    use crate::learning::{FEATURE_COUNT, Features};
+    use crate::learning::{FEATURE_COUNT, Features, LearningState};
+    use crate::resource::{ResidentReservation, ResourceEnvelopeGuard};
+    use crate::{NonZeroDuration, ProposalFeatures, ResourceEnvelope};
 
     #[cfg(feature = "internal-experiments")]
     #[test]
@@ -5181,6 +5239,61 @@ mod tests {
         assert!(online_training_due(63, 64));
         assert!(online_training_due(40, 80));
         assert!(!online_training_due(64, 64));
+    }
+
+    #[test]
+    fn optional_online_learning_falls_back_when_its_checkpoint_cannot_fit() {
+        let resources = ResourceEnvelope::new(
+            NonZeroUsize::MIN,
+            NonZeroU64::new(1024).unwrap(),
+            NonZeroU64::new(1024).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(1)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(1)).unwrap(),
+            NonZeroU64::MIN,
+        );
+        let meter = ResourceEnvelopeGuard::start(&resources).unwrap();
+        let calls = Cell::new(0_usize);
+        let incumbent = LearningState::default();
+
+        let (checkpoint, challenger, _) = select_learning_checkpoint::<(), _, _>(
+            &incumbent,
+            Some(incumbent.clone()),
+            &meter,
+            |_| {
+                let call = calls.get();
+                calls.set(call + 1);
+                Ok(vec![0; if call == 0 { 1025 } else { 1 }])
+            },
+            |_, checkpoint_capacity, replaced| {
+                ResidentReservation::live(1)
+                    .with_transient(checkpoint_capacity.saturating_add(replaced))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(checkpoint.len(), 1);
+        assert!(challenger.is_none());
+
+        let meter = ResourceEnvelopeGuard::start(&resources).unwrap();
+        let calls = Cell::new(0_usize);
+        let (_, challenger, _) = select_learning_checkpoint::<(), _, _>(
+            &incumbent,
+            Some(incumbent.clone()),
+            &meter,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(vec![0])
+            },
+            |_, checkpoint_capacity, replaced| {
+                ResidentReservation::live(if replaced == 0 { 1 } else { 1025 })
+                    .with_transient(checkpoint_capacity)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert!(challenger.is_none());
     }
 
     #[test]
