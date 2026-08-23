@@ -17,6 +17,8 @@ const MAX_SELECTION_USES: u8 = 3;
 const MIN_SELECTION_CASES: usize = 8;
 const MIN_REPLAY_CASES: usize = 8;
 const MAX_SPECIALISTS: usize = 8;
+pub(crate) const MIN_ONLINE_TRAINING_EXAMPLES: usize = 32;
+pub(crate) const ONLINE_TRAINING_GROWTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Features(pub(crate) [f32; FEATURE_COUNT]);
@@ -116,6 +118,8 @@ enum ObservedPolicyComparison {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LearningState {
     generation: u64,
+    last_training_examples: u64,
+    online_comparisons: u8,
     champion: Option<FtrlModel>,
     predecessor: Option<FtrlModel>,
     predecessor_is_bootstrap: bool,
@@ -157,6 +161,18 @@ impl LearningState {
         self.champion.as_ref()
     }
 
+    pub(crate) fn last_training_examples(&self) -> usize {
+        usize::try_from(self.last_training_examples).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) const fn online_comparison_budget() -> u32 {
+        (MAX_SELECTION_USES - 1) as u32
+    }
+
+    pub(crate) fn online_comparisons(&self) -> u8 {
+        self.online_comparisons
+    }
+
     pub(crate) fn resident_bytes(&self) -> u64 {
         let inline = std::mem::size_of_val(self) as u64;
         let specialists = (self.specialists.capacity() as u64)
@@ -168,9 +184,26 @@ impl LearningState {
     }
 
     pub(crate) fn corpus_is_valid(&self, attempts: &[([u8; 32], [u8; 32])]) -> bool {
-        self.roles
-            .keys()
-            .all(|key| attempts.iter().any(|(_, corpus)| corpus == key))
+        let Ok(watermark) = usize::try_from(self.last_training_examples) else {
+            return false;
+        };
+        let Some(trained_prefix) = attempts.get(..watermark) else {
+            return false;
+        };
+        let trained_claims = trained_prefix
+            .iter()
+            .map(|(_, corpus)| *corpus)
+            .collect::<BTreeSet<_>>();
+        let minimum_online_examples = if self.online_comparisons == 0 {
+            0
+        } else {
+            (1..self.online_comparisons).fold(MIN_ONLINE_TRAINING_EXAMPLES, |value, _| {
+                value.saturating_mul(ONLINE_TRAINING_GROWTH)
+            })
+        };
+        watermark >= minimum_online_examples
+            && self.roles.len() == trained_claims.len()
+            && self.roles.keys().all(|key| trained_claims.contains(key))
     }
 
     pub(crate) fn training_scratch_bytes(example_count: usize) -> u64 {
@@ -194,6 +227,7 @@ impl LearningState {
     }
 
     pub(crate) fn learn(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
+        self.last_training_examples = u64::try_from(examples.len()).unwrap_or(u64::MAX);
         self.assign_new_corpus_roles(examples);
         let selection = bounded_corpus(examples, true);
         if let Some(champion) = &self.champion {
@@ -244,6 +278,12 @@ impl LearningState {
             PromotionDecision::Reject | PromotionDecision::Rollback => {}
         }
         self.finish_selection(examples);
+        decision
+    }
+
+    pub(crate) fn learn_online(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
+        let decision = self.learn(examples);
+        self.online_comparisons = self.online_comparisons.saturating_add(1);
         decision
     }
 
@@ -443,8 +483,10 @@ impl LearningState {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
-        output.extend_from_slice(b"RFLS\x02");
+        output.extend_from_slice(b"RFLS\x03");
         output.extend_from_slice(&self.generation.to_le_bytes());
+        output.extend_from_slice(&self.last_training_examples.to_le_bytes());
+        output.push(self.online_comparisons);
         push_model(&mut output, self.champion.as_ref());
         match (&self.predecessor, self.predecessor_is_bootstrap) {
             (None, false) => output.push(0),
@@ -475,10 +517,12 @@ impl LearningState {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, ()> {
         let mut input = bytes;
-        if take(&mut input, 5)? != b"RFLS\x02" {
+        if take(&mut input, 5)? != b"RFLS\x03" {
             return Err(());
         }
         let generation = read_u64(&mut input)?;
+        let last_training_examples = read_u64(&mut input)?;
+        let online_comparisons = take(&mut input, 1)?[0];
         let champion = read_model(&mut input)?;
         let (predecessor, predecessor_is_bootstrap) = match take(&mut input, 1)?[0] {
             0 => (None, false),
@@ -510,7 +554,7 @@ impl LearningState {
                 0 => CorpusRole::Replay,
                 1 => {
                     let uses = take(&mut input, 1)?[0];
-                    if uses >= 3 {
+                    if uses >= MAX_SELECTION_USES {
                         return Err(());
                     }
                     CorpusRole::Selection { uses }
@@ -522,6 +566,7 @@ impl LearningState {
             }
         }
         if !input.is_empty()
+            || u32::from(online_comparisons) > Self::online_comparison_budget()
             || generation == 0
                 && (champion.is_some()
                     || predecessor.is_some()
@@ -551,6 +596,8 @@ impl LearningState {
         }
         Ok(Self {
             generation,
+            last_training_examples,
+            online_comparisons,
             champion,
             predecessor,
             predecessor_is_bootstrap,
@@ -2079,6 +2126,7 @@ mod tests {
         }
         let mut state = LearningState::default();
         assert_eq!(state.learn(&mut examples), PromotionDecision::Promote);
+        assert_eq!(state.last_training_examples(), examples.len());
         let digest = state.revision_digest("domain");
         let encoded = state.encode();
         let mut recovered = LearningState::decode(&encoded).unwrap();
@@ -2086,6 +2134,8 @@ mod tests {
         assert!(
             recovered.generation() == 1
                 && recovered.pinned_model().is_some()
+                && recovered.last_training_examples() == examples.len()
+                && recovered.online_comparisons() == 0
                 && recovered.revision_digest("domain") == digest
                 && recovered.encode() == encoded
                 && recovered.specialist_count() == 0
@@ -2104,6 +2154,8 @@ mod tests {
         regressed.rebuild_cache();
         let mut state = LearningState {
             generation: 1,
+            last_training_examples: 0,
+            online_comparisons: 0,
             champion: Some(regressed),
             predecessor: None,
             predecessor_is_bootstrap: true,
@@ -2149,20 +2201,30 @@ mod tests {
     fn learning_state_rejects_corpus_overlap_and_invalid_revision_ancestry() {
         let mut roles = BTreeMap::new();
         roles.insert([7; 32], CorpusRole::Replay);
-        let state = LearningState {
+        let mut state = LearningState {
+            last_training_examples: 1,
             roles,
             ..LearningState::default()
         };
         assert!(state.corpus_is_valid(&[([1; 32], [7; 32])]));
         assert!(!state.corpus_is_valid(&[([1; 32], [9; 32])]));
+        state.last_training_examples = 2;
+        assert!(!state.corpus_is_valid(&[([1; 32], [7; 32])]));
+        state.last_training_examples = 1;
+        state.online_comparisons = 1;
+        assert!(!state.corpus_is_valid(&[([1; 32], [7; 32])]));
+        state.online_comparisons = 0;
+        state.roles.clear();
+        assert!(!state.corpus_is_valid(&[([1; 32], [7; 32])]));
+        state.roles.insert([7; 32], CorpusRole::Replay);
         let encoded = state.encode();
         let mut duplicate = encoded.clone();
-        duplicate[23..31].copy_from_slice(&2_u64.to_le_bytes());
-        duplicate.extend_from_slice(&encoded[31..]);
+        duplicate[32..40].copy_from_slice(&2_u64.to_le_bytes());
+        duplicate.extend_from_slice(&encoded[40..]);
         assert!(LearningState::decode(&duplicate).is_err());
 
         let mut invalid_ancestry = LearningState::default().encode();
-        invalid_ancestry[14] = 1;
+        invalid_ancestry[23] = 1;
         assert!(LearningState::decode(&invalid_ancestry).is_err());
     }
 
@@ -2171,6 +2233,8 @@ mod tests {
         let specialist = FtrlModel::zero();
         let state = LearningState {
             generation: 1,
+            last_training_examples: 0,
+            online_comparisons: 0,
             champion: Some(FtrlModel::zero()),
             predecessor: None,
             predecessor_is_bootstrap: true,

@@ -277,7 +277,49 @@ fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches(
         Err(SessionError::CorruptBundle)
     ));
 
-    let mut bad_model_digest = valid;
+    let mut future_training_watermark = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
+    let mut revisions = future_training_watermark
+        .segment(SegmentKind::Revisions)
+        .to_vec();
+    let knowledge_length =
+        usize::try_from(u64::from_le_bytes(revisions[64..72].try_into().unwrap())).unwrap();
+    let learning = 72 + knowledge_length + 8;
+    assert_eq!(&revisions[learning..learning + 5], b"RFLS\x03");
+    revisions[learning + 13..learning + 21].copy_from_slice(&u64::MAX.to_le_bytes());
+    future_training_watermark.replace_segment(SegmentKind::Revisions, revisions);
+    std::fs::write(&bundle_path, future_training_watermark.encode()).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::CorruptBundle)
+    ));
+
+    let mut impossible_online_progress = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
+    let mut revisions = impossible_online_progress
+        .segment(SegmentKind::Revisions)
+        .to_vec();
+    revisions[learning + 21] = 2;
+    impossible_online_progress.replace_segment(SegmentKind::Revisions, revisions);
+    std::fs::write(&bundle_path, impossible_online_progress.encode()).unwrap();
+    assert!(matches!(
+        improve(
+            BitVecDomain::unary_u8(),
+            make_request(BundlePlan::Resume {
+                source: bundle_path.clone(),
+                target: bundle_path.clone(),
+            }),
+            |_| ControlFlow::Continue(())
+        ),
+        Err(SessionError::CorruptBundle)
+    ));
+
+    let mut bad_model_digest = valid.clone();
     let (_, payload, length, checksum) = segment_location(&bad_model_digest, 2);
     bad_model_digest[payload + 32] ^= 0xff;
     let segment_digest = Sha256::digest(&bad_model_digest[payload..payload + length]);

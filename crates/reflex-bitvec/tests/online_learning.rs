@@ -399,7 +399,7 @@ fn snapshot(path: &Path) -> Snapshot {
     ))
     .unwrap();
     let learning = &revisions[learning_offset + 8..learning_offset + 8 + learning_length];
-    assert_eq!(&learning[..5], b"RFLS\x02");
+    assert_eq!(&learning[..5], b"RFLS\x03");
     let model_generation = u64::from_le_bytes(learning[5..13].try_into().unwrap());
     let attempts = experience
         .attempts

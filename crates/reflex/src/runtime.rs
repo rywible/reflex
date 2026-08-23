@@ -21,7 +21,8 @@ use crate::instrumentation::{Phase, Recorder, ResourceRefusal};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, FEATURE_COUNT, Features,
-    FtrlModel, LearningState, compare_forecasts, derive_targets,
+    FtrlModel, LearningState, MIN_ONLINE_TRAINING_EXAMPLES, ONLINE_TRAINING_GROWTH,
+    compare_forecasts, derive_targets,
 };
 use crate::measurement::{Measurement, MeasurementSpace, MeasurementWriter, VerifiedBatch};
 use crate::policy::{AllocationQueue, OperationalPartition, operational_ranked_selections};
@@ -53,7 +54,6 @@ use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
 const OPERATOR_FEATURE_START: usize = 5;
 const OPERATOR_FEATURE_END: usize = 13;
-const MIN_ONLINE_TRAINING_EXAMPLES: usize = 32;
 
 struct StoredArtifact<D: DomainDefinition> {
     artifact: D::Artifact,
@@ -372,7 +372,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 19;
+const RUNTIME_REVISION: u64 = 20;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1780,7 +1780,6 @@ where
         };
         instrumentation.finish(Phase::Verification, verification_started);
         test_fault_point("verdict-recorded");
-        let experience_before_cohort = ledger.len();
         let experience_checkpoint_state = ledger.checkpoint_entries();
         let candidate_fate_checkpoint = ledger.checkpoint_candidate_fates();
         let measurement_checkpoint = ledger.checkpoint_measurements();
@@ -1888,7 +1887,6 @@ where
             let proposed_learning = online_learning_candidate(
                 &ledger,
                 &learning,
-                experience_before_cohort,
                 resource_meter,
                 online_learning_live,
                 durability.pending_bytes(),
@@ -2021,7 +2019,6 @@ where
         let proposed_learning = online_learning_candidate(
             epoch.ledger(),
             &learning,
-            experience_before_cohort,
             resource_meter,
             online_learning_live,
             durability.pending_bytes(),
@@ -2292,7 +2289,9 @@ where
     let learning_transient = (ledger.len() as u64)
         .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64)
         .saturating_add(LearningState::training_scratch_bytes(ledger.len()));
-    let can_train = !durable_budget_exhausted
+    let final_training_due = learning.last_training_examples() != ledger.len();
+    let can_train = final_training_due
+        && !durable_budget_exhausted
         && !resource_meter
             .time_exhausted()
             .map_err(|()| SessionError::Resource)?
@@ -2305,7 +2304,7 @@ where
         let attempts = ledger.attempts();
         let mut examples = derive_targets(&attempts, ledger.consequences());
         let _promotion = learning.learn(&mut examples);
-    } else {
+    } else if final_training_due {
         completion = Completion::ResourceEnvelopeExhausted;
     }
     instrumentation.finish(Phase::Training, training_started);
@@ -2539,16 +2538,14 @@ fn generation_refill_limit(inventory_target: usize, deferred_candidates: usize) 
     inventory_target.saturating_sub(deferred_candidates)
 }
 
-fn online_training_due(previous_examples: usize, current_examples: usize) -> bool {
-    fn checkpoint(examples: usize) -> u32 {
-        if examples < MIN_ONLINE_TRAINING_EXAMPLES {
-            0
-        } else {
-            usize::BITS - examples.leading_zeros()
-        }
+fn online_training_due(completed_comparisons: u8, current_examples: usize) -> bool {
+    if u32::from(completed_comparisons) >= LearningState::online_comparison_budget() {
+        return false;
     }
-
-    checkpoint(current_examples) > checkpoint(previous_examples)
+    let threshold = (0..completed_comparisons).fold(MIN_ONLINE_TRAINING_EXAMPLES, |value, _| {
+        value.saturating_mul(ONLINE_TRAINING_GROWTH)
+    });
+    current_examples >= threshold
 }
 
 fn learning_transient_bytes(ledger: &ExperienceLedger, learning: &LearningState) -> u64 {
@@ -2561,12 +2558,11 @@ fn learning_transient_bytes(ledger: &ExperienceLedger, learning: &LearningState)
 fn online_learning_candidate(
     ledger: &ExperienceLedger,
     learning: &LearningState,
-    previous_examples: usize,
     resource_meter: &ResourceEnvelopeGuard,
     live_bytes: u64,
     pending_durability: u64,
 ) -> Option<LearningState> {
-    if !online_training_due(previous_examples, ledger.len())
+    if !online_training_due(learning.online_comparisons(), ledger.len())
         || !resource_meter.reserve(
             ResidentReservation::live(live_bytes)
                 .with_transient(learning_transient_bytes(ledger, learning))
@@ -2578,7 +2574,7 @@ fn online_learning_candidate(
     let mut challenger = learning.clone();
     let attempts = ledger.attempts();
     let mut examples = derive_targets(&attempts, ledger.consequences());
-    let _promotion = challenger.learn(&mut examples);
+    let _promotion = challenger.learn_online(&mut examples);
     Some(challenger)
 }
 
@@ -5231,14 +5227,13 @@ mod tests {
     }
 
     #[test]
-    fn online_training_runs_at_logarithmic_experience_checkpoints() {
+    fn online_training_spreads_bounded_comparisons_across_experience_growth() {
         assert!(!online_training_due(0, 31));
         assert!(online_training_due(0, 32));
-        assert!(online_training_due(31, 40));
-        assert!(!online_training_due(32, 63));
-        assert!(online_training_due(63, 64));
-        assert!(online_training_due(40, 80));
-        assert!(!online_training_due(64, 64));
+        assert!(online_training_due(0, 512));
+        assert!(!online_training_due(1, 511));
+        assert!(online_training_due(1, 512));
+        assert!(!online_training_due(2, 8_192));
     }
 
     #[test]
