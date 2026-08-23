@@ -30,7 +30,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v18";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v19";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -111,6 +111,16 @@ struct VerificationCurvePoint {
     observed_requests: usize,
     strict_discoveries: usize,
     cpu_ns_through_completed_batch: u64,
+}
+
+#[derive(Serialize)]
+struct DiscoveryEfficiencyComparison {
+    request_budget: usize,
+    full_strict_discoveries: usize,
+    bootstrap_strict_discoveries: usize,
+    full_candidate_cpu_ns: u64,
+    bootstrap_candidate_cpu_ns: u64,
+    full_uses_less_candidate_cpu_per_improvement: bool,
 }
 
 #[derive(Serialize)]
@@ -307,7 +317,8 @@ struct Report {
     no_derived: TreatmentResult,
     bootstrap: TreatmentResult,
     full_has_more_improvements: bool,
-    full_uses_less_cpu_per_improvement: bool,
+    full_uses_less_end_to_end_cpu_per_improvement: bool,
+    request_16_candidate_efficiency: Option<DiscoveryEfficiencyComparison>,
     full_noninferior_after_16_requests: bool,
     host: HostEnvironment,
     host_isolation: HostIsolation,
@@ -791,15 +802,18 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
     } = inputs;
     let full_has_more_improvements =
         full.strict_proof_node_improvements > bootstrap.strict_proof_node_improvements;
-    let cpu_per_improvement = |result: &TreatmentResult| {
-        result
-            .usage
-            .cpu_ns
-            .checked_div(u64::try_from(result.strict_proof_node_improvements).unwrap_or(u64::MAX))
-    };
-    let full_uses_less_cpu_per_improvement = cpu_per_improvement(&full)
-        .zip(cpu_per_improvement(&bootstrap))
-        .is_some_and(|(full, bootstrap)| full < bootstrap);
+    let full_uses_less_end_to_end_cpu_per_improvement = nonzero_ratio_is_strictly_less(
+        full.usage.cpu_ns,
+        full.strict_proof_node_improvements,
+        bootstrap.usage.cpu_ns,
+        bootstrap.strict_proof_node_improvements,
+    )
+    .unwrap_or(false);
+    let request_16_candidate_efficiency = discovery_efficiency_at(
+        16,
+        &full.candidate_verification_curve,
+        &bootstrap.candidate_verification_curve,
+    );
     let comparable_prefixes = full
         .candidate_verification_curve
         .iter()
@@ -830,7 +844,8 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
         no_derived,
         bootstrap,
         full_has_more_improvements,
-        full_uses_less_cpu_per_improvement,
+        full_uses_less_end_to_end_cpu_per_improvement,
+        request_16_candidate_efficiency,
         full_noninferior_after_16_requests,
         host,
         host_isolation,
@@ -843,6 +858,60 @@ fn write_report(arguments: &Arguments, inputs: ReportInputs) -> Result<(), AnyEr
     std::fs::write(&arguments.output, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
+}
+
+fn nonzero_ratio_is_strictly_less(
+    left_numerator: u64,
+    left_denominator: usize,
+    right_numerator: u64,
+    right_denominator: usize,
+) -> Option<bool> {
+    (left_denominator > 0 && right_denominator > 0).then(|| {
+        ratio_is_strictly_less(
+            left_numerator,
+            left_denominator as u64,
+            right_numerator,
+            right_denominator as u64,
+        )
+    })
+}
+
+fn ratio_is_strictly_less(
+    left_numerator: u64,
+    left_denominator: u64,
+    right_numerator: u64,
+    right_denominator: u64,
+) -> bool {
+    debug_assert!(left_denominator > 0 && right_denominator > 0);
+    u128::from(left_numerator) * u128::from(right_denominator)
+        < u128::from(right_numerator) * u128::from(left_denominator)
+}
+
+fn discovery_efficiency_at(
+    request_budget: usize,
+    full: &[VerificationCurvePoint],
+    bootstrap: &[VerificationCurvePoint],
+) -> Option<DiscoveryEfficiencyComparison> {
+    let full = full
+        .iter()
+        .find(|point| point.request_budget == request_budget && point.reached)?;
+    let bootstrap = bootstrap
+        .iter()
+        .find(|point| point.request_budget == request_budget && point.reached)?;
+    Some(DiscoveryEfficiencyComparison {
+        request_budget,
+        full_strict_discoveries: full.strict_discoveries,
+        bootstrap_strict_discoveries: bootstrap.strict_discoveries,
+        full_candidate_cpu_ns: full.cpu_ns_through_completed_batch,
+        bootstrap_candidate_cpu_ns: bootstrap.cpu_ns_through_completed_batch,
+        full_uses_less_candidate_cpu_per_improvement: nonzero_ratio_is_strictly_less(
+            full.cpu_ns_through_completed_batch,
+            full.strict_discoveries,
+            bootstrap.cpu_ns_through_completed_batch,
+            bootstrap.strict_discoveries,
+        )
+        .unwrap_or(false),
+    })
 }
 
 fn prepare_corpus(arguments: &Arguments) -> Result<DevelopmentCorpus, AnyError> {
@@ -1153,11 +1222,17 @@ fn library_for(seeds: &[SelectedTheorem], library: Vec<SelectedTheorem>) -> Vec<
 }
 
 fn is_human_facing(name: &reflex_lean::ast::LeanName) -> bool {
-    let display = name.to_string();
-    let component = display.rsplit('.').next().unwrap_or(&display);
-    !component.strip_prefix("proof_").is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })
+    match name {
+        reflex_lean::ast::LeanName::Anonymous => true,
+        reflex_lean::ast::LeanName::Num { .. } => false,
+        reflex_lean::ast::LeanName::Str { parent, value } => {
+            !value.starts_with('_')
+                && !value.strip_prefix("proof_").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                && is_human_facing(parent)
+        }
+    }
 }
 
 fn selected_artifacts(
@@ -2089,8 +2164,35 @@ mod tests {
     }
 
     #[test]
+    fn discovery_efficiency_compares_exact_ratios_at_a_registered_prefix() {
+        let full = VerificationCurvePoint {
+            request_budget: 16,
+            reached: true,
+            observed_requests: 16,
+            strict_discoveries: 4,
+            cpu_ns_through_completed_batch: 2_071_896_436,
+        };
+        let bootstrap = VerificationCurvePoint {
+            request_budget: 16,
+            reached: true,
+            observed_requests: 16,
+            strict_discoveries: 1,
+            cpu_ns_through_completed_batch: 1_348_917_507,
+        };
+
+        let comparison = discovery_efficiency_at(16, &[full], &[bootstrap]).unwrap();
+
+        assert_eq!(comparison.full_strict_discoveries, 4);
+        assert_eq!(comparison.bootstrap_strict_discoveries, 1);
+        assert!(comparison.full_uses_less_candidate_cpu_per_improvement);
+        assert!(ratio_is_strictly_less(10, 3, 7, 2));
+        assert!(!ratio_is_strictly_less(7, 2, 10, 3));
+    }
+
+    #[test]
     fn primary_selection_excludes_generated_components_and_duplicate_statements() {
         let generated = example("Test.theorem.proof_7", 1, 0);
+        let auxiliary = example("Test.theorem._auxLemma.9", 4, 4);
         let first = example("Test.first", 2, 1);
         let duplicate = example("Test.duplicate", 2, 2);
         let second = example("Test.second", 3, 3);
@@ -2111,6 +2213,7 @@ mod tests {
             vec![2, 3]
         );
         assert!(!is_human_facing(&generated.declaration));
+        assert!(!is_human_facing(&auxiliary.declaration));
         assert!(is_human_facing(&LeanName::from_dotted(
             "Test.proof_by_cases"
         )));

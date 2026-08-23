@@ -1,0 +1,7 @@
+# Keep Lean Development claims literal
+
+The Lean public-optimizer Development harness excludes generated declaration-name components from its human-facing primary stratum. A dotted numeric component, a component beginning with `_`, or a generated `proof_N` component makes the declaration ineligible. The check covers the complete Lean name rather than only its final component. Library donors remain mechanically selected support Artifacts and need not be human-facing.
+
+The harness reports end-to-end CPU per strict improvement and Candidate Verification-path efficiency as separate, explicitly named quantities. The registered request-16 comparison uses completed Verification-batch CPU, requires both treatments to reach the prefix and make at least one discovery, and compares ratios by exact cross multiplication. Setup, recovery, and finalization remain visible in end-to-end Resource Usage; they are never silently subtracted from the equal treatment envelope.
+
+The previous final-component filter admitted `_auxLemma.N` training Seeds while describing them as human-facing. Its end-to-end integer-division gate also allowed setup cost and quotient truncation to obscure the early allocation effect. These are Development protocol defects, not Runtime or Verification semantics. Report schema v19 pins the corrected corpus and efficiency meanings before another execution; v18 remains retained with an explicit limitation rather than being rewritten.
