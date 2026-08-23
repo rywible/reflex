@@ -57,6 +57,47 @@ fn verification_budget_exhaustion_is_a_successful_completion() {
 }
 
 #[test]
+fn durable_preflight_does_not_refuse_a_checkpoint_that_fits() {
+    let durable_bytes = 5 * 1024;
+    let bundle_path = std::env::temp_dir().join(format!(
+        "reflex-durable-preflight-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+    let preference =
+        Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+    let request = ImprovementRequest::new(
+        GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+        SeedScope::one(Expression::xor(
+            Expression::input(),
+            Expression::constant(0),
+        )),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(durable_bytes).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        ),
+        BundlePlan::Fresh {
+            target: bundle_path.clone(),
+        },
+    )
+    .unwrap();
+    let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    let encoded_bytes = std::fs::metadata(&bundle_path).unwrap().len();
+
+    assert_eq!(outcome.usage().verification_requests, 2);
+    assert!(encoded_bytes <= durable_bytes);
+    std::fs::remove_file(bundle_path).ok();
+}
+
+#[test]
 fn resume_does_not_charge_verification_for_refuted_experience() {
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-negative-experience-budget-{}-{}.bundle",

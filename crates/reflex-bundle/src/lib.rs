@@ -224,6 +224,79 @@ impl CanonicalBundle {
         Ok(output)
     }
 
+    /// Returns a conservative encoded-size bound after replacing logical segments.
+    ///
+    /// Unchanged segments retain their exact stored size. Compressed replacements
+    /// use the compressor's published maximum output size, so callers can enforce
+    /// a durable limit without encoding a speculative bundle. This parses framing
+    /// but deliberately does not rehash a bundle already validated by its owner.
+    pub fn replacement_size_bound(
+        bytes: &[u8],
+        replacements: &[(SegmentKind, u64)],
+    ) -> Result<u64, CodecError> {
+        if replacements.iter().enumerate().any(|(index, (kind, _))| {
+            replacements[index + 1..]
+                .iter()
+                .any(|(later, _)| later == kind)
+        }) {
+            return Err(CodecError::Invalid);
+        }
+        if bytes.len() < 32 {
+            return Err(CodecError::Invalid);
+        }
+        let content_len = bytes.len() - 32;
+        let (content, _checksum) = bytes.split_at(content_len);
+        let mut input = content;
+        if take(&mut input, MAGIC.len())? != MAGIC {
+            return Err(CodecError::Invalid);
+        }
+        let identity = take_sized(&mut input)?;
+        if read_u32(&mut input)? != ENCODED_SEGMENT_COUNT {
+            return Err(CodecError::Invalid);
+        }
+        let mut bound = MAGIC
+            .len()
+            .saturating_add(8)
+            .saturating_add(identity.len())
+            .saturating_add(4);
+        for expected in SegmentKind::ALL {
+            let kind = SegmentKind::decode(take(&mut input, 1)?[0])?;
+            let version = read_u32(&mut input)?;
+            if kind != expected || !kind.accepts(version) {
+                return Err(CodecError::Invalid);
+            }
+            let stored = take_sized(&mut input)?;
+            let _logical_checksum = take(&mut input, 32)?;
+            let replacement = replacements
+                .iter()
+                .find_map(|(replacement_kind, logical_bytes)| {
+                    (*replacement_kind == kind).then_some(*logical_bytes)
+                });
+            let stored_bound = if let Some(logical_bytes) = replacement {
+                let logical_bytes =
+                    usize::try_from(logical_bytes).map_err(|_| CodecError::Invalid)?;
+                if matches!(kind, SegmentKind::Artifacts | SegmentKind::Experience) {
+                    8_usize.saturating_add(lz4_flex::block::get_maximum_output_size(logical_bytes))
+                } else {
+                    logical_bytes
+                }
+            } else {
+                stored.len()
+            };
+            bound = bound
+                .saturating_add(1)
+                .saturating_add(4)
+                .saturating_add(8)
+                .saturating_add(stored_bound)
+                .saturating_add(32);
+        }
+        if !input.is_empty() {
+            return Err(CodecError::Invalid);
+        }
+        bound = bound.saturating_add(32);
+        u64::try_from(bound).map_err(|_| CodecError::Invalid)
+    }
+
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         self.encode_with_compression(true)
@@ -460,5 +533,40 @@ mod tests {
             bundle.segment(SegmentKind::Experience)
         );
         assert!(CanonicalBundle::replace_session(&encoded, b"other-domain", b"new").is_err());
+    }
+
+    #[test]
+    fn replacement_bound_covers_every_encoded_replacement() {
+        let bundle = CanonicalBundle::new(
+            b"domain".to_vec(),
+            b"session".to_vec(),
+            b"revisions".to_vec(),
+            b"artifact".repeat(100),
+            b"experience".repeat(100),
+            b"recovery".to_vec(),
+        );
+        let encoded = bundle.encode();
+        let new_experience = b"incompressible-ish-experience-0123456789".repeat(137);
+        let new_recovery = b"candidate-tail-9876543210".repeat(91);
+        let bound = CanonicalBundle::replacement_size_bound(
+            &encoded,
+            &[
+                (SegmentKind::Experience, new_experience.len() as u64),
+                (SegmentKind::Recovery, new_recovery.len() as u64),
+            ],
+        )
+        .unwrap();
+        let mut replaced = bundle;
+        replaced.replace_segment(SegmentKind::Experience, new_experience);
+        replaced.replace_segment(SegmentKind::Recovery, new_recovery);
+
+        assert!(replaced.encode().len() as u64 <= bound);
+        assert!(
+            CanonicalBundle::replacement_size_bound(
+                &encoded,
+                &[(SegmentKind::Recovery, 1), (SegmentKind::Recovery, 2)]
+            )
+            .is_err()
+        );
     }
 }

@@ -31,7 +31,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v23";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v24";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -182,7 +182,18 @@ struct BundleSummary {
     learning: LearningSummary,
     knowledge_revision: String,
     model_revision: String,
+    durable_size_bound: u64,
+    recovery: RecoverySummary,
     segment_logical_bytes: Vec<SegmentLogicalBytes>,
+}
+
+#[derive(Serialize)]
+struct RecoverySummary {
+    pareto_artifacts: usize,
+    frontier_artifacts: usize,
+    deferred_candidates: usize,
+    deferred_canonical_bytes: u64,
+    pending_parents: usize,
 }
 
 #[derive(Serialize)]
@@ -462,6 +473,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
     }
     let artifact_records = u64::from_le_bytes(artifacts[..8].try_into()?);
     let experience = experience_summary(decoded.segment(SegmentKind::Experience))?;
+    let recovery = recovery_summary(decoded.segment(SegmentKind::Recovery))?;
     let revisions = decoded.segment(SegmentKind::Revisions);
     if revisions.len() < 64 {
         return Err("Lean Bundle has a truncated Revisions segment".into());
@@ -486,7 +498,7 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
     })
     .collect();
     let summary = BundleSummary {
-        schema: "reflex-lean-bundle-summary-v2",
+        schema: "reflex-lean-bundle-summary-v3",
         identity: String::from_utf8(decoded.identity().to_vec())?,
         completed: session.completed,
         completion: session.completion.map(completion_name),
@@ -509,6 +521,20 @@ pub fn bundle_summary(arguments: &[String]) -> Result<(), AnyError> {
         learning,
         knowledge_revision: hex(&revisions[..32]),
         model_revision: hex(&revisions[32..64]),
+        durable_size_bound: CanonicalBundle::replacement_size_bound(
+            &bytes,
+            &[
+                (
+                    SegmentKind::Experience,
+                    decoded.segment(SegmentKind::Experience).len() as u64,
+                ),
+                (
+                    SegmentKind::Recovery,
+                    decoded.segment(SegmentKind::Recovery).len() as u64,
+                ),
+            ],
+        )?,
+        recovery,
         segment_logical_bytes,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1993,6 +2019,52 @@ fn experience_summary(experience: &[u8]) -> Result<ExperienceSummary, AnyError> 
     })
 }
 
+fn recovery_summary(mut recovery: &[u8]) -> Result<RecoverySummary, AnyError> {
+    let pareto_artifacts = usize::try_from(read_summary_u64(&mut recovery)?)?;
+    take_summary(&mut recovery, pareto_artifacts.saturating_mul(32))?;
+    let frontier_artifacts = usize::try_from(read_summary_u64(&mut recovery)?)?;
+    take_summary(&mut recovery, frontier_artifacts.saturating_mul(32))?;
+    let deferred_candidates = usize::try_from(read_summary_u64(&mut recovery)?)?;
+    let mut deferred_canonical_bytes = 0_u64;
+    for _ in 0..deferred_candidates {
+        let canonical = take_summary_sized(&mut recovery)?;
+        deferred_canonical_bytes = deferred_canonical_bytes.saturating_add(canonical.len() as u64);
+        take_summary(&mut recovery, 32)?;
+        take_summary_sized(&mut recovery)?;
+        take_summary(
+            &mut recovery,
+            4 + 1 + reflex::domain::PROPOSAL_FEATURE_COUNT * 4,
+        )?;
+        match take_summary(&mut recovery, 1)?[0] {
+            0 => {}
+            1 => {
+                take_summary(&mut recovery, 32)?;
+            }
+            _ => return Err("Lean Bundle has invalid Recovery provenance framing".into()),
+        }
+    }
+    let pending_parents = usize::try_from(read_summary_u64(&mut recovery)?)?;
+    for _ in 0..pending_parents {
+        take_summary(&mut recovery, 32)?;
+        let offsets = usize::try_from(read_summary_u64(&mut recovery)?)?;
+        take_summary(&mut recovery, offsets.saturating_mul(8))?;
+        match take_summary(&mut recovery, 1)?[0] {
+            0 | 1 => {}
+            _ => return Err("Lean Bundle has invalid pending-parent framing".into()),
+        }
+    }
+    if !recovery.is_empty() {
+        return Err("Lean Bundle has trailing Recovery state".into());
+    }
+    Ok(RecoverySummary {
+        pareto_artifacts,
+        frontier_artifacts,
+        deferred_candidates,
+        deferred_canonical_bytes,
+        pending_parents,
+    })
+}
+
 fn candidate_fate_summary(fate: &CandidateFateInspection) -> CandidateFateSummary {
     let mut summary = CandidateFateSummary {
         candidate_key: hex(&fate.candidate_key),
@@ -2432,6 +2504,43 @@ mod tests {
 
         promoted[14..22].copy_from_slice(&4_u64.to_le_bytes());
         assert!(learning_header(&promoted).is_err());
+    }
+
+    #[test]
+    fn recovery_summary_reads_cursor_and_canonical_payload_counts() {
+        let mut recovery = Vec::new();
+        let push_u64 = |output: &mut Vec<u8>, value: u64| {
+            output.extend_from_slice(&value.to_le_bytes());
+        };
+        push_u64(&mut recovery, 1);
+        recovery.extend_from_slice(&[1; 32]);
+        push_u64(&mut recovery, 1);
+        recovery.extend_from_slice(&[2; 32]);
+        push_u64(&mut recovery, 1);
+        push_u64(&mut recovery, 3);
+        recovery.extend_from_slice(b"dag");
+        recovery.extend_from_slice(&[3; 32]);
+        push_u64(&mut recovery, 2);
+        recovery.extend_from_slice(b"op");
+        recovery.extend_from_slice(&8_u32.to_le_bytes());
+        recovery.push(0);
+        recovery.extend_from_slice(&[0; reflex::domain::PROPOSAL_FEATURE_COUNT * 4]);
+        recovery.push(1);
+        recovery.extend_from_slice(&[4; 32]);
+        push_u64(&mut recovery, 1);
+        recovery.extend_from_slice(&[5; 32]);
+        push_u64(&mut recovery, 2);
+        recovery.extend_from_slice(&0_u64.to_le_bytes());
+        recovery.extend_from_slice(&8_u64.to_le_bytes());
+        recovery.push(1);
+
+        let summary = recovery_summary(&recovery).unwrap();
+
+        assert_eq!(summary.pareto_artifacts, 1);
+        assert_eq!(summary.frontier_artifacts, 1);
+        assert_eq!(summary.deferred_candidates, 1);
+        assert_eq!(summary.deferred_canonical_bytes, 3);
+        assert_eq!(summary.pending_parents, 1);
     }
 
     #[test]

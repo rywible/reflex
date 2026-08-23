@@ -683,6 +683,39 @@ impl ExperienceLedger {
         output
     }
 
+    pub(super) fn encoded_len(&self) -> u64 {
+        let entries = self.entries.iter().fold(8_u64, |bytes, entry| {
+            bytes.saturating_add(encoded_entry_len(
+                entry.canonical_candidate.len(),
+                entry.operator_symbol.len(),
+                entry.proposal_provenance.is_some(),
+            ))
+        });
+        let consequences = 8_u64.saturating_add(
+            (self.consequences.len() as u64).saturating_mul(FIXED_CONSEQUENCE_BYTES as u64),
+        );
+        let measurements = self.measurements.iter().fold(8_u64, |bytes, measurement| {
+            let values = measurement.values.iter().fold(0_u64, |bytes, value| {
+                bytes
+                    .saturating_add(SIZED_LENGTH_BYTES as u64)
+                    .saturating_add(value.metric_symbol.len() as u64)
+                    .saturating_add(SIZED_LENGTH_BYTES as u64)
+                    .saturating_add(value.observation.len() as u64)
+            });
+            bytes
+                .saturating_add(DIGEST_BYTES as u64)
+                .saturating_add(SIZED_LENGTH_BYTES as u64)
+                .saturating_add(measurement.environment.len() as u64)
+                .saturating_add(SIZED_LENGTH_BYTES as u64)
+                .saturating_add(values)
+        });
+        entries
+            .saturating_add(consequences)
+            .saturating_add(measurements)
+            .saturating_add(8)
+            .saturating_add(encoded_candidate_fates_len(&self.candidate_fates))
+    }
+
     pub(super) fn resident_bytes(&self) -> u64 {
         let entry_payloads = self.entries.iter().fold(0_u64, |bytes, entry| {
             bytes
@@ -717,6 +750,25 @@ impl ExperienceLedger {
             .saturating_sub(vector_bytes(&self.consequences))
             .saturating_add(vector_bytes(consequences))
     }
+}
+
+pub(super) fn encoded_entry_len(
+    canonical_candidate_bytes: usize,
+    operator_symbol_bytes: usize,
+    has_proposal_provenance: bool,
+) -> u64 {
+    (FIXED_ENTRY_BYTES as u64)
+        .saturating_add(canonical_candidate_bytes as u64)
+        .saturating_add(operator_symbol_bytes as u64)
+        .saturating_add(u64::from(has_proposal_provenance) * DIGEST_BYTES as u64)
+}
+
+pub(super) fn encoded_candidate_fates_len(fates: &[CandidateFateObservation]) -> u64 {
+    fates.iter().fold(0_u64, |bytes, fate| {
+        bytes
+            .saturating_add(FIXED_CANDIDATE_FATE_BYTES as u64)
+            .saturating_add(u64::from(fate.proposal_provenance.is_some()) * DIGEST_BYTES as u64)
+    })
 }
 
 fn decode_candidate_fates(input: &mut &[u8]) -> Result<Vec<CandidateFateObservation>, ()> {
@@ -992,8 +1044,22 @@ mod tests {
                 }
             })
             .collect();
-        let ledger = ExperienceLedger::from_parts(entries, Vec::new(), Vec::new(), candidate_fates);
+        let consequences = vec![ConsequenceObservation {
+            subject: [0xc3; 32],
+            kind: ConsequenceKind::Compression,
+        }];
+        let measurements = vec![MeasurementObservation {
+            subject: [0xd4; 32],
+            environment: b"test-environment".to_vec(),
+            values: vec![EncodedMeasurement {
+                metric_symbol: b"nodes".to_vec(),
+                observation: b"3".to_vec(),
+            }],
+        }];
+        let ledger =
+            ExperienceLedger::from_parts(entries, consequences, measurements, candidate_fates);
         let encoded = ledger.encode();
+        assert_eq!(ledger.encoded_len(), encoded.len() as u64);
         let decoded = ExperienceLedger::decode(&encoded).unwrap();
         assert!(decoded.entries() == ledger.entries());
         assert!(decoded.candidate_fates() == ledger.candidate_fates());

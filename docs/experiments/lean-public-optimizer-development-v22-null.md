@@ -12,13 +12,13 @@ Training used 384 total Verification requests: 32 Seed replays and 352 Candidate
 
 This is enough to reject the v21 producer-consumer failure. Generation no longer compounded the full breadth target every epoch; the Runtime spent about five times as many Candidate requests and admitted more than twelve times as many Artifacts.
 
-## Remaining stop
+## Initial diagnosis (later falsified)
 
-The final cohort stopped at resident admission. Observed peak residency was 19.734 GB under the 32 GiB Runtime allowance, durable use was 90.7 MB under 1 GiB, and CPU and elapsed use were about 110 seconds under ten minutes. The low observed peak is expected because the refused allocation never occurred.
+The final cohort stopped after selection and before Verification. Observed peak residency was 19.734 GB under the 32 GiB Runtime allowance, durable use was 90.7 MB under 1 GiB, and CPU and elapsed use were about 110 seconds under ten minutes. At v22, the first uninstrumented working hypothesis assigned this to resident admission.
 
 Code inspection found a false overlap in the predictive reservation. `resident_before_epoch` charged every deferred Artifact payload. Selection then moved those same payloads into the selected and prospective-deferred vectors without cloning their dynamic heaps, but the transaction added the complete prospective payload again. Once proof terms, admitted Artifacts, and Experience grew, this impossible double ownership crossed the envelope.
 
-ADR 0072 recomputes the post-selection ownership graph. It still separately charges element buffers, the selected Candidate pipeline, Candidate Fates, generation context, both coexisting checkpoints, and pending durability. Only the moved Artifact payload's duplicate charge is removed.
+ADR 0072 recomputes the post-selection ownership graph. It still separately charges element buffers, the selected Candidate pipeline, Candidate Fates, generation context, both coexisting checkpoints, and pending durability. Only the moved Artifact payload's duplicate charge is removed. The identical v23 retry later lowered the resident estimate without changing the stop, falsifying this as the limiting cause; ADR 0073 records the actual durable-unit defect.
 
 ## Decision
 

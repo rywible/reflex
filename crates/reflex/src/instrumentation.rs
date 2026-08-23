@@ -21,6 +21,27 @@ pub(crate) enum Phase {
     Finalization,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ResourceRefusal {
+    DurablePreVerification,
+    ResidentPreVerification,
+    ResidentEpoch,
+    VerificationBudget,
+    Time,
+}
+
+impl ResourceRefusal {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DurablePreVerification => "durable-pre-verification",
+            Self::ResidentPreVerification => "resident-pre-verification",
+            Self::ResidentEpoch => "resident-epoch",
+            Self::VerificationBudget => "verification-budget",
+            Self::Time => "time",
+        }
+    }
+}
+
 impl Phase {
     const COUNT: usize = 9;
 
@@ -38,6 +59,7 @@ pub(crate) struct Recorder {
     candidates_selected: u64,
     verification_requests: u64,
     artifacts_admitted: u64,
+    resource_refusal: Option<ResourceRefusal>,
 }
 
 impl Recorder {
@@ -58,6 +80,7 @@ impl Recorder {
             candidates_selected: 0,
             verification_requests: 0,
             artifacts_admitted: 0,
+            resource_refusal: None,
         }
     }
 
@@ -117,9 +140,16 @@ impl Recorder {
         }
     }
 
+    #[inline]
+    pub(crate) fn refused(&mut self, refusal: ResourceRefusal) {
+        if self.report.is_some() && self.resource_refusal.is_none() {
+            self.resource_refusal = Some(refusal);
+        }
+    }
+
     fn write_report(&self, report: &PathBuf) -> std::io::Result<()> {
         let mut body = String::new();
-        writeln!(body, "schema=reflex-internal-phase-v1").unwrap();
+        writeln!(body, "schema=reflex-internal-phase-v2").unwrap();
         let total = self
             .started
             .map_or(0, |started| nanoseconds(started.elapsed()));
@@ -142,6 +172,12 @@ impl Recorder {
         writeln!(body, "candidates_selected={}", self.candidates_selected).unwrap();
         writeln!(body, "verification_requests={}", self.verification_requests).unwrap();
         writeln!(body, "artifacts_admitted={}", self.artifacts_admitted).unwrap();
+        writeln!(
+            body,
+            "resource_refusal={}",
+            self.resource_refusal.map_or("none", ResourceRefusal::name)
+        )
+        .unwrap();
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -178,6 +214,7 @@ mod tests {
             candidates_selected: 0,
             verification_requests: 0,
             artifacts_admitted: 0,
+            resource_refusal: None,
         };
         let started = recorder.start();
         recorder.finish(Phase::Generation, started);
@@ -186,11 +223,13 @@ mod tests {
         recorder.selected(5);
         recorder.verified(4);
         recorder.admitted(3);
+        recorder.refused(super::ResourceRefusal::DurablePreVerification);
         assert_eq!(recorder.phase_ns, [0; Phase::COUNT]);
         assert_eq!(recorder.epochs, 0);
         assert_eq!(recorder.candidates_generated, 0);
         assert_eq!(recorder.candidates_selected, 0);
         assert_eq!(recorder.verification_requests, 0);
         assert_eq!(recorder.artifacts_admitted, 0);
+        assert!(recorder.resource_refusal.is_none());
     }
 }

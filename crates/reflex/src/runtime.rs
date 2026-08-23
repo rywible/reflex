@@ -17,7 +17,7 @@ use crate::domain::{
     VerificationWorkerRequirements,
 };
 use crate::durability;
-use crate::instrumentation::{Phase, Recorder};
+use crate::instrumentation::{Phase, Recorder, ResourceRefusal};
 use crate::knowledge::{DerivationObservation, KnowledgeRevision, KnowledgeState};
 use crate::learning::{
     AttemptObservation, ConsequenceKind, ConsequenceObservation, FEATURE_COUNT, Features,
@@ -46,6 +46,7 @@ use experience::CandidateFateKey;
 use experience::{
     CandidateFateDisposition, CandidateFateObservation, CandidateRank, ExperienceEntry,
     ExperienceLedger, ExperienceVerdict, candidate_fate_batches_are_valid,
+    encoded_candidate_fates_len, encoded_entry_len,
 };
 use goals::GoalEvaluator;
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
@@ -107,6 +108,7 @@ struct VerificationOutcome<D: DomainDefinition> {
 
 struct ProposedCandidate<D: DomainDefinition> {
     candidate: Candidate<D>,
+    canonical_candidate: Vec<u8>,
     operator_symbol: Vec<u8>,
     features: Features,
     epoch: u64,
@@ -117,6 +119,32 @@ struct ProposedCandidate<D: DomainDefinition> {
     bootstrap_rank: CandidateRank,
     learned_rank: CandidateRank,
     generated_in_epoch: bool,
+}
+
+impl<D: DomainDefinition> ProposedCandidate<D> {
+    fn generated(
+        candidate: Candidate<D>,
+        canonical_operator: Vec<u8>,
+        features: Features,
+        epoch: u64,
+        proposal_limit: usize,
+        protected_derived: bool,
+    ) -> Self {
+        Self {
+            candidate,
+            canonical_candidate: Vec::new(),
+            operator_symbol: canonical_operator,
+            features,
+            epoch,
+            proposal_limit: u32::try_from(proposal_limit).unwrap_or(u32::MAX),
+            protected_derived,
+            allocation_queue: AllocationQueue::Bootstrap,
+            fate_index: usize::MAX,
+            bootstrap_rank: CandidateRank::absent(),
+            learned_rank: CandidateRank::absent(),
+            generated_in_epoch: true,
+        }
+    }
 }
 
 const ENUMERATION_COMPLETE: u64 = u64::MAX;
@@ -201,6 +229,7 @@ impl<'a, D: DomainDefinition> SearchTailView<'a, D> {
 
 struct DeferredCandidate<D: DomainDefinition> {
     artifact: D::Artifact,
+    canonical_candidate: Vec<u8>,
     parent_key: ArtifactKey,
     operator_symbol: Vec<u8>,
     proposal_features: ProposalFeatures,
@@ -342,7 +371,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 17;
+const RUNTIME_REVISION: u64 = 18;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1159,6 +1188,7 @@ where
                     proposal_features: deferred.proposal_features,
                     proposal_provenance: deferred.proposal_provenance,
                 },
+                canonical_candidate: deferred.canonical_candidate,
                 operator_symbol: deferred.operator_symbol,
                 features: Features([0.0; FEATURE_COUNT]),
                 epoch: 0,
@@ -1321,11 +1351,13 @@ where
                 &pending_parents,
             ));
         if !resource_meter.reserve(ResidentReservation::live(resident_before_epoch)) {
+            instrumentation.refused(ResourceRefusal::ResidentEpoch);
             resident_budget_exhausted = true;
             break;
         }
         let remaining_verifications = verification_budget.saturating_sub(verification_requests);
         if remaining_verifications == 0 {
+            instrumentation.refused(ResourceRefusal::VerificationBudget);
             verification_budget_exhausted = true;
             break;
         }
@@ -1388,6 +1420,7 @@ where
         let generation_limit =
             generation_refill_limit(generation_inventory_target, deferred_candidates.len());
         if generation_inventory_target == 0 && deferred_candidates.is_empty() {
+            instrumentation.refused(ResourceRefusal::ResidentEpoch);
             resident_budget_exhausted = true;
             break;
         }
@@ -1397,6 +1430,7 @@ where
             ResidentReservation::live(resident_before_epoch)
                 .with_transient(generation_transient_bound),
         ) {
+            instrumentation.refused(ResourceRefusal::ResidentEpoch);
             resident_budget_exhausted = true;
             break;
         }
@@ -1487,6 +1521,7 @@ where
                 .search_time_exhausted()
                 .map_err(|()| SessionError::Resource)?
             {
+                instrumentation.refused(ResourceRefusal::Time);
                 time_exhausted = true;
                 break;
             }
@@ -1520,6 +1555,7 @@ where
             .map_err(|()| SessionError::Resource)?
         {
             deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
+            instrumentation.refused(ResourceRefusal::Time);
             time_exhausted = true;
             break;
         }
@@ -1565,6 +1601,7 @@ where
             .map_err(|()| SessionError::Resource)?
         {
             deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
+            instrumentation.refused(ResourceRefusal::Time);
             time_exhausted = true;
             break;
         }
@@ -1630,13 +1667,24 @@ where
             .saturating_add(vector_bytes(&candidates))
             .saturating_add(candidate_pipeline_reserve(domain, &candidates))
             .saturating_add(vector_bytes(&candidate_fates));
-        let prospective_durable = (checkpoint.len() as u64)
-            .saturating_add(candidate_pipeline_reserve(domain, &candidates))
-            .saturating_add(deferred_resident)
-            .saturating_add(vector_bytes(&candidate_fates));
+        let prospective_experience =
+            prospective_experience_encoded_len(&ledger, &candidates, &candidate_fates);
+        let prospective_recovery = recovery_encoded_len(
+            &pareto,
+            &SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
+        );
+        let prospective_durable = CanonicalBundle::replacement_size_bound(
+            &checkpoint,
+            &[
+                (SegmentKind::Experience, prospective_experience),
+                (SegmentKind::Recovery, prospective_recovery),
+            ],
+        )
+        .map_err(|_| SessionError::CorruptBundle)?;
         if !resource_meter.checkpoint_fits(prospective_durable) {
             deferred_candidates =
                 cohort::rollback_unverified_generation(candidates, deferred_candidates);
+            instrumentation.refused(ResourceRefusal::DurablePreVerification);
             durable_budget_exhausted = true;
             break;
         }
@@ -1664,6 +1712,7 @@ where
         ) {
             deferred_candidates =
                 cohort::rollback_unverified_generation(candidates, deferred_candidates);
+            instrumentation.refused(ResourceRefusal::ResidentPreVerification);
             resident_budget_exhausted = true;
             break;
         }
@@ -1673,11 +1722,13 @@ where
         {
             deferred_candidates =
                 cohort::rollback_unverified_generation(candidates, deferred_candidates);
+            instrumentation.refused(ResourceRefusal::Time);
             time_exhausted = true;
             break;
         }
         if candidates.len() > remaining {
             candidates.truncate(remaining);
+            instrumentation.refused(ResourceRefusal::VerificationBudget);
             verification_budget_exhausted = true;
         }
         if candidates.is_empty() {
@@ -1971,6 +2022,7 @@ where
             proposed_reservation.peak_bytes(),
         );
         if delivery.resource_exhausted() {
+            instrumentation.refused(ResourceRefusal::ResidentEpoch);
             resident_budget_exhausted = true;
             break;
         }
@@ -2310,10 +2362,57 @@ fn candidate_pipeline_reserve<D: DomainDefinition>(
             .saturating_add((view.node_count() as u64).saturating_mul(256));
         let ledger = (std::mem::size_of::<ExperienceEntry>() as u64)
             .saturating_add(candidate.operator_symbol.capacity() as u64)
+            .saturating_add(candidate.canonical_candidate.capacity() as u64)
             .saturating_add(structural)
             .saturating_mul(2);
         bytes.saturating_add(ledger.max(4 * 1024))
     })
+}
+
+fn prospective_experience_encoded_len<D: DomainDefinition>(
+    ledger: &ExperienceLedger,
+    candidates: &[ProposedCandidate<D>],
+    candidate_fates: &[CandidateFateObservation],
+) -> u64 {
+    candidates
+        .iter()
+        .fold(ledger.encoded_len(), |bytes, candidate| {
+            bytes.saturating_add(encoded_entry_len(
+                candidate.canonical_candidate.len(),
+                candidate.operator_symbol.len(),
+                candidate.candidate.proposal_provenance.is_some(),
+            ))
+        })
+        .saturating_add(encoded_candidate_fates_len(candidate_fates))
+}
+
+fn recovery_encoded_len<D: DomainDefinition>(
+    pareto: &[VerifiedArtifact<D>],
+    search_tail: &SearchTailView<'_, D>,
+) -> u64 {
+    let frontier = search_tail.frontier;
+    let deferred = search_tail.deferred_candidates;
+    let pending = search_tail.pending_parents;
+    let deferred_bytes = deferred.iter().fold(0_u64, |bytes, candidate| {
+        bytes
+            .saturating_add(86)
+            .saturating_add(candidate.canonical_candidate.len() as u64)
+            .saturating_add(candidate.operator_symbol.len() as u64)
+            .saturating_add(u64::from(candidate.candidate.proposal_provenance.is_some()) * 32)
+    });
+    let pending_bytes = pending.iter().fold(0_u64, |bytes, parent| {
+        bytes
+            .saturating_add(32 + 8 + 1)
+            .saturating_add((parent.primitive_offsets.len() as u64).saturating_mul(8))
+    });
+    8_u64
+        .saturating_add((pareto.len() as u64).saturating_mul(32))
+        .saturating_add(8)
+        .saturating_add((frontier.len() as u64).saturating_mul(32))
+        .saturating_add(8)
+        .saturating_add(deferred_bytes)
+        .saturating_add(8)
+        .saturating_add(pending_bytes)
 }
 
 fn candidate_generation_limit(
@@ -2618,28 +2717,24 @@ fn append_primitive_candidates<D: DomainDefinition>(
                 .frontier_indexes
                 .get(candidate.source_index)
                 .ok_or(SessionError::InvalidSeed)?;
-            output.push(ProposedCandidate {
-                features: opportunity_features(
-                    domain,
-                    StructuralSummary {
-                        node_count: structural_node_count(domain, parent),
-                    },
-                    &candidate.artifact,
-                    operator_features,
-                    epoch,
-                    candidate.proposal_features,
-                ),
-                candidate,
-                operator_symbol: descriptor.symbol().as_str().as_bytes().to_vec(),
+            let features = opportunity_features(
+                domain,
+                StructuralSummary {
+                    node_count: structural_node_count(domain, parent),
+                },
+                &candidate.artifact,
+                operator_features,
                 epoch,
-                proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
-                protected_derived: false,
-                allocation_queue: AllocationQueue::Bootstrap,
-                fate_index: usize::MAX,
-                bootstrap_rank: CandidateRank::absent(),
-                learned_rank: CandidateRank::absent(),
-                generated_in_epoch: true,
-            });
+                candidate.proposal_features,
+            );
+            output.push(ProposedCandidate::generated(
+                candidate,
+                descriptor.symbol().as_str().as_bytes().to_vec(),
+                features,
+                epoch,
+                operator_limit,
+                false,
+            ));
         }
     }
     Ok(application_bytes)
@@ -2748,28 +2843,24 @@ fn append_derived_candidates<D: DomainDefinition>(
                 .frontier_indexes
                 .get(candidate.source_index)
                 .ok_or(SessionError::CorruptBundle)?;
-            output.push(ProposedCandidate {
-                features: opportunity_features(
-                    domain,
-                    StructuralSummary {
-                        node_count: structural_node_count(domain, parent),
-                    },
-                    &candidate.artifact,
-                    operator_features,
-                    epoch,
-                    candidate.proposal_features,
-                ),
-                candidate,
-                operator_symbol: derived.symbol().to_vec(),
+            let features = opportunity_features(
+                domain,
+                StructuralSummary {
+                    node_count: structural_node_count(domain, parent),
+                },
+                &candidate.artifact,
+                operator_features,
                 epoch,
-                proposal_limit: u32::try_from(operator_limit).unwrap_or(u32::MAX),
-                protected_derived: derived.protected_exploration(),
-                allocation_queue: AllocationQueue::Bootstrap,
-                fate_index: usize::MAX,
-                bootstrap_rank: CandidateRank::absent(),
-                learned_rank: CandidateRank::absent(),
-                generated_in_epoch: true,
-            });
+                candidate.proposal_features,
+            );
+            output.push(ProposedCandidate::generated(
+                candidate,
+                derived.symbol().to_vec(),
+                features,
+                epoch,
+                operator_limit,
+                derived.protected_exploration(),
+            ));
         }
     }
     Ok((application_bytes, truncated))
@@ -3066,11 +3157,13 @@ fn retain_novel_candidates<D: DomainDefinition>(
     let mut fates = Vec::with_capacity(candidates.len());
     let mut fate_is_new_generation = Vec::with_capacity(candidates.len());
     for (generation_rank, mut candidate) in candidates.into_iter().enumerate() {
-        let mut canonical = Vec::new();
-        domain
-            .structure()
-            .encode_canonical(&candidate.candidate.artifact, &mut canonical, &mut scratch)
-            .map_err(SessionError::Domain)?;
+        let mut canonical = std::mem::take(&mut candidate.canonical_candidate);
+        if candidate.generated_in_epoch {
+            domain
+                .structure()
+                .encode_canonical(&candidate.candidate.artifact, &mut canonical, &mut scratch)
+                .map_err(SessionError::Domain)?;
+        }
         let candidate_key = ArtifactKey(stable_digest(identity.as_str(), &canonical));
         let origin = frontier[candidate.candidate.source_index].1;
         let claim_digest = root_claims[origin];
@@ -3113,6 +3206,7 @@ fn retain_novel_candidates<D: DomainDefinition>(
         });
         fate_is_new_generation.push(candidate.generated_in_epoch);
         if novel {
+            candidate.canonical_candidate = canonical;
             candidate.fate_index = fate_index;
             retained.push(candidate);
         }
@@ -3584,10 +3678,19 @@ fn decode_bundle<D: DomainDefinition>(
     }
     let mut deferred_candidates = Vec::with_capacity(deferred_count);
     for _ in 0..deferred_count {
+        let canonical_candidate = take_sized(&mut recovery)?.to_vec();
         let artifact = domain
             .structure()
-            .decode_canonical(take_sized(&mut recovery)?, &mut structure_scratch)
+            .decode_canonical(&canonical_candidate, &mut structure_scratch)
             .map_err(|_| SessionError::CorruptBundle)?;
+        let mut canonical_round_trip = Vec::new();
+        domain
+            .structure()
+            .encode_canonical(&artifact, &mut canonical_round_trip, &mut structure_scratch)
+            .map_err(|_| SessionError::CorruptBundle)?;
+        if canonical_round_trip != canonical_candidate {
+            return Err(SessionError::CorruptBundle);
+        }
         let parent_key = ArtifactKey(
             take_bundle(&mut recovery, 32)?
                 .try_into()
@@ -3630,6 +3733,7 @@ fn decode_bundle<D: DomainDefinition>(
         }
         deferred_candidates.push(DeferredCandidate {
             artifact,
+            canonical_candidate,
             parent_key,
             operator_symbol,
             proposal_features: ProposalFeatures::new(proposal_features),
@@ -4287,26 +4391,6 @@ fn verify_candidates<D: DomainDefinition>(
     instrumentation: &mut Recorder,
     candidate_fates: &mut [CandidateFateObservation],
 ) -> Result<VerificationOutcome<D>, SessionError<D::Error>> {
-    let mut structure_scratch = <D::Structure as StructuralProtocol<D>>::Scratch::default();
-    let identity = domain.semantic_identity();
-    let candidate_encodings = candidates
-        .iter()
-        .map(|candidate| {
-            let mut canonical = Vec::new();
-            domain
-                .structure()
-                .encode_canonical(
-                    &candidate.candidate.artifact,
-                    &mut canonical,
-                    &mut structure_scratch,
-                )
-                .map_err(SessionError::Domain)?;
-            Ok((
-                ArtifactKey(stable_digest(identity.as_str(), &canonical)),
-                canonical,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let requests = candidates
         .iter()
         .map(|candidate| {
@@ -4351,14 +4435,15 @@ fn verify_candidates<D: DomainDefinition>(
     let revision = domain.kernel().revision();
     let mut accepted = Vec::new();
     let mut experience = Vec::with_capacity(candidates.len());
-    for ((candidate, (candidate_key, canonical_candidate)), (claim, verdict)) in candidates
-        .into_iter()
-        .zip(candidate_encodings)
-        .zip(claims_and_verdicts)
-    {
+    for (mut candidate, (claim, verdict)) in candidates.into_iter().zip(claims_and_verdicts) {
         let origin = parent_origins[candidate.candidate.source_index];
         let origin_key = roots[origin].key();
         let parent_key = parent_keys[candidate.candidate.source_index];
+        let candidate_key = candidate_fates
+            .get(candidate.fate_index)
+            .ok_or(SessionError::CorruptBundle)?
+            .candidate_key;
+        let canonical_candidate = std::mem::take(&mut candidate.canonical_candidate);
         let mut encoded_claim = Vec::new();
         domain
             .kernel()
@@ -4585,7 +4670,7 @@ fn publish_interrupted_bytes<D: DomainDefinition>(
 }
 
 fn encode_recovery_segment<D: DomainDefinition>(
-    domain: &D,
+    _domain: &D,
     pareto: &[VerifiedArtifact<D>],
     search_tail: &SearchTailView<'_, D>,
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
@@ -4611,23 +4696,13 @@ fn encode_recovery_segment<D: DomainDefinition>(
         recovery.extend_from_slice(artifact.key().as_bytes());
     }
     push_u64(&mut recovery, deferred_candidates.len() as u64);
-    let mut structure_scratch = <D::Structure as crate::StructuralProtocol<D>>::Scratch::default();
     for candidate in deferred_candidates {
         let parent_key = frontier
             .get(candidate.candidate.source_index)
             .ok_or(SessionError::CorruptBundle)?
             .0
             .key();
-        let mut canonical = Vec::new();
-        domain
-            .structure()
-            .encode_canonical(
-                &candidate.candidate.artifact,
-                &mut canonical,
-                &mut structure_scratch,
-            )
-            .map_err(SessionError::Domain)?;
-        push_bytes(&mut recovery, &canonical);
+        push_bytes(&mut recovery, &candidate.canonical_candidate);
         recovery.extend_from_slice(parent_key.as_bytes());
         push_bytes(&mut recovery, &candidate.operator_symbol);
         recovery.extend_from_slice(&candidate.proposal_limit.to_le_bytes());
@@ -4651,6 +4726,13 @@ fn encode_recovery_segment<D: DomainDefinition>(
         }
         recovery.push(u8::from(pending.derived_sampled));
     }
+    debug_assert_eq!(
+        recovery.len() as u64,
+        recovery_encoded_len(
+            pareto,
+            &SearchTailView::new(frontier, deferred_candidates, pending_parents)
+        )
+    );
     Ok(recovery)
 }
 
