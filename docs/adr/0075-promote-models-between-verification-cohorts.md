@@ -13,3 +13,7 @@ The active Knowledge Revision remains pinned for a Session because consolidation
 Later Experience is gathered under an earlier promoted policy and is therefore operationally on-policy rather than an independent scientific estimate. Candidate Fates retain Bootstrap and learned counterfactual ranks, and Scientific Confirmation still requires a frozen external treatment. Training at every cohort would react sooner but repeatedly derive targets over a growing ledger; end-only training wastes the entire current Session. Logarithmic checkpoints bound that cost to a small number of attempts.
 
 Runtime revision 19 rejects older interrupted recovery state because model activation can now change between Verification Cohorts. Lean Development schema v26 identifies the changed allocation protocol. The public Improvement Session interface is unchanged.
+
+## Development evidence
+
+The [v26 32×8 run](../experiments/lean-public-optimizer-development-v26.md) confirms that the promoted Model Revision serves later cohorts: Learned produced 27 Accepted Candidates in 464 checks while the cooperative Bootstrap queue produced seven in 496. It also falsifies the original power-of-two cadence. Three early comparisons exhausted the three-use Selection Corpus, leaving zero Selection claims and preventing the complete-Experience challenger from replacing generation one. A follow-up revision must spread the same bounded comparison budget across Experience growth; it must not relax disjointness or silently reuse retired Selection cases.

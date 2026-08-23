@@ -1,0 +1,160 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v26-summary-v1",
+  "status": "development-only; no 2026 exposure",
+  "source_report": {
+    "path": "/tmp/reflex-lean-public-optimizer-development-v26-32x8.json",
+    "content_sha256": "2bdb2f1c6ff3a5701636673611183d1191e14ec9dc0c0b3ac10b61b92576f885",
+    "file_sha256": "7a4fa287bc23bf6da58ebc0f9dcfa80eb29ae198539481da6c51e19d9dac1d0b"
+  },
+  "corpus": {
+    "training_artifacts": 32,
+    "heldout_artifacts": 8,
+    "training_verification_limit": 1024,
+    "evaluation_verification_limit": 128,
+    "heldout_declarations": [
+      "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "Matrix.det_updateCol_eq_zero",
+      "hfdifferential_apply",
+      "Matrix.fromCols_mul_fromRows",
+      "Stream'.WSeq.get?_terminates",
+      "Metric.isUniformEmbedding_iff",
+      "ContinuousLinearEquiv.isUniformEmbedding",
+      "FiberBundle.Prod.isInducing_diag"
+    ],
+    "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+    "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398"
+  },
+  "training": {
+    "learning": {
+      "generation": 1,
+      "champion_present": true
+    },
+    "experience_entries": 992,
+    "accepted_attempts": 35,
+    "accepted_claims": 32,
+    "verified_by_queue": {
+      "protected_origin": 32,
+      "learned": 464,
+      "bootstrap": 496
+    },
+    "accepted_by_queue": {
+      "protected_origin": 1,
+      "learned": 27,
+      "bootstrap": 7
+    },
+    "first_learned_epoch": 4,
+    "selection_claims_after_final_training": 0,
+    "complete_data_model_reproduces_champion": false,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 19975749307,
+      "verification_requests": 1024,
+      "durable_bytes": 124073900,
+      "elapsed_ns": 263272619792,
+      "cpu_ns": 264045807005
+    },
+    "bundle_sha256": "77f341d0dbfe04809f26fa03bbeee84eb5ca5b0777d94a97927b42b74a232dcc",
+    "phase_sha256": "068febb0a2ac25e98ec0a0bd16ca80c6f1e5b85dbda111817e5488a837be547f"
+  },
+  "treatments": {
+    "bootstrap": {
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 1417,
+      "at_16": {
+        "strict_discoveries": 1,
+        "candidate_cpu_ns": 831902599
+      },
+      "final": {
+        "observed_candidate_requests": 120,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 10173705149
+      },
+      "usage": {
+        "resident_bytes": 18189478443,
+        "verification_requests": 128,
+        "elapsed_ns": 56284569723,
+        "cpu_ns": 56362498763
+      },
+      "bundle_sha256": "1c893495f750b6be299d85894aae294a7df14a60829cc1f9beb809fbf70f0726"
+    },
+    "full": {
+      "strict_proof_node_improvements": 5,
+      "proof_nodes_removed": 5684,
+      "at_16": {
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 863910481
+      },
+      "final": {
+        "observed_candidate_requests": 18,
+        "strict_discoveries": 5,
+        "candidate_cpu_ns": 878966063
+      },
+      "usage": {
+        "resident_bytes": 23688167826,
+        "verification_requests": 128,
+        "elapsed_ns": 53780568371,
+        "cpu_ns": 53828548980
+      },
+      "bundle_sha256": "6eee2bb35f724db7c3663f73bf2198181b9388c3ad87bdf2aafcf009436c39f0"
+    },
+    "no_model": {
+      "strict_proof_node_improvements": 1,
+      "proof_nodes_removed": 5,
+      "final_observed_candidate_requests": 18,
+      "usage": {
+        "resident_bytes": 23688130191,
+        "verification_requests": 128,
+        "elapsed_ns": 53276780481,
+        "cpu_ns": 53325050165
+      },
+      "bundle_sha256": "353ec6bf2d9a61d4556ea8482d933567970b7ee9e45c891b64846458537ebe65"
+    },
+    "no_derived": {
+      "strict_proof_node_improvements": 5,
+      "proof_nodes_removed": 5684,
+      "final_observed_candidate_requests": 18,
+      "usage": {
+        "resident_bytes": 23688167826,
+        "verification_requests": 128,
+        "elapsed_ns": 53338995506,
+        "cpu_ns": 53387703557
+      },
+      "bundle_sha256": "d36f2b753240d5bc10a80d9070f9ebdff626523f11058c12db1490da0c15af9d"
+    }
+  },
+  "gates": {
+    "full_has_more_improvements": true,
+    "full_uses_less_end_to_end_cpu_per_improvement": true,
+    "full_noninferior_after_16_requests": true,
+    "request_16_candidate_efficiency": {
+      "full_strict_discoveries": 4,
+      "bootstrap_strict_discoveries": 1,
+      "full_candidate_cpu_ns": 863910481,
+      "bootstrap_candidate_cpu_ns": 831902599,
+      "full_uses_less_candidate_cpu_per_improvement": true
+    }
+  },
+  "host": {
+    "git_revision": "14a40c084982312e7c073ffe164a7f2346e37af2",
+    "git_dirty": false,
+    "build_profile": "release",
+    "target_features": "neon",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "limits": [
+    "Development opportunity corpus; not confirmation sampling.",
+    "Eight held-out claims are insufficient for Scientific Confirmation.",
+    "All improvements reuse exact-statement library proofs; this is verified proof deduplication, not theorem invention.",
+    "Full and no-model pay mandatory replay from retained training state and have 18 fresh Candidate requests; Bootstrap is Fresh and has 120.",
+    "No-derived was an identity transformation because training produced no active Derived Operators.",
+    "The three-use Selection corpus was exhausted by repeated online comparisons, so generation 1 could not be challenged on complete Experience."
+  ]
+}
