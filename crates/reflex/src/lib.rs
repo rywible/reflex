@@ -8,6 +8,7 @@ pub mod session;
 
 mod durability;
 mod instrumentation;
+mod intelligence;
 #[cfg(feature = "internal-experiments")]
 #[doc(hidden)]
 pub mod internal_experiments;
@@ -19,13 +20,13 @@ mod runtime;
 
 pub use bundle::{BundlePlan, DomainBundle};
 pub use domain::{
-    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, EncodingContract,
     ExternalVerificationUsage, ImmediateArity, KernelRevision, OperatorAlgebra, OperatorDescriptor,
-    OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, Seed, SeedPage, SeedSource,
-    SeedWriter, SemanticIdentity, StructuralLocation, StructuralProtocol, StructuralView, Verdict,
-    VerdictWriter, VerificationAllowance, VerificationBatch, VerificationBatchOutcome,
-    VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayBatch,
-    VerificationWorkerRequirements,
+    OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, RejectionAdvisory, Seed,
+    SeedPage, SeedSource, SeedWriter, SemanticIdentity, StructuralLocation, StructuralProtocol,
+    StructuralView, Verdict, VerdictWriter, VerificationAllowance, VerificationBatch,
+    VerificationBatchOutcome, VerificationBatchReport, VerificationKernel, VerificationRecord,
+    VerificationReplayBatch, VerificationWorkerRequirements,
 };
 pub use goal::{
     Direction, EmptyGoalSet, GoalError, GoalSet, MeasurementConstraint, MeasurementTolerance,

@@ -41,6 +41,10 @@ impl SemanticIdentity {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.0.capacity() as u64
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -181,6 +185,33 @@ pub struct StructuralSchema<S, C> {
     pub constructors: Vec<ConstructorDescriptor<S, C>>,
 }
 
+/// Domain-declared allocation contract for one canonical encoding operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncodingContract {
+    encoded_bytes: usize,
+    scratch_resident_bytes: u64,
+}
+
+impl EncodingContract {
+    #[must_use]
+    pub const fn new(encoded_bytes: usize, scratch_resident_bytes: u64) -> Self {
+        Self {
+            encoded_bytes,
+            scratch_resident_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn encoded_bytes(self) -> usize {
+        self.encoded_bytes
+    }
+
+    #[must_use]
+    pub const fn scratch_resident_bytes(self) -> u64 {
+        self.scratch_resident_bytes
+    }
+}
+
 pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
     type Sort: Copy + Eq + Hash + Send + Sync + 'static;
     type Constructor: Copy + Eq + Hash + Send + Sync + 'static;
@@ -212,6 +243,12 @@ pub trait StructuralProtocol<D: DomainDefinition>: Send + Sync + 'static {
         replacement: &D::Artifact,
         scratch: &mut Self::Scratch,
     ) -> Result<D::Artifact, D::Error>;
+    fn canonical_encoding_contract(
+        &self,
+        artifact: &D::Artifact,
+    ) -> Result<EncodingContract, D::Error>;
+    fn artifact_dynamic_resident_bytes(&self, artifact: &D::Artifact) -> u64;
+    fn scratch_dynamic_resident_bytes(&self, scratch: &Self::Scratch) -> u64;
     fn encode_canonical(
         &self,
         artifact: &D::Artifact,
@@ -957,77 +994,196 @@ pub enum Verdict<E> {
     Unknown,
 }
 
+/// Bounded, typed evidence about why a Candidate was Refuted.
+///
+/// A Rejection Advisory is never correctness evidence. It may guide later
+/// search, but only the accompanying [`Verdict`] controls admission. Every
+/// variant is allocation-free and has a canonical private Experience encoding.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RejectionAdvisory {
+    /// The Candidate disagreed with the correctness claim on one concrete input.
+    Counterexample {
+        input: u64,
+        expected: u64,
+        observed: u64,
+    },
+    /// The Candidate's domain representation was malformed.
+    MalformedArtifact,
+    /// The correctness claim was not a well-formed claim in the Verification Kernel.
+    MalformedClaim,
+    /// The Candidate did not pass the Verification Kernel's type or structure check.
+    KernelCheckFailure,
+    /// The Candidate expressed a different correctness claim than the Seed.
+    ClaimMismatch,
+    /// The Candidate used a construct categorically forbidden by the domain.
+    ForbiddenConstruct,
+    /// The Candidate referenced a variable or parameter outside its valid scope.
+    ScopeViolation,
+    /// The Candidate introduced a forbidden or unavailable dependency.
+    DependencyViolation,
+    /// The Candidate introduced an axiom outside the allowed set.
+    AxiomViolation,
+    /// The Candidate's declared dependencies differed from kernel-observed dependencies.
+    DependencyMismatch,
+}
+
 pub struct VerdictWriter<'a, E> {
     output: &'a mut Vec<Verdict<E>>,
-    remaining: usize,
-    overflowed: bool,
+    rejection_advisories: Option<&'a mut Vec<Option<RejectionAdvisory>>>,
+    expected_request_index: usize,
+    request_limit: Option<usize>,
+    contract_violated: bool,
 }
 
 impl<'a, E> VerdictWriter<'a, E> {
     pub fn new(output: &'a mut Vec<Verdict<E>>) -> Self {
         Self {
             output,
-            remaining: usize::MAX,
-            overflowed: false,
+            rejection_advisories: None,
+            expected_request_index: 0,
+            request_limit: None,
+            contract_violated: false,
         }
     }
 
-    pub(crate) fn with_limit(output: &'a mut Vec<Verdict<E>>, limit: usize) -> Self {
+    /// Creates a writer that records one optional Rejection Advisory beside
+    /// every Verdict while preserving the Verdict stream's existing shape.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the supplied Verdict and advisory streams do not start at
+    /// the same length.
+    pub fn recording_rejections(
+        output: &'a mut Vec<Verdict<E>>,
+        rejection_advisories: &'a mut Vec<Option<RejectionAdvisory>>,
+    ) -> Self {
+        assert_eq!(
+            output.len(),
+            rejection_advisories.len(),
+            "Verdicts and Rejection Advisories must start aligned"
+        );
         Self {
             output,
-            remaining: limit,
-            overflowed: false,
+            rejection_advisories: Some(rejection_advisories),
+            expected_request_index: 0,
+            request_limit: None,
+            contract_violated: false,
         }
     }
 
-    pub fn push(&mut self, verdict: Verdict<E>) {
-        if self.remaining == 0 {
-            self.overflowed = true;
-        } else {
-            self.remaining -= 1;
-            self.output.push(verdict);
+    pub(crate) fn with_limit(
+        output: &'a mut Vec<Verdict<E>>,
+        rejection_advisories: &'a mut Vec<Option<RejectionAdvisory>>,
+        limit: usize,
+    ) -> Self {
+        assert_eq!(
+            output.len(),
+            rejection_advisories.len(),
+            "Verdicts and Rejection Advisories must start aligned"
+        );
+        Self {
+            output,
+            rejection_advisories: Some(rejection_advisories),
+            expected_request_index: 0,
+            request_limit: Some(limit),
+            contract_violated: false,
         }
     }
 
-    pub(crate) fn overflowed(&self) -> bool {
-        self.overflowed
+    /// Records the Verdict for one request in the batch's original order.
+    ///
+    /// `request_index` is relative to the [`VerificationBatch`] passed to the
+    /// kernel. A skipped, repeated, reordered, or out-of-range index violates
+    /// the kernel contract; the Runtime rejects the complete batch.
+    pub fn push(&mut self, request_index: usize, verdict: Verdict<E>) {
+        self.push_aligned(request_index, verdict, None);
+    }
+
+    /// Records a Refuted Verdict and its advisory evidence atomically.
+    pub fn push_refuted(&mut self, request_index: usize, advisory: RejectionAdvisory) {
+        self.push_aligned(request_index, Verdict::Refuted, Some(advisory));
+    }
+
+    fn push_aligned(
+        &mut self,
+        request_index: usize,
+        verdict: Verdict<E>,
+        rejection_advisory: Option<RejectionAdvisory>,
+    ) {
+        let in_range = self.request_limit.is_none_or(|limit| request_index < limit);
+        if self.contract_violated || !in_range || request_index != self.expected_request_index {
+            self.contract_violated = true;
+            return;
+        }
+        let Some(next_request_index) = self.expected_request_index.checked_add(1) else {
+            self.contract_violated = true;
+            return;
+        };
+        self.expected_request_index = next_request_index;
+        self.output.push(verdict);
+        if let Some(rejection_advisories) = &mut self.rejection_advisories {
+            rejection_advisories.push(rejection_advisory);
+        }
+    }
+
+    pub(crate) fn contract_violated(&self) -> bool {
+        self.contract_violated
+            || self
+                .request_limit
+                .is_some_and(|limit| self.expected_request_index != limit)
     }
 }
 
 pub struct ReplayVerdictWriter<'a> {
     output: &'a mut Vec<bool>,
-    remaining: usize,
-    overflowed: bool,
+    expected_request_index: usize,
+    request_limit: Option<usize>,
+    contract_violated: bool,
 }
 
 impl<'a> ReplayVerdictWriter<'a> {
     pub fn new(output: &'a mut Vec<bool>) -> Self {
         Self {
             output,
-            remaining: usize::MAX,
-            overflowed: false,
+            expected_request_index: 0,
+            request_limit: None,
+            contract_violated: false,
         }
     }
 
     pub(crate) fn with_limit(output: &'a mut Vec<bool>, limit: usize) -> Self {
         Self {
             output,
-            remaining: limit,
-            overflowed: false,
+            expected_request_index: 0,
+            request_limit: Some(limit),
+            contract_violated: false,
         }
     }
 
-    pub fn push(&mut self, accepted: bool) {
-        if self.remaining == 0 {
-            self.overflowed = true;
-        } else {
-            self.remaining -= 1;
-            self.output.push(accepted);
+    /// Records whether one Verification Record replayed successfully.
+    ///
+    /// `request_index` is relative to the [`VerificationReplayBatch`] passed
+    /// to the kernel and must advance exactly once from zero for each record.
+    pub fn push(&mut self, request_index: usize, accepted: bool) {
+        let in_range = self.request_limit.is_none_or(|limit| request_index < limit);
+        if self.contract_violated || !in_range || request_index != self.expected_request_index {
+            self.contract_violated = true;
+            return;
         }
+        let Some(next_request_index) = self.expected_request_index.checked_add(1) else {
+            self.contract_violated = true;
+            return;
+        };
+        self.expected_request_index = next_request_index;
+        self.output.push(accepted);
     }
 
-    pub(crate) fn overflowed(&self) -> bool {
-        self.overflowed
+    pub(crate) fn contract_violated(&self) -> bool {
+        self.contract_violated
+            || self
+                .request_limit
+                .is_some_and(|limit| self.expected_request_index != limit)
     }
 }
 
@@ -1051,12 +1207,31 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
         output: &mut VerdictWriter<'_, Self::Evidence>,
         scratch: &mut Self::Scratch,
     ) -> VerificationBatchOutcome<D::Error>;
+    /// Cheaply confirms that accepted evidence is bound to the exact request.
+    ///
+    /// The Runtime invokes this for every Accepted Verdict before it may form
+    /// a Verification Record. This check must bind the Candidate Artifact and
+    /// Correctness Claim under this Kernel revision, without performing a
+    /// second Verification request. Recovery still uses [`Self::replay_batch`]
+    /// as the authoritative re-execution path.
+    fn evidence_binds(
+        &self,
+        request: &VerificationRequest<'_, D, Self::Claim>,
+        evidence: &Self::Evidence,
+    ) -> Result<bool, D::Error>;
     fn replay_batch(
         &self,
         records: VerificationReplayBatch<'_, D, Self::Claim, Self::Evidence>,
         output: &mut ReplayVerdictWriter<'_>,
         scratch: &mut Self::Scratch,
     ) -> VerificationBatchOutcome<D::Error>;
+    fn claim_encoding_contract(&self, claim: &Self::Claim) -> Result<EncodingContract, D::Error>;
+    fn evidence_encoding_contract(
+        &self,
+        evidence: &Self::Evidence,
+    ) -> Result<EncodingContract, D::Error>;
+    fn claim_dynamic_resident_bytes(&self, claim: &Self::Claim) -> u64;
+    fn evidence_dynamic_resident_bytes(&self, evidence: &Self::Evidence) -> u64;
     fn encode_claim(&self, claim: &Self::Claim, output: &mut Vec<u8>) -> Result<(), D::Error>;
     fn decode_claim(&self, bytes: &[u8]) -> Result<Self::Claim, D::Error>;
     fn encode_evidence(
@@ -1065,4 +1240,89 @@ pub trait VerificationKernel<D: DomainDefinition>: Send + Sync + 'static {
         output: &mut Vec<u8>,
     ) -> Result<(), D::Error>;
     fn decode_evidence(&self, bytes: &[u8]) -> Result<Self::Evidence, D::Error>;
+}
+
+#[cfg(test)]
+mod verdict_writer_tests {
+    use super::{RejectionAdvisory, ReplayVerdictWriter, Verdict, VerdictWriter};
+
+    #[test]
+    fn rejection_advisories_are_bounded_and_aligned_without_changing_verdicts() {
+        let counterexample = RejectionAdvisory::Counterexample {
+            input: 7,
+            expected: 11,
+            observed: 13,
+        };
+        let mut verdicts = Vec::<Verdict<()>>::new();
+        let mut advisories = Vec::new();
+        {
+            let mut writer = VerdictWriter::recording_rejections(&mut verdicts, &mut advisories);
+            writer.push(0, Verdict::Unknown);
+            writer.push_refuted(1, counterexample);
+            writer.push(2, Verdict::Refuted);
+        }
+
+        assert!(matches!(
+            verdicts.as_slice(),
+            [Verdict::Unknown, Verdict::Refuted, Verdict::Refuted]
+        ));
+        assert_eq!(advisories, [None, Some(counterexample), None]);
+        assert!(std::mem::size_of::<RejectionAdvisory>() <= 32);
+    }
+
+    #[test]
+    fn verdict_writer_rejects_swapped_duplicate_and_foreign_request_indices() {
+        for indices in [[1, 0], [0, 0], [0, 2]] {
+            let mut verdicts = Vec::<Verdict<()>>::new();
+            let mut advisories = Vec::new();
+            let mut writer = VerdictWriter::with_limit(&mut verdicts, &mut advisories, 2);
+            for index in indices {
+                writer.push(index, Verdict::Unknown);
+            }
+            assert!(writer.contract_violated());
+        }
+
+        let mut verdicts = Vec::<Verdict<()>>::new();
+        let mut advisories = Vec::new();
+        let mut writer = VerdictWriter::with_limit(&mut verdicts, &mut advisories, 2);
+        writer.push(0, Verdict::Unknown);
+        assert!(
+            writer.contract_violated(),
+            "a missing output rejects the batch"
+        );
+
+        let mut verdicts = Vec::<Verdict<()>>::new();
+        let mut advisories = Vec::new();
+        let mut writer = VerdictWriter::with_limit(&mut verdicts, &mut advisories, 2);
+        writer.push(0, Verdict::Unknown);
+        writer.push(1, Verdict::Unknown);
+        assert!(!writer.contract_violated());
+    }
+
+    #[test]
+    fn replay_writer_binds_each_decision_to_its_original_record() {
+        for indices in [[1, 0], [0, 0], [0, 2]] {
+            let mut replayed = Vec::new();
+            let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, 2);
+            for index in indices {
+                writer.push(index, true);
+            }
+            assert!(writer.contract_violated());
+        }
+
+        let mut replayed = Vec::new();
+        let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, 2);
+        writer.push(0, true);
+        assert!(
+            writer.contract_violated(),
+            "a missing replay rejects the batch"
+        );
+
+        let mut replayed = Vec::new();
+        let mut writer = ReplayVerdictWriter::with_limit(&mut replayed, 2);
+        writer.push(0, true);
+        writer.push(1, false);
+        assert!(!writer.contract_violated());
+        assert_eq!(replayed, [true, false]);
+    }
 }

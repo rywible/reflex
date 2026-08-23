@@ -1,5 +1,6 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use reflex::{
@@ -58,7 +59,7 @@ fn verification_budget_exhaustion_is_a_successful_completion() {
 
 #[test]
 fn durable_preflight_does_not_refuse_a_checkpoint_that_fits() {
-    let durable_bytes = 5 * 1024;
+    let durable_bytes = 8 * 1024;
     let bundle_path = std::env::temp_dir().join(format!(
         "reflex-durable-preflight-{}-{}.bundle",
         std::process::id(),
@@ -402,7 +403,7 @@ fn session_runs_inside_its_bounded_worker_set() {
         SeedScope::one(Expression::input()),
         ResourceEnvelope::new(
             NonZeroUsize::new(2).unwrap(),
-            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            NonZeroU64::new(32 * 1024 * 1024).unwrap(),
             NonZeroU64::new(16 * 1024 * 1024).unwrap(),
             NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
             NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
@@ -429,6 +430,36 @@ fn session_runs_inside_its_bounded_worker_set() {
     std::fs::remove_file(bundle_path).ok();
 }
 
+fn durable_budget_request(
+    target: PathBuf,
+    durable_bytes: NonZeroU64,
+    verification_requests: NonZeroU64,
+) -> ImprovementRequest<BitVecDomain> {
+    let goal = |direction| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, direction));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        OptimizationGoal::new([], objectives, preference, None).unwrap()
+    };
+    ImprovementRequest::new(
+        GoalSet::try_from_iter([goal(Direction::Minimize), goal(Direction::Maximize)]).unwrap(),
+        SeedScope::one(Expression::xor(
+            Expression::input(),
+            Expression::constant(0),
+        )),
+        ResourceEnvelope::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+            durable_bytes,
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+            verification_requests,
+        ),
+        BundlePlan::Fresh { target },
+    )
+    .unwrap()
+}
+
 #[test]
 fn durable_budget_rejects_an_uncheckpointable_frontier_atomically() {
     let bundle_path = std::env::temp_dir().join(format!(
@@ -436,58 +467,37 @@ fn durable_budget_rejects_an_uncheckpointable_frontier_atomically() {
         std::process::id(),
         std::thread::current().name().unwrap_or("unnamed")
     ));
-    let goal = |direction| {
-        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, direction));
-        let preference =
-            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
-        OptimizationGoal::new([], objectives, preference, None).unwrap()
-    };
-    let baseline_request = ImprovementRequest::new(
-        GoalSet::one(goal(Direction::Minimize)),
-        SeedScope::one(Expression::xor(
-            Expression::input(),
-            Expression::constant(0),
-        )),
-        ResourceEnvelope::new(
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
-            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
-            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
-            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
-            NonZeroU64::new(1).unwrap(),
-        ),
-        BundlePlan::Fresh {
-            target: bundle_path.clone(),
-        },
-    )
-    .unwrap();
+    let baseline_request = durable_budget_request(
+        bundle_path.clone(),
+        NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+        NonZeroU64::new(1).unwrap(),
+    );
     improve(BitVecDomain::unary_u8(), baseline_request, |_| {
         ControlFlow::Continue(())
     })
     .unwrap();
     let baseline = std::fs::read(&bundle_path).unwrap();
+    let below_baseline_path = bundle_path.with_extension("below-baseline.bundle");
+    let below_baseline_request = durable_budget_request(
+        below_baseline_path.clone(),
+        NonZeroU64::new((baseline.len() as u64).saturating_sub(1)).unwrap(),
+        NonZeroU64::new(1).unwrap(),
+    );
+    let below_baseline = improve(BitVecDomain::unary_u8(), below_baseline_request, |_| {
+        ControlFlow::Continue(())
+    });
+
+    assert!(
+        matches!(below_baseline, Err(reflex::SessionError::Resource))
+            && !below_baseline_path.exists(),
+        "one byte below the exact verified baseline remains unaffordable"
+    );
     let durable_limit = NonZeroU64::new(baseline.len() as u64).unwrap();
-    let goals =
-        GoalSet::try_from_iter([goal(Direction::Minimize), goal(Direction::Maximize)]).unwrap();
-    let request = ImprovementRequest::new(
-        goals,
-        SeedScope::one(Expression::xor(
-            Expression::input(),
-            Expression::constant(0),
-        )),
-        ResourceEnvelope::new(
-            NonZeroUsize::new(1).unwrap(),
-            NonZeroU64::new(16 * 1024 * 1024).unwrap(),
-            durable_limit,
-            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
-            NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
-            NonZeroU64::new(10_000).unwrap(),
-        ),
-        BundlePlan::Fresh {
-            target: bundle_path.clone(),
-        },
-    )
-    .unwrap();
+    let request = durable_budget_request(
+        bundle_path.clone(),
+        durable_limit,
+        NonZeroU64::new(10_000).unwrap(),
+    );
     let mut updates = 0;
 
     let outcome = improve(BitVecDomain::unary_u8(), request, |_| {
@@ -548,6 +558,62 @@ fn resident_limit_rejects_a_mandatory_state_that_cannot_fit() {
 }
 
 #[test]
+fn exact_initial_checkpoint_peak_is_admitted_without_counting_it_twice() {
+    let directory = std::env::temp_dir();
+    let baseline_path = directory.join(format!(
+        "reflex-initial-peak-baseline-{}-{}.bundle",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    let exact_path = baseline_path.with_extension("exact.bundle");
+    let under_path = baseline_path.with_extension("under.bundle");
+    let make_request = |resident_bytes, target| {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::one(Expression::input()),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU64::new(resident_bytes).unwrap(),
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(5)).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            ),
+            BundlePlan::Fresh { target },
+        )
+        .unwrap()
+    };
+    let baseline = improve(
+        BitVecDomain::unary_u8(),
+        make_request(16 * 1024 * 1024, baseline_path.clone()),
+        |_| ControlFlow::Break(()),
+    )
+    .unwrap();
+    let exact_peak = baseline.usage().resident_bytes;
+
+    let exact = improve(
+        BitVecDomain::unary_u8(),
+        make_request(exact_peak, exact_path.clone()),
+        |_| ControlFlow::Break(()),
+    )
+    .unwrap();
+
+    assert_eq!(exact.usage().resident_bytes, exact_peak);
+    let under = improve(
+        BitVecDomain::unary_u8(),
+        make_request(exact_peak - 1, under_path.clone()),
+        |_| ControlFlow::Break(()),
+    );
+    assert!(matches!(under, Err(SessionError::Resource)));
+    std::fs::remove_file(baseline_path).ok();
+    std::fs::remove_file(exact_path).ok();
+    std::fs::remove_file(under_path).ok();
+}
+
+#[test]
 fn resident_limit_rejects_growth_before_frontier_admission() {
     let baseline_path = std::env::temp_dir().join(format!(
         "reflex-resident-baseline-{}-{}.bundle",
@@ -587,9 +653,13 @@ fn resident_limit_rejects_growth_before_frontier_admission() {
     )
     .unwrap();
 
+    // The baseline is the exact one-seed seal peak. Leave explicit room for
+    // constructing the larger-budget Session's fixed intelligence inventory;
+    // the assertion below still requires Candidate growth itself to be refused.
+    let resident_limit = baseline.usage().resident_bytes.saturating_add(64 * 1024);
     let outcome = improve(
         BitVecDomain::unary_u8(),
-        request(baseline.usage().resident_bytes, 10_000, target_path.clone()),
+        request(resident_limit, 10_000, target_path.clone()),
         |_| ControlFlow::Continue(()),
     )
     .unwrap();
@@ -599,7 +669,7 @@ fn resident_limit_rejects_growth_before_frontier_admission() {
             && outcome.pareto().artifacts().len() == 1
             && outcome.pareto().artifacts()[0].artifact().node_count() == 3
             && outcome.usage().verification_requests == 1
-            && outcome.usage().resident_bytes <= baseline.usage().resident_bytes,
+            && outcome.usage().resident_bytes <= resident_limit,
         "working growth is rejected before another Candidate batch is scheduled"
     );
     std::fs::remove_file(baseline_path).ok();

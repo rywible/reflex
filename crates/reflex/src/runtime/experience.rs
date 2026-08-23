@@ -2,11 +2,12 @@ use std::collections::{BTreeSet, HashMap};
 
 use sha2::Digest;
 
-use crate::domain::{DomainDefinition, ProposalFeatures, ProposalProvenance};
+use crate::domain::{DomainDefinition, ProposalFeatures, ProposalProvenance, RejectionAdvisory};
+use crate::intelligence::KnowledgeCompilationShape;
 use crate::knowledge::{DerivationObservation, KnowledgeRevision};
-use crate::learning::{
-    AttemptObservation, ConsequenceKind, ConsequenceObservation, Features, VerdictTarget,
-};
+#[cfg(feature = "internal-experiments")]
+use crate::learning::{AttemptObservation, VerdictTarget};
+use crate::learning::{ConsequenceKind, ConsequenceObservation, Features};
 use crate::measurement::MeasurementSpace;
 use crate::session::{ArtifactKey, SessionError, VerifiedArtifact};
 
@@ -20,9 +21,13 @@ const FLOAT_BYTES: usize = 4;
 const VERDICT_BYTES: usize = 1;
 const VERIFICATION_REQUEST_BYTES: usize = 4;
 const EPOCH_BYTES: usize = 8;
+const REJECTION_ADVISORY_BYTES: usize = 26;
+const CAUSAL_PARENT_BYTES: usize = 33;
 const FIXED_ENTRY_BYTES: usize = DIGEST_BYTES * 5
     + SIZED_LENGTH_BYTES * 2
     + VERDICT_BYTES
+    + REJECTION_ADVISORY_BYTES
+    + CAUSAL_PARENT_BYTES
     + 1
     + crate::domain::PROPOSAL_FEATURE_COUNT * FLOAT_BYTES
     + 1
@@ -32,6 +37,13 @@ const FIXED_ENTRY_BYTES: usize = DIGEST_BYTES * 5
 const FIXED_CONSEQUENCE_BYTES: usize = DIGEST_BYTES + 1;
 const MINIMUM_MEASUREMENT_BYTES: usize = DIGEST_BYTES + SIZED_LENGTH_BYTES * 2;
 const FIXED_CANDIDATE_FATE_BYTES: usize = DIGEST_BYTES * 4 + 8 * 2 + 4 * 6 + 1 + 1 + 1;
+
+#[derive(Clone, Copy)]
+enum ExperienceEncoding {
+    LegacyV20,
+    PreActionV23,
+    Current,
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ExperienceVerdict {
@@ -47,8 +59,10 @@ pub(super) struct ExperienceEntry {
     pub(super) claim_digest: [u8; 32],
     pub(super) origin_key: ArtifactKey,
     pub(super) parent_key: ArtifactKey,
+    pub(super) causal_parent_key: Option<ArtifactKey>,
     pub(super) canonical_candidate: Vec<u8>,
     pub(super) verdict: ExperienceVerdict,
+    pub(super) rejection_advisory: Option<RejectionAdvisory>,
     pub(super) allocation_queue: AllocationQueue,
     pub(super) operator_symbol: Vec<u8>,
     pub(super) proposal_features: ProposalFeatures,
@@ -247,25 +261,7 @@ pub(super) struct ExperienceLedger {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct EntryCheckpoint {
-    len: usize,
-    capacity: usize,
-}
-
-#[derive(Clone, Copy)]
 pub(super) struct ConsequenceCheckpoint {
-    len: usize,
-    capacity: usize,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CandidateFateCheckpoint {
-    len: usize,
-    capacity: usize,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct MeasurementCheckpoint {
     len: usize,
     capacity: usize,
 }
@@ -312,35 +308,11 @@ impl ExperienceLedger {
         &self.candidate_fates
     }
 
-    pub(super) fn checkpoint_candidate_fates(&self) -> CandidateFateCheckpoint {
-        CandidateFateCheckpoint {
-            len: self.candidate_fates.len(),
-            capacity: self.candidate_fates.capacity(),
-        }
-    }
-
-    pub(super) fn rollback_candidate_fates(&mut self, checkpoint: CandidateFateCheckpoint) {
-        self.candidate_fates.truncate(checkpoint.len);
-        self.candidate_fates.shrink_to(checkpoint.capacity);
-    }
-
     pub(super) fn append_candidate_fates(
         &mut self,
         fates: impl IntoIterator<Item = CandidateFateObservation>,
     ) {
         self.candidate_fates.extend(fates);
-    }
-
-    pub(super) fn checkpoint_measurements(&self) -> MeasurementCheckpoint {
-        MeasurementCheckpoint {
-            len: self.measurements.len(),
-            capacity: self.measurements.capacity(),
-        }
-    }
-
-    pub(super) fn rollback_measurements(&mut self, checkpoint: MeasurementCheckpoint) {
-        self.measurements.truncate(checkpoint.len);
-        self.measurements.shrink_to(checkpoint.capacity);
     }
 
     #[cfg(feature = "internal-experiments")]
@@ -354,9 +326,32 @@ impl ExperienceLedger {
     ///
     /// Domain-dependent semantic validation deliberately remains with restart,
     /// but no caller needs to know byte offsets or record widths.
-    pub(super) fn decode(mut input: &[u8]) -> Result<Self, ()> {
+    pub(super) fn decode(input: &[u8]) -> Result<Self, ()> {
+        Self::decode_with_encoding(input, ExperienceEncoding::Current)
+    }
+
+    pub(super) fn decode_legacy_v20(input: &[u8]) -> Result<Self, ()> {
+        Self::decode_with_encoding(input, ExperienceEncoding::LegacyV20)
+    }
+
+    pub(super) fn decode_pre_action_v23(input: &[u8]) -> Result<Self, ()> {
+        Self::decode_with_encoding(input, ExperienceEncoding::PreActionV23)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exact-consuming decoder keeps every frozen Experience framing and canonical field check in a single auditable path"
+    )]
+    fn decode_with_encoding(mut input: &[u8], encoding: ExperienceEncoding) -> Result<Self, ()> {
         let entry_count = read_usize(&mut input)?;
-        if entry_count > input.len().saturating_div(FIXED_ENTRY_BYTES) {
+        let minimum_entry_bytes = match encoding {
+            ExperienceEncoding::LegacyV20 => {
+                FIXED_ENTRY_BYTES - REJECTION_ADVISORY_BYTES - CAUSAL_PARENT_BYTES
+            }
+            ExperienceEncoding::PreActionV23 => FIXED_ENTRY_BYTES - CAUSAL_PARENT_BYTES,
+            ExperienceEncoding::Current => FIXED_ENTRY_BYTES,
+        };
+        if entry_count > input.len().saturating_div(minimum_entry_bytes) {
             return Err(());
         }
         let mut entries = Vec::with_capacity(entry_count);
@@ -373,12 +368,32 @@ impl ExperienceLedger {
                 3 => ExperienceVerdict::Unknown,
                 _ => return Err(()),
             };
+            let rejection_advisory = match encoding {
+                ExperienceEncoding::LegacyV20 => None,
+                ExperienceEncoding::PreActionV23 | ExperienceEncoding::Current => {
+                    decode_rejection_advisory(&mut input)?
+                }
+            };
+            if rejection_advisory.is_some() && verdict != ExperienceVerdict::Refuted {
+                return Err(());
+            }
             let allocation_queue = match take(&mut input, 1)?[0] {
                 1 => AllocationQueue::ProtectedOrigin,
                 2 => AllocationQueue::ProtectedDerived,
                 3 => AllocationQueue::Learned,
                 4 => AllocationQueue::Bootstrap,
                 _ => return Err(()),
+            };
+            let causal_parent_key = if matches!(encoding, ExperienceEncoding::Current) {
+                let present = take(&mut input, 1)?[0];
+                let identity = read_digest(&mut input)?;
+                match present {
+                    0 if identity == [0; 32] => None,
+                    1 => Some(ArtifactKey(identity)),
+                    _ => return Err(()),
+                }
+            } else {
+                None
             };
             let operator_symbol = read_sized(&mut input)?.to_vec();
             let mut proposal_values = [0.0; crate::domain::PROPOSAL_FEATURE_COUNT];
@@ -402,8 +417,10 @@ impl ExperienceLedger {
                 claim_digest,
                 origin_key,
                 parent_key,
+                causal_parent_key,
                 canonical_candidate,
                 verdict,
+                rejection_advisory,
                 allocation_queue,
                 operator_symbol,
                 proposal_features: ProposalFeatures::new(proposal_values),
@@ -450,18 +467,6 @@ impl ExperienceLedger {
         (&self.entries, &mut self.consequences)
     }
 
-    pub(super) fn checkpoint_entries(&self) -> EntryCheckpoint {
-        EntryCheckpoint {
-            len: self.entries.len(),
-            capacity: self.entries.capacity(),
-        }
-    }
-
-    pub(super) fn rollback_entries(&mut self, checkpoint: EntryCheckpoint) {
-        self.entries.truncate(checkpoint.len);
-        self.entries.shrink_to(checkpoint.capacity);
-    }
-
     pub(super) fn checkpoint_consequences(&self) -> ConsequenceCheckpoint {
         ConsequenceCheckpoint {
             len: self.consequences.len(),
@@ -476,6 +481,10 @@ impl ExperienceLedger {
 
     pub(super) fn append_entries(&mut self, entries: impl IntoIterator<Item = ExperienceEntry>) {
         for entry in entries {
+            assert!(
+                entry.rejection_advisory.is_none() || entry.verdict == ExperienceVerdict::Refuted,
+                "a Rejection Advisory can accompany only a Refuted Verdict"
+            );
             if let Some(existing) = self
                 .entries
                 .iter()
@@ -558,7 +567,7 @@ impl ExperienceLedger {
                 Ok(DerivationObservation {
                     id: entry.attempt_id,
                     artifact: entry.candidate_key.0,
-                    parent: entry.parent_key.0,
+                    parent: entry.causal_parent_key.unwrap_or(entry.parent_key).0,
                     claim: entry.claim_digest,
                     operator_identity: entry.operator_symbol.clone(),
                     operator_steps,
@@ -568,6 +577,34 @@ impl ExperienceLedger {
             .collect()
     }
 
+    pub(super) fn derivation_shape<E>(
+        &self,
+        knowledge: &KnowledgeRevision,
+        primitive_symbols: &BTreeSet<Vec<u8>>,
+    ) -> Result<KnowledgeCompilationShape, SessionError<E>> {
+        let mut shape = KnowledgeCompilationShape::default();
+        for entry in &self.entries {
+            if primitive_symbols.contains(&entry.operator_symbol) {
+                shape
+                    .observe(
+                        &entry.operator_symbol,
+                        std::slice::from_ref(&entry.operator_symbol),
+                    )
+                    .map_err(|_| SessionError::Resource)?;
+            } else {
+                let steps = knowledge
+                    .resolve_operator(&entry.operator_symbol)
+                    .map(crate::knowledge::DerivedOperator::steps)
+                    .ok_or(SessionError::CorruptBundle)?;
+                shape
+                    .observe(&entry.operator_symbol, steps)
+                    .map_err(|_| SessionError::Resource)?;
+            }
+        }
+        Ok(shape)
+    }
+
+    #[cfg(feature = "internal-experiments")]
     pub(super) fn attempts(&self) -> Vec<AttemptObservation> {
         let traces = self
             .candidate_fates
@@ -610,7 +647,37 @@ impl ExperienceLedger {
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(8 + self.entries.len() * FIXED_ENTRY_BYTES);
+        self.encode_with_encoding(ExperienceEncoding::Current)
+    }
+
+    #[cfg(test)]
+    fn encode_legacy_v20_for_test(&self) -> Vec<u8> {
+        assert!(
+            self.entries
+                .iter()
+                .all(|entry| entry.rejection_advisory.is_none()),
+            "v20 fixtures cannot contain Rejection Advisories"
+        );
+        self.encode_with_encoding(ExperienceEncoding::LegacyV20)
+    }
+
+    #[cfg(any(test, feature = "internal-experiments"))]
+    pub(super) fn encode_pre_action_v23_for_test(&self) -> Vec<u8> {
+        self.encode_with_encoding(ExperienceEncoding::PreActionV23)
+    }
+
+    fn encode_with_encoding(&self, encoding: ExperienceEncoding) -> Vec<u8> {
+        let encoded_len = match encoding {
+            ExperienceEncoding::Current => self.encoded_len(),
+            ExperienceEncoding::PreActionV23 => self.encoded_len().saturating_sub(
+                (self.entries.len() as u64).saturating_mul(CAUSAL_PARENT_BYTES as u64),
+            ),
+            ExperienceEncoding::LegacyV20 => self.encoded_len().saturating_sub(
+                (self.entries.len() as u64)
+                    .saturating_mul((REJECTION_ADVISORY_BYTES + CAUSAL_PARENT_BYTES) as u64),
+            ),
+        };
+        let mut output = Vec::with_capacity(usize::try_from(encoded_len).unwrap_or(usize::MAX));
         push_u64(&mut output, self.entries.len() as u64);
         for entry in &self.entries {
             output.extend_from_slice(&entry.attempt_id);
@@ -620,7 +687,22 @@ impl ExperienceLedger {
             output.extend_from_slice(entry.parent_key.as_bytes());
             push_bytes(&mut output, &entry.canonical_candidate);
             output.push(entry.verdict as u8);
+            if matches!(
+                encoding,
+                ExperienceEncoding::PreActionV23 | ExperienceEncoding::Current
+            ) {
+                encode_rejection_advisory(&mut output, entry.rejection_advisory);
+            }
             output.push(entry.allocation_queue as u8);
+            if matches!(encoding, ExperienceEncoding::Current) {
+                if let Some(parent) = entry.causal_parent_key {
+                    output.push(1);
+                    output.extend_from_slice(parent.as_bytes());
+                } else {
+                    output.push(0);
+                    output.extend_from_slice(&[0; 32]);
+                }
+            }
             push_bytes(&mut output, &entry.operator_symbol);
             for feature in entry.proposal_features.as_array() {
                 output.extend_from_slice(&feature.to_bits().to_le_bytes());
@@ -680,6 +762,7 @@ impl ExperienceLedger {
             output.push(fate.disposition as u8);
             output.push(fate.allocation_queue.map_or(0, |queue| queue as u8));
         }
+        debug_assert_eq!(output.len() as u64, encoded_len);
         output
     }
 
@@ -740,15 +823,6 @@ impl ExperienceLedger {
             .saturating_add(vector_bytes(&self.measurements))
             .saturating_add(vector_bytes(&self.candidate_fates))
             .saturating_add(measurement_payloads)
-    }
-
-    pub(super) fn resident_bytes_with_consequences(
-        &self,
-        consequences: &Vec<ConsequenceObservation>,
-    ) -> u64 {
-        self.resident_bytes()
-            .saturating_sub(vector_bytes(&self.consequences))
-            .saturating_add(vector_bytes(consequences))
     }
 }
 
@@ -874,6 +948,85 @@ fn decode_measurements(input: &mut &[u8]) -> Result<Vec<MeasurementObservation>,
     Ok(measurements)
 }
 
+fn encode_rejection_advisory(output: &mut Vec<u8>, rejection_advisory: Option<RejectionAdvisory>) {
+    let Some(rejection_advisory) = rejection_advisory else {
+        output.extend_from_slice(&[0; REJECTION_ADVISORY_BYTES]);
+        return;
+    };
+    output.push(1);
+    match rejection_advisory {
+        RejectionAdvisory::Counterexample {
+            input,
+            expected,
+            observed,
+        } => {
+            output.push(1);
+            output.extend_from_slice(&input.to_le_bytes());
+            output.extend_from_slice(&expected.to_le_bytes());
+            output.extend_from_slice(&observed.to_le_bytes());
+        }
+        RejectionAdvisory::MalformedArtifact => push_classified_advisory(output, 2),
+        RejectionAdvisory::MalformedClaim => push_classified_advisory(output, 3),
+        RejectionAdvisory::KernelCheckFailure => push_classified_advisory(output, 4),
+        RejectionAdvisory::ClaimMismatch => push_classified_advisory(output, 5),
+        RejectionAdvisory::ForbiddenConstruct => push_classified_advisory(output, 6),
+        RejectionAdvisory::ScopeViolation => push_classified_advisory(output, 7),
+        RejectionAdvisory::DependencyViolation => push_classified_advisory(output, 8),
+        RejectionAdvisory::AxiomViolation => push_classified_advisory(output, 9),
+        RejectionAdvisory::DependencyMismatch => push_classified_advisory(output, 10),
+    }
+}
+
+fn push_classified_advisory(output: &mut Vec<u8>, tag: u8) {
+    output.push(tag);
+    output.extend_from_slice(&[0; 24]);
+}
+
+fn decode_rejection_advisory(input: &mut &[u8]) -> Result<Option<RejectionAdvisory>, ()> {
+    let encoded = take(input, REJECTION_ADVISORY_BYTES)?;
+    match encoded[0] {
+        0 if encoded[1..].iter().all(|byte| *byte == 0) => Ok(None),
+        1 => {
+            let payload = &encoded[2..];
+            let classified = |advisory| {
+                payload
+                    .iter()
+                    .all(|byte| *byte == 0)
+                    .then_some(Some(advisory))
+                    .ok_or(())
+            };
+            match encoded[1] {
+                1 => Ok(Some(RejectionAdvisory::Counterexample {
+                    input: read_advisory_u64(payload, 0)?,
+                    expected: read_advisory_u64(payload, 8)?,
+                    observed: read_advisory_u64(payload, 16)?,
+                })),
+                2 => classified(RejectionAdvisory::MalformedArtifact),
+                3 => classified(RejectionAdvisory::MalformedClaim),
+                4 => classified(RejectionAdvisory::KernelCheckFailure),
+                5 => classified(RejectionAdvisory::ClaimMismatch),
+                6 => classified(RejectionAdvisory::ForbiddenConstruct),
+                7 => classified(RejectionAdvisory::ScopeViolation),
+                8 => classified(RejectionAdvisory::DependencyViolation),
+                9 => classified(RejectionAdvisory::AxiomViolation),
+                10 => classified(RejectionAdvisory::DependencyMismatch),
+                _ => Err(()),
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+fn read_advisory_u64(payload: &[u8], offset: usize) -> Result<u64, ()> {
+    Ok(u64::from_le_bytes(
+        payload
+            .get(offset..offset + 8)
+            .ok_or(())?
+            .try_into()
+            .map_err(|_| ())?,
+    ))
+}
+
 fn read_finite_features<const N: usize>(
     input: &mut &[u8],
     output: &mut [f32; N],
@@ -955,8 +1108,17 @@ mod tests {
                     claim_digest: [marker; 32],
                     origin_key: ArtifactKey([marker; 32]),
                     parent_key: ArtifactKey([marker; 32]),
+                    causal_parent_key: (verdict == ExperienceVerdict::Accepted)
+                        .then_some(ArtifactKey([0x71; 32])),
                     canonical_candidate: vec![marker],
                     verdict,
+                    rejection_advisory: (verdict == ExperienceVerdict::Refuted).then_some(
+                        RejectionAdvisory::Counterexample {
+                            input: 7,
+                            expected: 11,
+                            observed: 13,
+                        },
+                    ),
                     allocation_queue: AllocationQueue::Bootstrap,
                     operator_symbol: vec![marker],
                     proposal_features: ProposalFeatures::default(),
@@ -1083,6 +1245,128 @@ mod tests {
         push_bytes(&mut hostile_value_count, b"environment");
         push_u64(&mut hostile_value_count, u64::MAX);
         assert!(ExperienceLedger::decode(&hostile_value_count).is_err());
+
+        let mut invalid_entry = ledger.entries()[0].clone();
+        invalid_entry.rejection_advisory = Some(RejectionAdvisory::MalformedArtifact);
+        let invalid_ledger =
+            ExperienceLedger::from_parts(vec![invalid_entry], Vec::new(), Vec::new(), Vec::new());
+        assert!(ExperienceLedger::decode(&invalid_ledger.encode()).is_err());
+    }
+
+    #[test]
+    fn rejection_advisory_codec_is_canonical_and_rejects_corruption() {
+        let advisories = [
+            None,
+            Some(RejectionAdvisory::Counterexample {
+                input: 7,
+                expected: 11,
+                observed: 13,
+            }),
+            Some(RejectionAdvisory::MalformedArtifact),
+            Some(RejectionAdvisory::MalformedClaim),
+            Some(RejectionAdvisory::KernelCheckFailure),
+            Some(RejectionAdvisory::ClaimMismatch),
+            Some(RejectionAdvisory::ForbiddenConstruct),
+            Some(RejectionAdvisory::ScopeViolation),
+            Some(RejectionAdvisory::DependencyViolation),
+            Some(RejectionAdvisory::AxiomViolation),
+            Some(RejectionAdvisory::DependencyMismatch),
+        ];
+        for advisory in advisories {
+            let mut encoded = Vec::new();
+            encode_rejection_advisory(&mut encoded, advisory);
+            assert_eq!(encoded.len(), REJECTION_ADVISORY_BYTES);
+            let mut input = encoded.as_slice();
+            assert_eq!(decode_rejection_advisory(&mut input), Ok(advisory));
+            assert!(input.is_empty());
+        }
+
+        let mut noncanonical_absence = [0; REJECTION_ADVISORY_BYTES];
+        noncanonical_absence[1] = 1;
+        assert!(decode_rejection_advisory(&mut noncanonical_absence.as_slice()).is_err());
+
+        let mut unknown_tag = [0; REJECTION_ADVISORY_BYTES];
+        unknown_tag[0] = 1;
+        unknown_tag[1] = u8::MAX;
+        assert!(decode_rejection_advisory(&mut unknown_tag.as_slice()).is_err());
+
+        let mut classified_with_payload = [0; REJECTION_ADVISORY_BYTES];
+        classified_with_payload[0] = 1;
+        classified_with_payload[1] = 2;
+        classified_with_payload[2] = 1;
+        assert!(decode_rejection_advisory(&mut classified_with_payload.as_slice()).is_err());
+    }
+
+    #[test]
+    fn legacy_v20_experience_upgrades_only_through_its_frozen_decoder() {
+        let entry = ExperienceEntry {
+            attempt_id: [1; 32],
+            candidate_key: ArtifactKey([2; 32]),
+            claim_digest: [3; 32],
+            origin_key: ArtifactKey([4; 32]),
+            parent_key: ArtifactKey([5; 32]),
+            causal_parent_key: None,
+            canonical_candidate: vec![6],
+            verdict: ExperienceVerdict::Refuted,
+            rejection_advisory: None,
+            allocation_queue: AllocationQueue::Bootstrap,
+            operator_symbol: vec![7],
+            proposal_features: ProposalFeatures::default(),
+            proposal_provenance: None,
+            features: Features([0.0; crate::learning::FEATURE_COUNT]),
+            verification_requests: 1,
+            epoch: 8,
+        };
+        let ledger = ExperienceLedger::from_parts(vec![entry], Vec::new(), Vec::new(), Vec::new());
+        let legacy = ledger.encode_legacy_v20_for_test();
+        assert!(ExperienceLedger::decode(&legacy).is_err());
+
+        let upgraded = ExperienceLedger::decode_legacy_v20(&legacy).unwrap();
+        assert!(upgraded.entries() == ledger.entries());
+        let current = upgraded.encode();
+        assert!(ExperienceLedger::decode_legacy_v20(&current).is_err());
+        assert_eq!(
+            ExperienceLedger::decode(&current).unwrap().encode(),
+            current
+        );
+    }
+
+    #[test]
+    fn pre_action_v23_experience_defaults_the_absent_causal_parent() {
+        let entry = ExperienceEntry {
+            attempt_id: [1; 32],
+            candidate_key: ArtifactKey([2; 32]),
+            claim_digest: [3; 32],
+            origin_key: ArtifactKey([4; 32]),
+            parent_key: ArtifactKey([5; 32]),
+            causal_parent_key: Some(ArtifactKey([6; 32])),
+            canonical_candidate: vec![7],
+            verdict: ExperienceVerdict::Refuted,
+            rejection_advisory: Some(RejectionAdvisory::MalformedArtifact),
+            allocation_queue: AllocationQueue::Bootstrap,
+            operator_symbol: vec![8],
+            proposal_features: ProposalFeatures::default(),
+            proposal_provenance: None,
+            features: Features([0.0; crate::learning::FEATURE_COUNT]),
+            verification_requests: 1,
+            epoch: 9,
+        };
+        let ledger = ExperienceLedger::from_parts(vec![entry], Vec::new(), Vec::new(), Vec::new());
+        let pre_action = ledger.encode_pre_action_v23_for_test();
+        assert!(ExperienceLedger::decode(&pre_action).is_err());
+
+        let upgraded = ExperienceLedger::decode_pre_action_v23(&pre_action).unwrap();
+        assert_eq!(upgraded.entries()[0].causal_parent_key, None);
+        assert_eq!(
+            upgraded.entries()[0].rejection_advisory,
+            Some(RejectionAdvisory::MalformedArtifact)
+        );
+        let current = upgraded.encode();
+        assert!(ExperienceLedger::decode_pre_action_v23(&current).is_err());
+        assert_eq!(
+            ExperienceLedger::decode(&current).unwrap().encode(),
+            current
+        );
     }
 
     #[test]

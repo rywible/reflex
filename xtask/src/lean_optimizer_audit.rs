@@ -26,19 +26,19 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    AnyError, HostEnvironment, HostIsolation, HostIsolationPolicy, capture_child_host_isolated,
-    completion_name, environment, hash_file, hash_json, hex, inherited_host_isolation,
-    parse_flag_values, require_absent, require_clean, require_release,
+    AnyError, HostEnvironment, HostIsolation, LEAN_PUBLIC_NESTED_RESIDENT_LIMIT,
+    LEAN_PUBLIC_NESTED_WALL_LIMIT, capture_large_campaign_child, completion_name, environment,
+    hash_file, hash_json, hex, inherited_host_isolation, parse_flag_values, require_absent,
+    require_clean, require_release,
 };
 
 const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v27";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
-const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const SUPERVISOR_RESIDENT_BYTES: u64 = LEAN_PUBLIC_NESTED_RESIDENT_LIMIT;
 const HOST_CPU_RESERVE: usize = 1;
 const WORKER_THREADS: usize = 6;
 const DURABLE_BYTES: u64 = 1024 * 1024 * 1024;
-const SUPERVISOR_WALL_LIMIT: Duration = Duration::from_mins(35);
+const SUPERVISOR_WALL_LIMIT: Duration = LEAN_PUBLIC_NESTED_WALL_LIMIT;
 const SUPERVISOR_CAPABILITY: &str = "reflex-lean-public-optimizer-supervisor-v1";
 const PRIMARY_PROOF_NODE_LIMIT: usize = 100_000;
 const SELECTION_POOL_MULTIPLIER: usize = 8;
@@ -418,16 +418,13 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
         std::process::id()
     ));
     let phase_report_prefix = parsed.work.join("runtime-phase");
-    let (capture, isolation) = capture_child_host_isolated(
+    let isolation = inherited_host_isolation()?;
+    let capture = capture_large_campaign_child(
         &executable,
         &child_arguments,
         &evidence_prefix,
-        SUPERVISOR_WALL_LIMIT,
-        HostIsolationPolicy {
-            memory_limit_bytes: SUPERVISOR_RESIDENT_BYTES,
-            memory_reserve_bytes: HOST_MEMORY_RESERVE_BYTES,
-            cpu_reserve: HOST_CPU_RESERVE,
-        },
+        Some(SUPERVISOR_WALL_LIMIT),
+        Some(SUPERVISOR_RESIDENT_BYTES),
         &[
             (
                 OsString::from("REFLEX_LEAN_OPTIMIZER_SUPERVISOR_CAPABILITY"),
@@ -439,14 +436,20 @@ pub fn development(arguments: &[String]) -> Result<(), AnyError> {
             ),
         ],
     )?;
-    if capture.status.success() && !capture.timed_out && !capture.resident_limit_exceeded {
+    if capture.status.success()
+        && !capture.timed_out
+        && !capture.resident_limit_exceeded
+        && !capture.output_limit_exceeded
+    {
         print!("{}", capture.stdout);
         return Ok(());
     }
     let failure = if capture.timed_out {
         "exceeded its 35-minute supervised wall limit"
     } else if capture.resident_limit_exceeded {
-        "reached its 40-GiB supervised resident boundary"
+        "reached its 39.5-GiB supervised resident boundary"
+    } else if capture.output_limit_exceeded {
+        "exceeded its bounded diagnostic-output allowance"
     } else {
         "failed inside its hard host-isolated boundary"
     };

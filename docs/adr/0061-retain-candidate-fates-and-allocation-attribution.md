@@ -4,6 +4,8 @@ The Experience Ledger retains a compact Candidate Fate for every generated Candi
 
 This makes the policy that actually ran attributable and replayable without exposing experimental controls through the public Improvement Session or Domain Definition interfaces. Reordering the historically selected, verifier-labeled subset remains an off-policy diagnostic, not causal evidence for a deployed policy. Causal claims require an equal-budget online comparison such as the Reference Domain treatment. The Runtime Controller remains the sole Allocation authority, and the Verification Kernel remains the sole correctness authority.
 
+Candidate-level causal settlements therefore record one Verification request but zero CPU when the Kernel reports only a shared batch duration. The shared total remains attached to every fate together with the exact batch size so diagnostics can reconstruct the batch without inventing a per-Candidate measurement. Only an explicitly measured or mechanically induced resource consequence, such as CPU saved by a counterfactual arm, may train an individual Verification-cost or Potential target.
+
 ## Considered options
 
 Inferring fates from Verified Experience loses Candidates filtered or deferred before Verification. Reconstructing queue attribution from final model scores cannot reproduce the policy that actually ran, especially after Model or Knowledge Revision changes. Keeping traces only in process telemetry would be cheaper, but would make retained-state ablations and Operational Promotion evidence irreproducible after restart.

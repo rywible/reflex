@@ -245,7 +245,7 @@ fn run_assignment(
     phase_report_prefix: Option<&Path>,
 ) -> Result<RecordedRun, AnyError> {
     let arguments = [
-        OsString::from("baseline-child"),
+        OsString::from("performance-child"),
         OsString::from("--workers"),
         OsString::from(assignment.worker_threads.to_string()),
         OsString::from("--storage"),
@@ -276,6 +276,11 @@ fn run_assignment(
         (
             None,
             Some("child exceeded the 30-second smoke timeout".into()),
+        )
+    } else if capture.output_limit_exceeded {
+        (
+            None,
+            Some("child exceeded the bounded diagnostic-output allowance".into()),
         )
     } else {
         parse_child_output(capture.status.success(), &capture.stdout, &capture.stderr)

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -19,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    AnyError, HostEnvironment, capture_child_bounded, duration_ns, environment, hash_file,
-    hash_json, parse_flag_values, peak_process_resident_bytes, require_absent, require_clean,
-    require_release,
+    AnyError, HostEnvironment, LEAN_TEMPORAL_NESTED_RESIDENT_LIMIT,
+    LEAN_TEMPORAL_NESTED_WALL_LIMIT, capture_large_campaign_child, duration_ns, environment,
+    hash_file, hash_json, parse_flag_values, peak_process_resident_bytes, require_absent,
+    require_clean, require_release,
 };
 
 const SCHEMA: &str = "reflex-lean-temporal-audit-result-v1";
@@ -29,9 +31,10 @@ const FREEZE_SCHEMA: &str = "reflex-lean-temporal-audit-freeze-v1";
 const LOCK_SCHEMA: &str = "reflex-lean-temporal-audit-lock-v1";
 const REPLAY_PER_HEAD: usize = 16;
 const RELATIONSHIP_LIMIT: usize = 64;
-const WALL_LIMIT: Duration = Duration::from_hours(24);
-const RESIDENT_LIMIT: u64 = 48 * 1024 * 1024 * 1024;
+const WALL_LIMIT: Duration = LEAN_TEMPORAL_NESTED_WALL_LIMIT;
+const RESIDENT_LIMIT: u64 = LEAN_TEMPORAL_NESTED_RESIDENT_LIMIT;
 const SUPERVISOR_CAPABILITY: &str = "reflex-lean-temporal-audit-supervisor-v1";
+static DURABLE_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const CPU_CHECKPOINT_SECONDS: [u64; 4] = [3_600, 14_400, 57_600, 230_400];
 const IN_PROCESS_LANES: usize = 6;
 const V1_EXECUTION_ENABLED: bool = false;
@@ -361,17 +364,32 @@ struct ExecutionReceipt<'a> {
 }
 
 #[derive(Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the sealed report records independent supervisor failure evidence explicitly"
+)]
 struct FailureReport<'a> {
     schema: &'static str,
     status: &'static str,
     error: &'a str,
     timed_out: bool,
     resident_limit_exceeded: bool,
+    boundary: FailureBoundary,
     child_exit_code: Option<i32>,
     child_stdout: &'a str,
     child_stderr: &'a str,
+    child_stdout_truncated: bool,
+    child_stderr_truncated: bool,
+    output_limit_exceeded: bool,
     process_tree_cpu_ns: u64,
     peak_process_tree_resident_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct FailureBoundary {
+    cgroup_oom_killed: bool,
+    cleanup_failed: bool,
+    evidence_failed: bool,
 }
 
 #[derive(Deserialize)]
@@ -472,7 +490,7 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
     require_release("lean-temporal-audit-confirm")?;
     let host = environment()?;
     require_clean(&host, SCHEMA)?;
-    if host.available_parallelism < IN_PROCESS_LANES + 2 {
+    if host.available_parallelism < IN_PROCESS_LANES + 1 {
         return Err("Lean Temporal Audit host cannot supply its registered eight lanes".into());
     }
     parse(arguments)?;
@@ -488,25 +506,31 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
         "reflex-lean-temporal-audit-supervisor-{}",
         std::process::id()
     ));
-    let capture = capture_child_bounded(
+    let capture = capture_large_campaign_child(
         &executable,
         &child_arguments,
         &evidence_prefix,
-        WALL_LIMIT,
-        RESIDENT_LIMIT,
+        Some(WALL_LIMIT),
+        Some(RESIDENT_LIMIT),
         &[(
             OsString::from("REFLEX_LEAN_AUDIT_SUPERVISOR_CAPABILITY"),
             OsString::from(SUPERVISOR_CAPABILITY),
         )],
     )?;
-    if capture.status.success() && !capture.timed_out && !capture.resident_limit_exceeded {
+    if capture.status.success()
+        && !capture.timed_out
+        && !capture.resident_limit_exceeded
+        && !capture.output_limit_exceeded
+    {
         print!("{}", capture.stdout);
         return Ok(());
     }
     let error = if capture.timed_out {
         "Lean Temporal Audit exceeded its 24-hour wall limit"
     } else if capture.resident_limit_exceeded {
-        "Lean Temporal Audit exceeded its 48-GiB combined resident limit"
+        "Lean Temporal Audit exceeded its 47.5-GiB combined resident limit"
+    } else if capture.output_limit_exceeded {
+        "Lean Temporal Audit exceeded its bounded diagnostic-output allowance"
     } else {
         "Lean Temporal Audit child failed"
     };
@@ -516,13 +540,70 @@ pub fn confirm(arguments: &[String]) -> Result<(), AnyError> {
         error,
         timed_out: capture.timed_out,
         resident_limit_exceeded: capture.resident_limit_exceeded,
+        boundary: FailureBoundary {
+            cgroup_oom_killed: capture.boundary.cgroup_oom_killed,
+            cleanup_failed: capture.boundary.cleanup_failed,
+            evidence_failed: capture.boundary.evidence_failed,
+        },
         child_exit_code: capture.status.code(),
         child_stdout: &capture.stdout,
         child_stderr: &capture.stderr,
+        child_stdout_truncated: capture.stdout_truncated,
+        child_stderr_truncated: capture.stderr_truncated,
+        output_limit_exceeded: capture.output_limit_exceeded,
         process_tree_cpu_ns: capture.process_tree_cpu_ns,
         peak_process_tree_resident_bytes: capture.peak_process_tree_resident_bytes,
     })?;
     Err(format!("{error}: {}", capture.stderr.trim()).into())
+}
+
+pub(super) fn retain_outer_supervisor_failure_if_exposed(
+    capture: &crate::harness::ChildCapture,
+    error: &str,
+) -> Result<(), AnyError> {
+    retain_failure_if_exposed(&FailureReport {
+        schema: "reflex-lean-temporal-audit-failure-v1",
+        status: "sealed-failure; rerun-forbidden",
+        error,
+        timed_out: capture.timed_out,
+        resident_limit_exceeded: capture.resident_limit_exceeded,
+        boundary: FailureBoundary {
+            cgroup_oom_killed: capture.boundary.cgroup_oom_killed,
+            cleanup_failed: capture.boundary.cleanup_failed,
+            evidence_failed: capture.boundary.evidence_failed,
+        },
+        child_exit_code: capture.status.code(),
+        child_stdout: &capture.stdout,
+        child_stderr: &capture.stderr,
+        child_stdout_truncated: capture.stdout_truncated,
+        child_stderr_truncated: capture.stderr_truncated,
+        output_limit_exceeded: capture.output_limit_exceeded,
+        process_tree_cpu_ns: capture.process_tree_cpu_ns,
+        peak_process_tree_resident_bytes: capture.peak_process_tree_resident_bytes,
+    })
+}
+
+pub(super) fn retain_outer_supervisor_error_if_exposed(error: &str) -> Result<(), AnyError> {
+    retain_failure_if_exposed(&FailureReport {
+        schema: "reflex-lean-temporal-audit-failure-v1",
+        status: "sealed-failure; rerun-forbidden",
+        error,
+        timed_out: false,
+        resident_limit_exceeded: false,
+        boundary: FailureBoundary {
+            cgroup_oom_killed: false,
+            cleanup_failed: true,
+            evidence_failed: true,
+        },
+        child_exit_code: None,
+        child_stdout: "",
+        child_stderr: "",
+        child_stdout_truncated: false,
+        child_stderr_truncated: false,
+        output_limit_exceeded: false,
+        process_tree_cpu_ns: 0,
+        peak_process_tree_resident_bytes: 0,
+    })
 }
 
 pub fn confirm_child(arguments: &[String]) -> Result<(), AnyError> {
@@ -696,14 +777,7 @@ fn confirm_once(arguments: &[String]) -> Result<(), AnyError> {
         audit_lock_content_sha256: &lock.content_sha256,
         git_revision: &host.git_revision,
     };
-    if let Some(parent) = receipt_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let receipt_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&receipt_path)?;
-    serde_json::to_writer_pretty(receipt_file, &receipt)?;
+    publish_new_durable_json(&receipt_path, &receipt, false)?;
     let execution_receipt_file_sha256 = hash_file(&receipt_path)?;
 
     let december_catalog = LeanCatalog::load(&arguments.december_catalog)?;
@@ -2082,12 +2156,50 @@ fn retain_failure_if_exposed(report: &FailureReport<'_>) -> Result<(), AnyError>
     if path.exists() {
         return Ok(());
     }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    serde_json::to_writer_pretty(file, report)?;
-    Ok(())
+    publish_new_durable_json(&path, report, true)
+}
+
+fn publish_new_durable_json(
+    path: &Path,
+    value: &impl Serialize,
+    existing_is_success: bool,
+) -> Result<(), AnyError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("durable JSON path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".reflex-durable-{}-{}.tmp",
+        std::process::id(),
+        DURABLE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let publish = || -> Result<(), AnyError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => {}
+            Err(error)
+                if existing_is_success && error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }();
+    let removed = std::fs::remove_file(&temporary);
+    if publish.is_ok() {
+        removed?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    publish
 }
 
 fn validate_assessment(
@@ -2423,5 +2535,30 @@ mod tests {
             time_to_target(&[&records[0]], 0, &targets, None, 0.0),
             Some(records[0].preparation_cpu_upper_bound_ns)
         );
+    }
+
+    #[test]
+    fn exposure_receipts_publish_atomically_and_never_replace() {
+        #[derive(Serialize)]
+        struct Receipt<'a> {
+            state: &'a str,
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "reflex-durable-exposure-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("receipt.json");
+        publish_new_durable_json(&path, &Receipt { state: "exposed" }, false).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["state"],
+            "exposed"
+        );
+        assert!(publish_new_durable_json(&path, &Receipt { state: "replaced" }, false).is_err());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["state"],
+            "exposed"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

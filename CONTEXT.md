@@ -168,6 +168,14 @@ _Avoid_: Required Subgoal, Candidate
 A calibrated, contextual forecast over multiple possible downstream outcomes and time horizons from investing further search in an Artifact or Emergent Opportunity.
 _Avoid_: Verified value, reward, scalar score
 
+**Investment**:
+A bounded allocation of Runtime resources to an eligible opportunity such as generation, Verification, repair, exploration, training, Knowledge Consolidation, or operational comparison. Its forecasts and later outcomes remain attributable without becoming correctness evidence or a universal reward.
+_Avoid_: Candidate, action, scalar bet
+
+**Shadow Campaign**:
+A paired, resource-matched operational comparison forked from one restart-complete state in which treatment permits a single subject and control masks it. It estimates contextual marginal consequences for learning and Operational Promotion but is not Scientific Confirmation.
+_Avoid_: A/B test, Verification, scientific experiment
+
 **Knowledge Consolidation**:
 The verified reorganization of accumulated Artifacts into more compact, reusable, and search-effective knowledge, potentially including independently Verified generalizations. It may compact cold history and active indexes without invalidating surviving Verification Records or reproducibility claims.
 _Avoid_: Model training, data compression, pruning
@@ -189,7 +197,7 @@ A deterministic, domain-owned ordering of verified library Artifacts that may le
 _Avoid_: Verification, learned allocation, theorem proof
 
 **Derived Operator**:
-A reusable transformation discovered through Knowledge Consolidation from verified derivations that becomes immediately eligible for search and initial exploration. Later Knowledge Revisions may specialize or deactivate it, while every proposed result remains subject to the Verification Kernel.
+A reusable transformation proposed through Knowledge Consolidation from verified derivations. It becomes eligible for search only after its explicit Obligations are Verified and a controlled comparison demonstrates downstream usefulness; later Knowledge Revisions may specialize or deactivate it, while every proposed result remains subject to the Verification Kernel.
 _Avoid_: Primitive Operator, unchecked generated code, model action
 
 **Knowledge Revision**:
@@ -200,6 +208,14 @@ _Avoid_: Model checkpoint, database snapshot
 A complete, immutable, and reproducible learned decision system scoped to one Domain Definition, including its predictors and the state required to interpret them. Campaigns may pin it, challengers may replace it through promotion, and cross-domain transfer requires explicit compatibility.
 _Avoid_: Knowledge Revision, live model
 
+**Model Ecology**:
+The Bootstrap Revision, routed Specialist Revisions, forecast calibration, competence scopes, and allocation machinery that together constitute one complete Model Revision. Its members may coexist when their strengths are incomparable instead of competing to become one global champion.
+_Avoid_: Ensemble, model zoo, single network
+
+**Routing Family**:
+A stable semantic partition of otherwise representation-compatible opportunities, such as a primitive or Derived Operator lineage, used to route bounded Specialist Revision inference and training. It is independent of a Feature Schema: two families may share an identical feature layout without sharing competence or evidence lineage.
+_Avoid_: Feature Schema, unbounded model tag, allocation queue
+
 **Bootstrap Revision**:
 The initial valid Model Revision that provides deterministic, domain-independent search and allocation before learned experience exists.
 _Avoid_: Prototype engine, random checkpoint, special runtime
@@ -207,6 +223,10 @@ _Avoid_: Prototype engine, random checkpoint, special runtime
 **Runtime Controller**:
 The deterministic authority that interprets learned proposals while enforcing Verification, Admission, Operational Promotion, and Resource Envelope rules.
 _Avoid_: Learned policy, Verification Kernel, domain adapter
+
+**Runtime Policy Revision**:
+An immutable, bounded, data-only policy for Reflex's own search economics whose safety is mechanically enforced by the Runtime Controller and whose usefulness is established operationally. It cannot modify Verification authority, hard resources, durability, corpus isolation, or executable code.
+_Avoid_: Self-modifying code, Runtime Controller, Optimization Goal
 
 **Specialist Revision**:
 A compatible Knowledge Revision or Model Revision retained because its strengths serve a subset of Optimization Goals even though it is not safe to promote as the default.

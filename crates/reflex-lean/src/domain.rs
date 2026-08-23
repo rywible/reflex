@@ -1,10 +1,13 @@
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use reflex::domain::{ReplayVerdictWriter, StructuralSchema, SymbolId, VerificationReplayRequest};
+use reflex::domain::{
+    RejectionAdvisory, ReplayVerdictWriter, StructuralSchema, SymbolId, VerificationReplayRequest,
+};
 use reflex::{
-    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, EncodingContract,
     ExternalVerificationUsage, Incomparable, KernelRevision, MeasurementDescriptor,
     MeasurementEnvironment, MeasurementSpace, MeasurementWriter, MetricOrdering, OperatorAlgebra,
     OperatorDescriptor, OperatorEnumerationBatch, ProposalFeatures, ProposalProvenance, Seed,
@@ -62,6 +65,31 @@ impl From<serde_json::Error> for LeanError {
     fn from(error: serde_json::Error) -> Self {
         Self::InvalidEncoding(error.to_string())
     }
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("canonical encoding length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_encoded_len(value: &impl Serialize) -> Result<usize, LeanError> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
 }
 
 #[derive(Clone, Debug)]
@@ -612,6 +640,21 @@ impl StructuralProtocol<LeanDomain> for LeanStructure {
             proof_term,
             allowed_axioms: artifact.allowed_axioms.clone(),
         })
+    }
+
+    fn canonical_encoding_contract(
+        &self,
+        artifact: &LeanArtifact,
+    ) -> Result<EncodingContract, LeanError> {
+        Ok(EncodingContract::new(json_encoded_len(artifact)?, 0))
+    }
+
+    fn artifact_dynamic_resident_bytes(&self, artifact: &LeanArtifact) -> u64 {
+        u64::try_from(json_encoded_len(artifact).unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
+    }
+
+    fn scratch_dynamic_resident_bytes(&self, scratch: &Self::Scratch) -> u64 {
+        u64::try_from(scratch.capacity()).unwrap_or(u64::MAX)
     }
 
     fn encode_canonical(
@@ -1404,7 +1447,9 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
             .collect::<Vec<_>>();
         match self.verify_items(&items, requests.allowance().elapsed_time()) {
             Ok((results, usage)) => {
-                for (request, result) in requests.requests().iter().zip(results) {
+                for (request_index, (request, result)) in
+                    requests.requests().iter().zip(results).enumerate()
+                {
                     let dependencies = normalized_names(result.dependencies.clone());
                     if result.accepted
                         && request.claim.environment == request.candidate.environment
@@ -1421,7 +1466,9 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
                             }
                         });
                         match evidence {
-                            Ok(evidence) => output.push(Verdict::Accepted { evidence }),
+                            Ok(evidence) => {
+                                output.push(request_index, Verdict::Accepted { evidence });
+                            }
                             Err(error) => {
                                 return VerificationBatchOutcome::domain_error(
                                     report(usage, false),
@@ -1430,7 +1477,22 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
                             }
                         }
                     } else {
-                        output.push(Verdict::Refuted);
+                        let rejection_advisory = if result.accepted {
+                            if request.claim.environment != request.candidate.environment
+                                || request.claim.declaration != request.candidate.declaration
+                            {
+                                RejectionAdvisory::ClaimMismatch
+                            } else if request.claim.allowed_axioms
+                                != request.candidate.allowed_axioms
+                            {
+                                RejectionAdvisory::AxiomViolation
+                            } else {
+                                RejectionAdvisory::DependencyMismatch
+                            }
+                        } else {
+                            classify_rejection(&result.diagnostic)
+                        };
+                        output.push_refuted(request_index, rejection_advisory);
                     }
                 }
                 VerificationBatchOutcome::completed(report(usage, false))
@@ -1440,6 +1502,26 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
                 LeanError::Worker(error),
             ),
         }
+    }
+
+    fn evidence_binds(
+        &self,
+        request: &reflex::domain::VerificationRequest<'_, LeanDomain, Self::Claim>,
+        evidence: &Self::Evidence,
+    ) -> Result<bool, LeanError> {
+        Ok(request.claim.environment == request.seed.environment
+            && request.claim.environment == request.candidate.environment
+            && request.claim.declaration == request.seed.declaration
+            && request.claim.declaration == request.candidate.declaration
+            && request.claim.allowed_axioms == request.seed.allowed_axioms
+            && request.claim.allowed_axioms == request.candidate.allowed_axioms
+            && evidence.environment == request.candidate.environment
+            && evidence.dependencies == request.candidate.dependencies
+            && evidence
+                .axioms
+                .iter()
+                .all(|axiom| request.claim.allowed_axioms.contains(axiom))
+            && artifact_digest(request.candidate)? == evidence.artifact_digest)
     }
 
     fn replay_batch(
@@ -1456,8 +1538,10 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
             .collect::<Vec<_>>();
         match self.verify_items(&items, records.allowance().elapsed_time()) {
             Ok((results, usage)) => {
-                for (record, result) in records.requests().iter().zip(results) {
-                    output.push(replay_accepted(record, &result));
+                for (request_index, (record, result)) in
+                    records.requests().iter().zip(results).enumerate()
+                {
+                    output.push(request_index, replay_accepted(record, &result));
                 }
                 VerificationBatchOutcome::completed(report(usage, false))
             }
@@ -1466,6 +1550,25 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
                 LeanError::Worker(error),
             ),
         }
+    }
+
+    fn claim_encoding_contract(&self, claim: &Self::Claim) -> Result<EncodingContract, LeanError> {
+        Ok(EncodingContract::new(json_encoded_len(claim)?, 0))
+    }
+
+    fn evidence_encoding_contract(
+        &self,
+        evidence: &Self::Evidence,
+    ) -> Result<EncodingContract, LeanError> {
+        Ok(EncodingContract::new(json_encoded_len(evidence)?, 0))
+    }
+
+    fn claim_dynamic_resident_bytes(&self, claim: &Self::Claim) -> u64 {
+        u64::try_from(json_encoded_len(claim).unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
+    }
+
+    fn evidence_dynamic_resident_bytes(&self, evidence: &Self::Evidence) -> u64 {
+        u64::try_from(json_encoded_len(evidence).unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
     }
 
     fn encode_claim(&self, claim: &Self::Claim, output: &mut Vec<u8>) -> Result<(), LeanError> {
@@ -1488,6 +1591,21 @@ impl VerificationKernel<LeanDomain> for LeanKernel {
 
     fn decode_evidence(&self, bytes: &[u8]) -> Result<Self::Evidence, LeanError> {
         decode_json(bytes)
+    }
+}
+
+fn classify_rejection(diagnostic: &str) -> RejectionAdvisory {
+    match diagnostic {
+        "sorry is forbidden" | "sorryAx dependency is forbidden" => {
+            RejectionAdvisory::ForbiddenConstruct
+        }
+        "proof introduced an unknown universe parameter" => RejectionAdvisory::ScopeViolation,
+        "unsafe, partial, sorry, or unknown dependency" => RejectionAdvisory::DependencyViolation,
+        "claim is not a well-formed type" => RejectionAdvisory::MalformedClaim,
+        "candidate or proof did not kernel-check" => RejectionAdvisory::KernelCheckFailure,
+        "candidate claim differs from the seed claim" => RejectionAdvisory::ClaimMismatch,
+        "proof introduced a new axiom" => RejectionAdvisory::AxiomViolation,
+        _ => RejectionAdvisory::MalformedArtifact,
     }
 }
 
@@ -1936,6 +2054,34 @@ impl MeasurementSpace<LeanDomain> for LeanMeasurements {
         &self.schema
     }
 
+    fn measurement_scratch_resident_bytes(&self, artifacts: &[&LeanArtifact]) -> u64 {
+        artifacts
+            .iter()
+            .map(|artifact| json_encoded_len(&artifact.proof_term).unwrap_or(usize::MAX))
+            .max()
+            .map_or(0, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
+
+    fn scratch_dynamic_resident_bytes(&self, scratch: &Self::Scratch) -> u64 {
+        u64::try_from(scratch.capacity()).unwrap_or(u64::MAX)
+    }
+
+    fn observation_dynamic_resident_bytes_bound(
+        &self,
+        _artifact: &LeanArtifact,
+        _metric: Self::Metric,
+    ) -> u64 {
+        0
+    }
+
+    fn observation_dynamic_resident_bytes(
+        &self,
+        _metric: Self::Metric,
+        _observation: &Self::Observation,
+    ) -> u64 {
+        0
+    }
+
     fn measure_batch(
         &self,
         artifacts: VerifiedBatch<'_, LeanDomain>,
@@ -1945,6 +2091,12 @@ impl MeasurementSpace<LeanDomain> for LeanMeasurements {
     ) -> Result<(), LeanError> {
         for (index, artifact) in artifacts.artifacts().iter().enumerate() {
             scratch.clear();
+            let encoded_bytes = json_encoded_len(&artifact.proof_term)?;
+            if scratch.capacity() < encoded_bytes {
+                scratch.try_reserve_exact(encoded_bytes).map_err(|_| {
+                    LeanError::InvalidEncoding("measurement scratch overflow".into())
+                })?;
+            }
             serde_json::to_writer(&mut *scratch, &artifact.proof_term)?;
             output.push(
                 index,
@@ -2038,14 +2190,54 @@ mod tests {
     use std::sync::Arc;
 
     use cpu_time::ProcessTime;
+    use reflex::domain::RejectionAdvisory;
     use reflex::{OperatorAlgebra, StructuralProtocol, StructuralView};
 
     use super::{
         LeanArtifact, LeanConstructor, LeanExpr, LeanOperatorScratch, LeanOperators, LeanStructure,
-        RetrievalTier, pinned_environment_identity,
+        RetrievalTier, classify_rejection, pinned_environment_identity,
     };
     use crate::ast::{LeanBinderInfo, LeanDeclarationIdentity, LeanName};
     use crate::worker::{LeanWorker, LeanWorkerConfig};
+
+    #[test]
+    fn lean_diagnostics_collapse_to_bounded_typed_rejection_classes() {
+        let cases = [
+            ("sorry is forbidden", RejectionAdvisory::ForbiddenConstruct),
+            (
+                "proof introduced an unknown universe parameter",
+                RejectionAdvisory::ScopeViolation,
+            ),
+            (
+                "unsafe, partial, sorry, or unknown dependency",
+                RejectionAdvisory::DependencyViolation,
+            ),
+            (
+                "claim is not a well-formed type",
+                RejectionAdvisory::MalformedClaim,
+            ),
+            (
+                "candidate or proof did not kernel-check",
+                RejectionAdvisory::KernelCheckFailure,
+            ),
+            (
+                "candidate claim differs from the seed claim",
+                RejectionAdvisory::ClaimMismatch,
+            ),
+            (
+                "proof introduced a new axiom",
+                RejectionAdvisory::AxiomViolation,
+            ),
+            (
+                "domain-specific parse detail that must not escape",
+                RejectionAdvisory::MalformedArtifact,
+            ),
+        ];
+
+        for (diagnostic, expected) in cases {
+            assert_eq!(classify_rejection(diagnostic), expected);
+        }
+    }
 
     #[test]
     fn cloned_proof_terms_share_immutable_subtrees() {

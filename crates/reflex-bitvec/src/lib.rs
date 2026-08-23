@@ -3,20 +3,27 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
 use rayon::prelude::*;
+#[cfg(test)]
+use reflex::ExternalVerificationUsage;
 use reflex::domain::{
-    ReplayVerdictWriter, StructuralSchema, StructuralView, SymbolId, VerificationReplayRequest,
+    RejectionAdvisory, ReplayVerdictWriter, StructuralSchema, StructuralView, SymbolId,
+    VerificationReplayRequest,
 };
 use reflex::{
-    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, Incomparable,
-    KernelRevision, MeasurementDescriptor, MeasurementEnvironment, MeasurementSpace,
+    ApplicationWriter, CandidateWriter, ConstructorDescriptor, DomainDefinition, EncodingContract,
+    Incomparable, KernelRevision, MeasurementDescriptor, MeasurementEnvironment, MeasurementSpace,
     MeasurementWriter, MetricOrdering, NonEmpty, OperatorAlgebra, OperatorDescriptor,
     OperatorEnumerationBatch, Seed, SeedPage, SeedSource, SeedWriter, SemanticIdentity,
     StructuralProtocol, Verdict, VerdictWriter, VerificationBatch, VerificationBatchOutcome,
     VerificationBatchReport, VerificationKernel, VerificationRecord, VerificationReplayBatch,
-    VerifiedBatch,
+    VerificationWorkerRequirements, VerifiedBatch,
 };
 
 const U8_ROTATIONS: u8 = 8;
@@ -1180,9 +1187,62 @@ impl BitVecDomain {
             structure: ExpressionStructure::new(),
             seeds: ExpressionSeeds,
             operators: ExpressionOperators::new(),
-            kernel: ExhaustiveKernel,
+            kernel: ExhaustiveKernel::standard(),
             measurements: ExpressionMeasurements::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn unary_u8_rejecting_external_verification_batch(
+        batch: usize,
+    ) -> (Self, KernelVerificationCounters) {
+        let (kernel, counters) = ExhaustiveKernel::rejecting_verification_batch(batch, true);
+        (
+            Self {
+                structure: ExpressionStructure::new(),
+                seeds: ExpressionSeeds,
+                operators: ExpressionOperators::new(),
+                kernel,
+                measurements: ExpressionMeasurements::new(),
+            },
+            counters,
+        )
+    }
+
+    #[cfg(test)]
+    fn unary_u8_external_replay_fault(
+        batch: usize,
+        worker_failed: bool,
+    ) -> (Self, KernelVerificationCounters) {
+        let (kernel, counters) = ExhaustiveKernel::external_replay_fault(batch, worker_failed);
+        (
+            Self {
+                structure: ExpressionStructure::new(),
+                seeds: ExpressionSeeds,
+                operators: ExpressionOperators::new(),
+                kernel,
+                measurements: ExpressionMeasurements::new(),
+            },
+            counters,
+        )
+    }
+
+    #[cfg(test)]
+    fn unary_u8_external_replay_overrun(
+        batch: usize,
+        usage: ExternalVerificationUsage,
+    ) -> (Self, KernelVerificationCounters) {
+        let (kernel, counters) = ExhaustiveKernel::external_replay_overrun(batch, usage);
+        (
+            Self {
+                structure: ExpressionStructure::new(),
+                seeds: ExpressionSeeds,
+                operators: ExpressionOperators::new(),
+                kernel,
+                measurements: ExpressionMeasurements::new(),
+            },
+            counters,
+        )
     }
 }
 
@@ -1468,6 +1528,23 @@ impl StructuralProtocol<BitVecDomain> for ExpressionStructure {
             .ok_or(BitVecError::InvalidEncoding)
     }
 
+    fn canonical_encoding_contract(
+        &self,
+        artifact: &Expression,
+    ) -> Result<EncodingContract, BitVecError> {
+        Ok(EncodingContract::new(artifact.encoded_len(), 0))
+    }
+
+    fn artifact_dynamic_resident_bytes(&self, artifact: &Expression) -> u64 {
+        u64::try_from(artifact.nodes.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<Node>() as u64)
+    }
+
+    fn scratch_dynamic_resident_bytes(&self, (): &Self::Scratch) -> u64 {
+        0
+    }
+
     fn encode_canonical(
         &self,
         artifact: &Expression,
@@ -1733,7 +1810,141 @@ impl OperatorAlgebra<BitVecDomain> for ExpressionOperators {
 
 pub type TruthTable = [u8; 256];
 
+#[cfg(not(test))]
 pub struct ExhaustiveKernel;
+
+#[cfg(test)]
+pub struct ExhaustiveKernel {
+    rejected_verification_batch: Option<usize>,
+    rejected_replay_batch: Option<usize>,
+    failed_replay_batch: Option<usize>,
+    external_usage: Option<ExternalVerificationUsage>,
+    counters: KernelVerificationCounters,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct KernelVerificationCounters {
+    inner: Arc<KernelVerificationCounts>,
+}
+
+#[cfg(test)]
+struct KernelVerificationCounts {
+    batches: AtomicUsize,
+    requests: AtomicUsize,
+    replay_batches: AtomicUsize,
+    replay_requests: AtomicUsize,
+}
+
+#[cfg(test)]
+impl KernelVerificationCounters {
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.inner.batches.load(Ordering::Relaxed),
+            self.inner.requests.load(Ordering::Relaxed),
+        )
+    }
+
+    fn replay_counts(&self) -> (usize, usize) {
+        (
+            self.inner.replay_batches.load(Ordering::Relaxed),
+            self.inner.replay_requests.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl ExhaustiveKernel {
+    fn standard() -> Self {
+        #[cfg(not(test))]
+        {
+            Self
+        }
+        #[cfg(test)]
+        {
+            Self {
+                rejected_verification_batch: None,
+                rejected_replay_batch: None,
+                failed_replay_batch: None,
+                external_usage: None,
+                counters: KernelVerificationCounters {
+                    inner: Arc::new(KernelVerificationCounts {
+                        batches: AtomicUsize::new(0),
+                        requests: AtomicUsize::new(0),
+                        replay_batches: AtomicUsize::new(0),
+                        replay_requests: AtomicUsize::new(0),
+                    }),
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn rejecting_verification_batch(
+        batch: usize,
+        external: bool,
+    ) -> (Self, KernelVerificationCounters) {
+        let counters = KernelVerificationCounters {
+            inner: Arc::new(KernelVerificationCounts {
+                batches: AtomicUsize::new(0),
+                requests: AtomicUsize::new(0),
+                replay_batches: AtomicUsize::new(0),
+                replay_requests: AtomicUsize::new(0),
+            }),
+        };
+        (
+            Self {
+                rejected_verification_batch: Some(batch),
+                rejected_replay_batch: None,
+                failed_replay_batch: None,
+                external_usage: external
+                    .then(|| ExternalVerificationUsage::new(1, 1, Duration::ZERO, Duration::ZERO)),
+                counters: counters.clone(),
+            },
+            counters,
+        )
+    }
+
+    #[cfg(test)]
+    fn external_replay_fault(
+        batch: usize,
+        worker_failed: bool,
+    ) -> (Self, KernelVerificationCounters) {
+        let counters = KernelVerificationCounters {
+            inner: Arc::new(KernelVerificationCounts {
+                batches: AtomicUsize::new(0),
+                requests: AtomicUsize::new(0),
+                replay_batches: AtomicUsize::new(0),
+                replay_requests: AtomicUsize::new(0),
+            }),
+        };
+        (
+            Self {
+                rejected_verification_batch: None,
+                rejected_replay_batch: (!worker_failed).then_some(batch),
+                failed_replay_batch: worker_failed.then_some(batch),
+                external_usage: Some(ExternalVerificationUsage::new(
+                    1,
+                    1,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )),
+                counters: counters.clone(),
+            },
+            counters,
+        )
+    }
+
+    #[cfg(test)]
+    fn external_replay_overrun(
+        batch: usize,
+        usage: ExternalVerificationUsage,
+    ) -> (Self, KernelVerificationCounters) {
+        let (mut kernel, counters) = Self::external_replay_fault(batch, false);
+        kernel.rejected_replay_batch = None;
+        kernel.external_usage = Some(usage);
+        (kernel, counters)
+    }
+}
 
 impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
     type Claim = TruthTable;
@@ -1742,6 +1953,17 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
 
     fn revision(&self) -> KernelRevision {
         KernelRevision(2)
+    }
+
+    fn worker_requirements(&self) -> VerificationWorkerRequirements {
+        #[cfg(test)]
+        if self.external_usage.is_some() {
+            return VerificationWorkerRequirements::external(
+                std::num::NonZeroUsize::new(1).expect("one external worker lane is nonzero"),
+                std::num::NonZeroU64::new(1).expect("one external worker byte is nonzero"),
+            );
+        }
+        VerificationWorkerRequirements::in_process()
     }
 
     fn claim_for_candidate(
@@ -1758,23 +1980,63 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         output: &mut VerdictWriter<'_, Self::Evidence>,
         (): &mut Self::Scratch,
     ) -> VerificationBatchOutcome<BitVecError> {
-        let verdicts = requests
-            .requests()
-            .iter()
-            .map(|request| {
-                let expected = truth_table(request.seed);
-                let evidence = truth_table(request.candidate);
-                if &expected == request.claim && evidence == expected {
-                    Verdict::Accepted { evidence }
-                } else {
-                    Verdict::Refuted
+        #[cfg(test)]
+        {
+            let batch = self.counters.inner.batches.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .inner
+                .requests
+                .fetch_add(requests.requests().len(), Ordering::Relaxed);
+            if self.rejected_verification_batch == Some(batch) {
+                for request_index in 0..requests.requests().len() {
+                    output.push(request_index, Verdict::Refuted);
                 }
-            })
-            .collect::<Vec<_>>();
-        for verdict in verdicts {
-            output.push(verdict);
+                return VerificationBatchOutcome::completed(self.verification_report(false));
+            }
         }
-        VerificationBatchOutcome::completed(VerificationBatchReport::in_process())
+        for (request_index, request) in requests.requests().iter().enumerate() {
+            let expected = truth_table(request.seed);
+            let evidence = truth_table(request.candidate);
+            if &expected == request.claim && evidence == expected {
+                output.push(request_index, Verdict::Accepted { evidence });
+                continue;
+            }
+            let (input, observed) = if let Some(input) = expected
+                .iter()
+                .zip(request.claim)
+                .position(|(expected, claimed)| expected != claimed)
+            {
+                (input, request.claim[input])
+            } else {
+                let input = expected
+                    .iter()
+                    .zip(evidence.iter())
+                    .position(|(expected, observed)| expected != observed)
+                    .expect("a Refuted BitVec Candidate must have a concrete mismatch");
+                (input, evidence[input])
+            };
+            output.push_refuted(
+                request_index,
+                RejectionAdvisory::Counterexample {
+                    input: u64::try_from(input).expect("a Truth Table input always fits u64"),
+                    expected: u64::from(expected[input]),
+                    observed: u64::from(observed),
+                },
+            );
+        }
+        VerificationBatchOutcome::completed(self.verification_report(false))
+    }
+
+    fn evidence_binds(
+        &self,
+        request: &reflex::domain::VerificationRequest<'_, BitVecDomain, Self::Claim>,
+        evidence: &Self::Evidence,
+    ) -> Result<bool, BitVecError> {
+        let seed_semantics = truth_table(request.seed);
+        let candidate_semantics = truth_table(request.candidate);
+        Ok(&seed_semantics == request.claim
+            && candidate_semantics == seed_semantics
+            && evidence == &candidate_semantics)
     }
 
     fn replay_batch(
@@ -1783,25 +2045,66 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
         output: &mut ReplayVerdictWriter<'_>,
         (): &mut Self::Scratch,
     ) -> VerificationBatchOutcome<BitVecError> {
-        let replayed = records
-            .requests()
-            .iter()
-            .map(
-                |VerificationReplayRequest {
-                     artifact,
-                     claim,
-                     evidence,
-                     kernel_revision,
-                 }| {
-                    let actual = truth_table(artifact);
-                    *kernel_revision == self.revision() && &actual == *claim && &actual == *evidence
-                },
-            )
-            .collect::<Vec<_>>();
-        for accepted in replayed {
-            output.push(accepted);
+        #[cfg(test)]
+        {
+            let batch = self
+                .counters
+                .inner
+                .replay_batches
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .inner
+                .replay_requests
+                .fetch_add(records.requests().len(), Ordering::Relaxed);
+            if self.failed_replay_batch == Some(batch) {
+                return VerificationBatchOutcome::completed(self.verification_report(true));
+            }
+            if self.rejected_replay_batch == Some(batch) {
+                for request_index in 0..records.requests().len() {
+                    output.push(request_index, false);
+                }
+                return VerificationBatchOutcome::completed(self.verification_report(false));
+            }
         }
-        VerificationBatchOutcome::completed(VerificationBatchReport::in_process())
+        for (
+            request_index,
+            VerificationReplayRequest {
+                artifact,
+                claim,
+                evidence,
+                kernel_revision,
+            },
+        ) in records.requests().iter().enumerate()
+        {
+            let actual = truth_table(artifact);
+            output.push(
+                request_index,
+                *kernel_revision == self.revision() && &actual == *claim && &actual == *evidence,
+            );
+        }
+        VerificationBatchOutcome::completed(self.verification_report(false))
+    }
+
+    fn claim_encoding_contract(
+        &self,
+        _claim: &Self::Claim,
+    ) -> Result<EncodingContract, BitVecError> {
+        Ok(EncodingContract::new(256, 0))
+    }
+
+    fn evidence_encoding_contract(
+        &self,
+        _evidence: &Self::Evidence,
+    ) -> Result<EncodingContract, BitVecError> {
+        Ok(EncodingContract::new(256, 0))
+    }
+
+    fn claim_dynamic_resident_bytes(&self, _claim: &Self::Claim) -> u64 {
+        0
+    }
+
+    fn evidence_dynamic_resident_bytes(&self, _evidence: &Self::Evidence) -> u64 {
+        0
     }
 
     fn encode_claim(&self, claim: &Self::Claim, output: &mut Vec<u8>) -> Result<(), BitVecError> {
@@ -1824,6 +2127,18 @@ impl VerificationKernel<BitVecDomain> for ExhaustiveKernel {
 
     fn decode_evidence(&self, bytes: &[u8]) -> Result<Self::Evidence, BitVecError> {
         bytes.try_into().map_err(|_| BitVecError::InvalidEncoding)
+    }
+}
+
+impl ExhaustiveKernel {
+    fn verification_report(&self, worker_failed: bool) -> VerificationBatchReport {
+        #[cfg(not(test))]
+        let _ = (self, worker_failed);
+        #[cfg(test)]
+        if let Some(usage) = self.external_usage {
+            return VerificationBatchReport::external(usage, worker_failed);
+        }
+        VerificationBatchReport::in_process()
     }
 }
 
@@ -1866,6 +2181,33 @@ impl MeasurementSpace<BitVecDomain> for ExpressionMeasurements {
 
     fn schema(&self) -> &[MeasurementDescriptor<Self::Metric>] {
         &self.schema
+    }
+
+    fn measurement_scratch_resident_bytes(&self, artifacts: &[&Expression]) -> u64 {
+        let item = std::mem::size_of::<(usize, u64, u64, u64, u64, u64)>() as u64;
+        u64::try_from(artifacts.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(item)
+    }
+
+    fn scratch_dynamic_resident_bytes(&self, scratch: &Self::Scratch) -> u64 {
+        u64::try_from(scratch.capacity()).unwrap_or(u64::MAX)
+    }
+
+    fn observation_dynamic_resident_bytes_bound(
+        &self,
+        _artifact: &Expression,
+        _metric: Self::Metric,
+    ) -> u64 {
+        0
+    }
+
+    fn observation_dynamic_resident_bytes(
+        &self,
+        _metric: Self::Metric,
+        _observation: &Self::Observation,
+    ) -> u64 {
+        0
     }
 
     fn measure_batch(
@@ -1969,5 +2311,562 @@ impl MeasurementSpace<BitVecDomain> for ExpressionMeasurements {
         Ok(u64::from_le_bytes(
             bytes.try_into().map_err(|_| BitVecError::InvalidEncoding)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use reflex::domain::{RejectionAdvisory, VerificationRequest};
+    use reflex::{Verdict, VerdictWriter, VerificationBatch, VerificationKernel};
+
+    use super::{ExhaustiveKernel, Expression, truth_table};
+
+    #[test]
+    fn exhaustive_kernel_emits_the_first_concrete_counterexample() {
+        let seed = Expression::input();
+        let accepted = seed.clone();
+        let refuted = Expression::constant(0);
+        let claim = truth_table(&seed);
+        let requests = [
+            VerificationRequest {
+                seed: &seed,
+                candidate: &accepted,
+                claim: &claim,
+            },
+            VerificationRequest {
+                seed: &seed,
+                candidate: &refuted,
+                claim: &claim,
+            },
+        ];
+        let mut verdicts = Vec::new();
+        let mut advisories = Vec::new();
+        let mut writer = VerdictWriter::recording_rejections(&mut verdicts, &mut advisories);
+        let kernel = ExhaustiveKernel::standard();
+
+        let outcome = kernel.verify_batch(VerificationBatch::new(&requests), &mut writer, &mut ());
+
+        assert!(outcome.into_parts().1.is_none());
+        assert!(matches!(
+            verdicts.as_slice(),
+            [Verdict::Accepted { .. }, Verdict::Refuted]
+        ));
+        assert_eq!(
+            advisories,
+            [
+                None,
+                Some(RejectionAdvisory::Counterexample {
+                    input: 1,
+                    expected: 1,
+                    observed: 0,
+                }),
+            ]
+        );
+        let accepted_evidence = truth_table(&accepted);
+        assert!(
+            kernel
+                .evidence_binds(&requests[0], &accepted_evidence)
+                .unwrap(),
+            "Accepted evidence binds the exact Candidate and Correctness Claim"
+        );
+        assert!(
+            !kernel
+                .evidence_binds(&requests[0], &truth_table(&refuted))
+                .unwrap(),
+            "evidence from another request cannot establish this Candidate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod knowledge_recovery_tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::ops::ControlFlow;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use reflex::internal_experiments::{
+        ExperienceVerdictInspection, hostile_current_knowledge_checkpoint,
+        inspect_experience_segment, inspect_knowledge_recovery_obligation_count,
+        inspect_session_segment,
+    };
+    use reflex::{
+        BundlePlan, Direction, ExternalVerificationUsage, GoalSet, ImprovementRequest, NonEmpty,
+        NonZeroDuration, Objective, OptimizationGoal, Preference, ResourceEnvelope, SessionError,
+        improve,
+    };
+    use reflex_bundle::{CanonicalBundle, SegmentKind};
+
+    use super::{BitVecDomain, Expression, Metric, SeedScope};
+
+    const FIXTURE_VERIFICATIONS: u64 = 10_000;
+    const MAXIMUM_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn external_semantic_replay_rejections_preserve_resume_and_fork_sources_without_publication() {
+        let directory = TestDirectory::new();
+        let source = directory.path.join("semantic-source.bundle");
+        build_promoted_knowledge_bundle(&source);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let bundle = CanonicalBundle::decode(&source_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let stored = usize::try_from(read_u64(bundle.segment(SegmentKind::Artifacts))).unwrap();
+        let accepted = inspect_experience_segment(bundle.segment(SegmentKind::Experience))
+            .unwrap()
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.verdict == ExperienceVerdictInspection::Accepted)
+            .count();
+        let obligations = inspect_knowledge_recovery_obligation_count(current_intelligence(
+            bundle.segment(SegmentKind::Revisions),
+        ))
+        .unwrap();
+        let recovery_verifications = u64::try_from(stored + accepted + 1 + obligations).unwrap();
+
+        for plan in [RecoveryPlan::Resume, RecoveryPlan::Fork] {
+            for fault in [
+                SemanticReplayFault::Stored,
+                SemanticReplayFault::AcceptedExperience,
+            ] {
+                let label = match (plan, fault) {
+                    (RecoveryPlan::Resume, SemanticReplayFault::Stored) => "resume-stored",
+                    (RecoveryPlan::Resume, SemanticReplayFault::AcceptedExperience) => {
+                        "resume-experience"
+                    }
+                    (RecoveryPlan::Fork, SemanticReplayFault::Stored) => "fork-stored",
+                    (RecoveryPlan::Fork, SemanticReplayFault::AcceptedExperience) => {
+                        "fork-experience"
+                    }
+                };
+                let target = match plan {
+                    RecoveryPlan::Resume => source.clone(),
+                    RecoveryPlan::Fork => directory.path.join(format!("{label}.bundle")),
+                };
+                let bundle_plan = recovery_plan(plan, &source, &target);
+                let (domain, counters) = match fault {
+                    SemanticReplayFault::Stored => {
+                        BitVecDomain::unary_u8_external_replay_fault(0, false)
+                    }
+                    SemanticReplayFault::AcceptedExperience => {
+                        BitVecDomain::unary_u8_rejecting_external_verification_batch(0)
+                    }
+                };
+                let result = improve(
+                    domain,
+                    request(
+                        deep_nested_seeds(17..=17),
+                        recovery_verifications,
+                        bundle_plan,
+                    ),
+                    |_| ControlFlow::Continue(()),
+                );
+
+                match fault {
+                    SemanticReplayFault::Stored => {
+                        assert!(matches!(result, Err(SessionError::CorruptBundle)));
+                        assert_eq!(counters.replay_counts(), (1, stored));
+                        assert_eq!(counters.counts(), (0, 0));
+                    }
+                    SemanticReplayFault::AcceptedExperience => {
+                        assert!(matches!(result, Err(SessionError::CorruptBundle)));
+                        assert_eq!(counters.replay_counts(), (2, stored + 1));
+                        assert_eq!(counters.counts(), (1, 1));
+                    }
+                }
+                assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+                if target != source {
+                    assert!(
+                        !target.exists(),
+                        "an external semantic replay rejection must not publish {label}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_worker_failure_durably_preserves_the_charged_recovery_setup() {
+        let directory = TestDirectory::new();
+        let source = directory.path.join("worker-source.bundle");
+        let interrupted = directory.path.join("worker-interrupted.bundle");
+        build_promoted_knowledge_bundle(&source);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let bundle = CanonicalBundle::decode(&source_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let stored = usize::try_from(read_u64(bundle.segment(SegmentKind::Artifacts))).unwrap();
+        let accepted = inspect_experience_segment(bundle.segment(SegmentKind::Experience))
+            .unwrap()
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.verdict == ExperienceVerdictInspection::Accepted)
+            .count();
+        let obligations = inspect_knowledge_recovery_obligation_count(current_intelligence(
+            bundle.segment(SegmentKind::Revisions),
+        ))
+        .unwrap();
+        let recovery_verifications = u64::try_from(stored + accepted + 1 + obligations).unwrap();
+        let (domain, counters) = BitVecDomain::unary_u8_external_replay_fault(0, true);
+
+        let result = improve(
+            domain,
+            request(
+                deep_nested_seeds(17..=17),
+                recovery_verifications,
+                BundlePlan::Resume {
+                    source: source.clone(),
+                    target: interrupted.clone(),
+                },
+            ),
+            |_| ControlFlow::Continue(()),
+        );
+
+        assert!(matches!(result, Err(SessionError::VerificationWorker)));
+        assert_eq!(counters.replay_counts(), (1, stored));
+        assert_eq!(counters.counts(), (0, 0));
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        let interrupted_bytes = std::fs::read(&interrupted).unwrap();
+        let interrupted_bundle =
+            CanonicalBundle::decode(&interrupted_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let session = inspect_session_segment(interrupted_bundle.segment(SegmentKind::Session))
+            .expect("the worker failure must publish a restart-complete interrupted Session");
+        assert!(!session.completed);
+        assert_eq!(session.usage.verification_requests, recovery_verifications);
+    }
+
+    #[test]
+    fn external_replay_overruns_publish_the_exact_charged_interruption() {
+        let directory = TestDirectory::new();
+        let source = directory.path.join("overrun-source.bundle");
+        build_promoted_knowledge_bundle(&source);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let bundle = CanonicalBundle::decode(&source_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let stored = usize::try_from(read_u64(bundle.segment(SegmentKind::Artifacts))).unwrap();
+        let accepted = inspect_experience_segment(bundle.segment(SegmentKind::Experience))
+            .unwrap()
+            .attempts
+            .into_iter()
+            .filter(|attempt| attempt.verdict == ExperienceVerdictInspection::Accepted)
+            .count();
+        let obligations = inspect_knowledge_recovery_obligation_count(current_intelligence(
+            bundle.segment(SegmentKind::Revisions),
+        ))
+        .unwrap();
+        let recovery_verifications = u64::try_from(stored + accepted + 1 + obligations).unwrap();
+        let overruns = [
+            (
+                "resident",
+                ExternalVerificationUsage::new(1, 2, Duration::ZERO, Duration::ZERO),
+            ),
+            (
+                "elapsed",
+                ExternalVerificationUsage::new(1, 1, Duration::from_secs(11), Duration::ZERO),
+            ),
+            (
+                "cpu",
+                ExternalVerificationUsage::new(1, 1, Duration::ZERO, Duration::from_secs(11)),
+            ),
+        ];
+
+        for (label, usage) in overruns {
+            let interrupted = directory.path.join(format!("overrun-{label}.bundle"));
+            let (domain, counters) = BitVecDomain::unary_u8_external_replay_overrun(0, usage);
+            let result = improve(
+                domain,
+                request(
+                    deep_nested_seeds(17..=17),
+                    recovery_verifications,
+                    BundlePlan::Resume {
+                        source: source.clone(),
+                        target: interrupted.clone(),
+                    },
+                ),
+                |_| ControlFlow::Continue(()),
+            );
+
+            assert!(matches!(result, Err(SessionError::Resource)));
+            assert_eq!(counters.replay_counts(), (1, stored));
+            assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+            let interrupted_bytes = std::fs::read(&interrupted).unwrap();
+            let interrupted_bundle =
+                CanonicalBundle::decode(&interrupted_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+            let session = inspect_session_segment(interrupted_bundle.segment(SegmentKind::Session))
+                .expect("a charged post-dispatch overrun must publish an interrupted Session");
+            assert!(!session.completed);
+            assert_eq!(session.usage.verification_requests, recovery_verifications);
+            match label {
+                "elapsed" => assert!(session.usage.elapsed_time >= Duration::from_secs(11)),
+                "cpu" => assert!(session.usage.cpu_time >= Duration::from_secs(11)),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn external_structural_knowledge_rejection_preserves_resume_and_fork_sources_without_publication()
+     {
+        let directory = TestDirectory::new();
+        let valid = directory.path.join("structural-valid.bundle");
+        let source = directory.path.join("structural-source.bundle");
+        build_promoted_knowledge_bundle(&valid);
+        let source_bytes = with_domain_invalid_knowledge(&std::fs::read(valid).unwrap());
+        std::fs::write(&source, &source_bytes).unwrap();
+
+        for plan in [RecoveryPlan::Resume, RecoveryPlan::Fork] {
+            let target = match plan {
+                RecoveryPlan::Resume => source.clone(),
+                RecoveryPlan::Fork => directory.path.join("structural-forked.bundle"),
+            };
+            let (domain, counters) =
+                BitVecDomain::unary_u8_rejecting_external_verification_batch(usize::MAX);
+            let result = improve(
+                domain,
+                request(
+                    deep_nested_seeds(17..=17),
+                    64,
+                    recovery_plan(plan, &source, &target),
+                ),
+                |_| ControlFlow::Continue(()),
+            );
+
+            assert!(matches!(result, Err(SessionError::CorruptBundle)));
+            assert_eq!(counters.replay_counts(), (0, 0));
+            assert_eq!(counters.counts(), (0, 0));
+            assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+            if target != source {
+                assert!(
+                    !target.exists(),
+                    "an authenticated but domain-invalid Knowledge state must not publish",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn promoted_knowledge_is_rejected_when_its_reconstructed_witness_fails_the_installed_kernel() {
+        let directory = TestDirectory::new();
+        let source = directory.path.join("source.bundle");
+        build_promoted_knowledge_bundle(&source);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let bundle = CanonicalBundle::decode(&source_bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let stored = read_u64(bundle.segment(SegmentKind::Artifacts));
+        let experience =
+            inspect_experience_segment(bundle.segment(SegmentKind::Experience)).unwrap();
+        let accepted = experience
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.verdict == ExperienceVerdictInspection::Accepted)
+            .count();
+        let obligations = inspect_knowledge_recovery_obligation_count(current_intelligence(
+            bundle.segment(SegmentKind::Revisions),
+        ))
+        .unwrap();
+        assert!(obligations > 0);
+        let recovery_verifications = stored
+            .checked_add(u64::try_from(accepted).unwrap())
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| count.checked_add(u64::try_from(obligations).unwrap()))
+            .unwrap();
+
+        for plan in [RecoveryPlan::Resume, RecoveryPlan::Fork] {
+            let target = match plan {
+                RecoveryPlan::Resume => source.clone(),
+                RecoveryPlan::Fork => directory.path.join("forked.bundle"),
+            };
+            let (domain, counters) =
+                BitVecDomain::unary_u8_rejecting_external_verification_batch(accepted);
+            let result = improve(
+                domain,
+                request(
+                    deep_nested_seeds(17..=17),
+                    recovery_verifications,
+                    recovery_plan(plan, &source, &target),
+                ),
+                |_| ControlFlow::Continue(()),
+            );
+
+            assert!(
+                matches!(result, Err(SessionError::CorruptBundle)),
+                "a retained Knowledge obligation is not correct under the installed Kernel",
+            );
+            assert_eq!(
+                counters.counts(),
+                (accepted + 1, accepted + obligations),
+                "the rejecting batch must be exactly the first derived-Knowledge replay after every Accepted Experience replay",
+            );
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                source_bytes,
+                "failed current Resume and Fork must preserve their completed source",
+            );
+            if target != source {
+                assert!(
+                    !target.exists(),
+                    "a semantic Knowledge recovery mismatch must not publish a target checkpoint",
+                );
+            }
+        }
+    }
+
+    fn build_promoted_knowledge_bundle(path: &Path) {
+        improve(
+            BitVecDomain::unary_u8(),
+            request(
+                deep_nested_seeds(1..=8),
+                FIXTURE_VERIFICATIONS,
+                BundlePlan::Fresh {
+                    target: path.to_path_buf(),
+                },
+            ),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        let fork = path.with_extension("fork");
+        improve(
+            BitVecDomain::unary_u8(),
+            request(
+                deep_nested_seeds(9..=16),
+                FIXTURE_VERIFICATIONS,
+                BundlePlan::Fork {
+                    source: path.to_path_buf(),
+                    target: fork.clone(),
+                },
+            ),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        std::fs::rename(fork, path).unwrap();
+    }
+
+    fn deep_nested_seeds(constants: impl IntoIterator<Item = u8>) -> Vec<Expression> {
+        constants
+            .into_iter()
+            .map(|constant| {
+                Expression::xor(
+                    Expression::xor(
+                        Expression::xor(
+                            Expression::xor(Expression::input(), Expression::constant(constant)),
+                            Expression::constant(0),
+                        ),
+                        Expression::constant(0),
+                    ),
+                    Expression::constant(0),
+                )
+            })
+            .collect()
+    }
+
+    fn request(
+        seeds: Vec<Expression>,
+        verification_requests: u64,
+        bundle: BundlePlan,
+    ) -> ImprovementRequest<BitVecDomain> {
+        let objectives = NonEmpty::one(Objective::new(Metric::NodeCount, Direction::Minimize));
+        let preference =
+            Preference::tiered(NonEmpty::one(NonEmpty::one(Metric::NodeCount)), []).unwrap();
+        ImprovementRequest::new(
+            GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
+            SeedScope::new(NonEmpty::try_from_iter(seeds).unwrap()),
+            ResourceEnvelope::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+                NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+                NonZeroDuration::new(Duration::from_secs(10)).unwrap(),
+                NonZeroU64::new(verification_requests).unwrap(),
+            ),
+            bundle,
+        )
+        .unwrap()
+    }
+
+    fn current_intelligence(revisions: &[u8]) -> &[u8] {
+        const REVISION_IDS_BYTES: usize = 4 * 32;
+        let mut input = &revisions[REVISION_IDS_BYTES..];
+        let intelligence = take_sized(&mut input);
+        assert!(input.is_empty());
+        intelligence
+    }
+
+    fn with_domain_invalid_knowledge(bytes: &[u8]) -> Vec<u8> {
+        const REVISION_IDS_BYTES: usize = 4 * 32;
+        const INTELLIGENCE_ID_START: usize = 3 * 32;
+        let mut bundle = CanonicalBundle::decode(bytes, MAXIMUM_BUNDLE_BYTES).unwrap();
+        let source = bundle.segment(SegmentKind::Revisions);
+        let mut input = &source[REVISION_IDS_BYTES..];
+        let intelligence = take_sized(&mut input);
+        assert!(input.is_empty());
+        let hostile = hostile_current_knowledge_checkpoint(intelligence).unwrap();
+        let hostile_identity = &hostile[hostile.len() - 32..];
+        let mut revisions = source[..REVISION_IDS_BYTES].to_vec();
+        revisions[INTELLIGENCE_ID_START..REVISION_IDS_BYTES].copy_from_slice(hostile_identity);
+        push_sized(&mut revisions, &hostile);
+        bundle.replace_segment(SegmentKind::Revisions, revisions);
+        let mut session = bundle.segment(SegmentKind::Session).to_vec();
+        session[9..41].copy_from_slice(&bundle.restart_state_root());
+        bundle.replace_segment(SegmentKind::Session, session);
+        bundle.encode()
+    }
+
+    fn take_sized<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+        let count = usize::try_from(read_u64(input)).unwrap();
+        let (value, remainder) = input.split_at(count + 8);
+        *input = remainder;
+        &value[8..]
+    }
+
+    fn read_u64(input: &[u8]) -> u64 {
+        u64::from_le_bytes(input[..8].try_into().unwrap())
+    }
+
+    fn push_sized(output: &mut Vec<u8>, bytes: &[u8]) {
+        output.extend_from_slice(&u64::try_from(bytes.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(bytes);
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecoveryPlan {
+        Resume,
+        Fork,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SemanticReplayFault {
+        Stored,
+        AcceptedExperience,
+    }
+
+    fn recovery_plan(plan: RecoveryPlan, source: &Path, target: &Path) -> BundlePlan {
+        match plan {
+            RecoveryPlan::Resume => BundlePlan::Resume {
+                source: source.to_path_buf(),
+                target: target.to_path_buf(),
+            },
+            RecoveryPlan::Fork => BundlePlan::Fork {
+                source: source.to_path_buf(),
+                target: target.to_path_buf(),
+            },
+        }
+    }
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "reflex-bitvec-knowledge-kernel-recovery-{}-{sequence}",
+                std::process::id(),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).ok();
+        }
     }
 }

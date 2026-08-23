@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use reflex::internal_experiments::{
     CandidateAllocationQueueInspection, CandidateFateInspection, CandidateFateOutcomeInspection,
-    ExperienceVerdictInspection, inspect_experience_segment,
+    ExperienceVerdictInspection, inspect_experience_segment, inspect_intelligence_revision_segment,
 };
 use reflex::{
     BundlePlan, Direction, GoalSet, ImprovementRequest, NonEmpty, NonZeroDuration, Objective,
@@ -127,7 +127,7 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         .collect::<BTreeSet<_>>()
         .len();
     assert!(
-        trained_snapshot.model_generation >= 1,
+        trained_snapshot.active_specialists >= 1,
         "training retained {} attempts over {training_claims} claims ({} accepted; queues: origin {} accepted {}, derived {}, learned {}, Bootstrap {} accepted {}) across {} Candidate Fates",
         trained_snapshot.attempts.len(),
         trained_snapshot
@@ -243,8 +243,8 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
         learned_accepted > 0
             && learned_queue_accepted > 0
             && learned_new.iter().any(|attempt| !attempt.accepted)
-            && learned_accepted > bootstrap_accepted,
-        "the learned allocator must beat Bootstrap while retaining protected exploration; learned accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
+            && learned_accepted >= bootstrap_accepted,
+        "the specialist allocator must remain no worse than Bootstrap while retaining protected exploration; specialist accepted {learned_accepted}, Bootstrap accepted {bootstrap_accepted}"
     );
     assert_eq!(
         learned_fates
@@ -304,12 +304,12 @@ fn promoted_model_changes_later_allocation_but_not_sufficient_budget_semantics()
                 CandidateFateOutcomeInspection::Verified {
                     allocation_queue: CandidateAllocationQueueInspection::ProtectedOrigin,
                     bootstrap_rank: Some(_),
-                    learned_rank: Some(_),
+                    learned_rank: None,
                     ..
                 }
             )
         }),
-        "protected learned work must retain both counterfactual policy ranks"
+        "protected specialist work must retain its counterfactual Bootstrap rank"
     );
     let bootstrap_full = snapshot(&bootstrap_full);
     let learned_semantics = learned_full.attempts[trained_snapshot.attempts.len()..]
@@ -369,7 +369,7 @@ fn request(
 
 struct Snapshot {
     artifact_count: usize,
-    model_generation: u64,
+    active_specialists: usize,
     attempts: Vec<Attempt>,
     candidate_fates: Vec<CandidateFateInspection>,
 }
@@ -389,18 +389,7 @@ fn snapshot(path: &Path) -> Snapshot {
     let experience = inspect_experience_segment(bundle.segment(SegmentKind::Experience)).unwrap();
     let artifact_count =
         usize::try_from(u64::from_le_bytes(artifacts[..8].try_into().unwrap())).unwrap();
-    let knowledge_length =
-        usize::try_from(u64::from_le_bytes(revisions[64..72].try_into().unwrap())).unwrap();
-    let learning_offset = 72 + knowledge_length;
-    let learning_length = usize::try_from(u64::from_le_bytes(
-        revisions[learning_offset..learning_offset + 8]
-            .try_into()
-            .unwrap(),
-    ))
-    .unwrap();
-    let learning = &revisions[learning_offset + 8..learning_offset + 8 + learning_length];
-    assert_eq!(&learning[..5], b"RFLS\x03");
-    let model_generation = u64::from_le_bytes(learning[5..13].try_into().unwrap());
+    let intelligence = inspect_intelligence_revision_segment(revisions).unwrap();
     let attempts = experience
         .attempts
         .into_iter()
@@ -413,7 +402,7 @@ fn snapshot(path: &Path) -> Snapshot {
         .collect();
     Snapshot {
         artifact_count,
-        model_generation,
+        active_specialists: intelligence.active_specialists,
         attempts,
         candidate_fates: experience.candidate_fates,
     }

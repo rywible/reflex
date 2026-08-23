@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 
 use atomic_write_file::AtomicWriteFile;
 
-type PublicationResult = Result<u64, std::io::Error>;
+type PublicationResult = Result<(u64, Vec<u8>), std::io::Error>;
 
 struct Publication {
     bytes: Vec<u8>,
@@ -27,7 +27,8 @@ impl CheckpointWriter {
             .stack_size(512 * 1024)
             .spawn(move || {
                 while let Ok(Some(publication)) = receiver.recv() {
-                    let result = publish(&target, &publication.bytes);
+                    let result = publish(&target, &publication.bytes)
+                        .map(|written| (written, publication.bytes));
                     let _ = publication.result.send(result);
                 }
             })?;
@@ -51,8 +52,12 @@ impl CheckpointWriter {
     }
 
     pub(crate) fn barrier(&mut self) -> Result<u64, std::io::Error> {
+        self.barrier_retaining().map(|(written, _)| written)
+    }
+
+    pub(crate) fn barrier_retaining(&mut self) -> Result<(u64, Vec<u8>), std::io::Error> {
         let Some(pending) = self.pending.take() else {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         };
         let result = pending.recv().map_err(|_| worker_stopped())?;
         self.pending_bytes = 0;
@@ -94,7 +99,7 @@ fn worker_stopped() -> std::io::Error {
     std::io::Error::other("Reflex durability worker stopped")
 }
 
-fn publish(target: &std::path::Path, bytes: &[u8]) -> PublicationResult {
+fn publish(target: &std::path::Path, bytes: &[u8]) -> Result<u64, std::io::Error> {
     let mut file = AtomicWriteFile::open(target)?;
     if let Err(error) = file.write_all(bytes) {
         let _ = file.discard();
@@ -125,3 +130,30 @@ fn test_fault_point(phase: &str) {
 #[cfg(not(debug_assertions))]
 #[inline(always)]
 fn test_fault_point(_: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckpointWriter;
+
+    #[test]
+    fn durability_barrier_returns_the_submitted_allocation_without_a_caller_clone() {
+        let path = std::env::temp_dir().join(format!(
+            "reflex-durability-retained-{}-{:?}.bundle",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let bytes = vec![3, 1, 4, 1, 5, 9];
+        let pointer = bytes.as_ptr();
+        let mut writer = CheckpointWriter::start(path.clone()).unwrap();
+
+        writer.submit(bytes).unwrap();
+        let (written, retained) = writer.barrier_retaining().unwrap();
+
+        assert_eq!(written, 6);
+        assert_eq!(retained, [3, 1, 4, 1, 5, 9]);
+        assert_eq!(retained.as_ptr(), pointer);
+        assert_eq!(std::fs::read(&path).unwrap(), retained);
+        writer.finish().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+}

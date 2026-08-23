@@ -13,7 +13,7 @@ use reflex_bitvec::{BitVecDomain, Expression, Metric, SeedScope};
 use serde::{Deserialize, Serialize};
 
 use crate::harness::{
-    AnyError, capture_child_with_environment, duration_ns, environment, require_absent,
+    AnyError, capture_large_campaign_child, duration_ns, environment, require_absent,
     require_release,
 };
 use crate::quantile;
@@ -23,7 +23,7 @@ const REPLICATES: u32 = 5;
 const EXPRESSION_LEAVES: usize = 256;
 const SEEDS: u8 = 32;
 const ONE_LANE: usize = 1;
-const MANY_LANES: usize = 8;
+const MANY_LANES: usize = 7;
 const REQUIRED_SPEEDUP_MILLIS: u64 = 6_000;
 const MAX_CPU_RATIO_MILLIS: u64 = 1_200;
 
@@ -82,7 +82,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
     };
     require_absent(&output, "verification scaling report")?;
     if std::thread::available_parallelism()?.get() < MANY_LANES {
-        return Err("verification-scaling requires at least eight available CPU lanes".into());
+        return Err("verification-scaling requires at least seven experimental CPU lanes".into());
     }
     let host = environment()?;
     let root = std::env::current_dir()?.join(format!(
@@ -130,14 +130,15 @@ fn run_all(root: &Path, host: crate::harness::HostEnvironment) -> Result<Report,
                 OsString::from("REFLEX_INTERNAL_PHASE_REPORT_PREFIX"),
                 prefix.as_os_str().to_owned(),
             )];
-            let capture = capture_child_with_environment(
+            let capture = capture_large_campaign_child(
                 &executable,
                 &arguments,
                 &prefix,
                 Some(Duration::from_secs(10)),
+                None,
                 &environment,
             )?;
-            if capture.timed_out || !capture.status.success() {
+            if capture.timed_out || capture.output_limit_exceeded || !capture.status.success() {
                 return Err(
                     format!("verification scaling child failed: {}", capture.stderr).into(),
                 );
@@ -181,7 +182,7 @@ fn run_all(root: &Path, host: crate::harness::HostEnvironment) -> Result<Report,
         .len()
         == 1;
     Ok(Report {
-        schema: "reflex-candidate-verification-scaling-v1",
+        schema: "reflex-candidate-verification-scaling-v2",
         status: "development-only",
         warning: "This bounded gate is performance evidence, not Scientific Confirmation.",
         environment: host,
@@ -279,4 +280,15 @@ fn phase_value(report: &str, name: &str) -> Result<u64, AnyError> {
         .lines()
         .find_map(|line| line.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
         .ok_or_else(|| format!("phase report omitted {name}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MANY_LANES, ONE_LANE};
+
+    #[test]
+    fn scaling_treatments_fit_an_eight_cpu_host_with_one_reserved_cpu() {
+        assert_eq!([ONE_LANE, MANY_LANES], [1, 7]);
+        assert_eq!(MANY_LANES + 1, 8);
+    }
 }

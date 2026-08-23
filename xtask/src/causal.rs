@@ -1,11 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use atomic_write_file::AtomicWriteFile;
 use cpu_time::ProcessTime;
+#[cfg(test)]
+use reflex::internal_experiments::{
+    IntelligenceComponentInspection, inspect_intelligence_components,
+    inspect_knowledge_revision_segment,
+};
+use reflex::internal_experiments::{IntelligenceTreatmentSource, ablate_intelligence_checkpoint};
 use reflex::{
     BundlePlan, Completion, Direction, DomainDefinition, GoalSet, ImprovementRequest,
     MeasurementConstraint, NonEmpty, NonZeroDuration, Objective, OptimizationGoal, Preference,
@@ -17,13 +25,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::harness::{
-    AnyError, HostEnvironment, capture_child_with_environment, completion_name, duration_ns,
+    AnyError, HostEnvironment, capture_large_campaign_child, completion_name, duration_ns,
     environment, hash_file, hash_json, hex, require_absent, require_clean, require_release,
 };
 
-const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v5";
+const SPEC_VERSION: &str = "reflex-u8-causal-confirmation-v6";
+const DOMAIN_IDENTITY: &str =
+    "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v4";
 const EXPECTED_SPEC_SHA256: &str =
-    "05b0e891b6023d5fe1e7b9db3b8d08e109e50422d3c9e6bd0bf16964bd644f14";
+    "a6afd9585d5c406488d29401373f25fdff979c2d36424d63f1dc3875e7fef166";
 const BOOTSTRAP_COMPARATOR_REPORT: &str = "docs/baselines/bootstrap-reference-domain-v7.json";
 const BOOTSTRAP_COMPARATOR_FILE_SHA256: &str =
     "b8a5e2c8ef87a88c4576d934e8d9e234961942cc599973d789a5fe4e29ad6daa";
@@ -63,16 +73,16 @@ const DERIVED_THRESHOLD: i64 = 200;
 const RESAMPLES: usize = 10_000;
 const PILOT_EXCLUSION_CASES: usize = 8_190;
 const AUDIT_SEEDS: [&str; REPLICATES] = [
-    "0f2b3ade103828b145701f3c7d64157c63ee88a13fe903803e3adc2c74f7dc2e",
-    "ed8ed953af495d71c4fba71c9914b73e34b28325a9b6f8bcba0a1918ed1e13b3",
-    "d0d6aaea5d9aad87039e1b501d16249224cb59dd37834ba51c92511242bf2d87",
-    "a1e62a6d517694ab11ddffb4d93dbf31c8f98d7ba12ecd3cff403b40fb26375f",
-    "ec21b3a02980f77b4e8c1a047dfa879a5eb3f8d72d5bddf13698be73d100bdac",
-    "eba1214c97f2c2b882cead130c567499ff8031963a845d58b050f754ab9470c0",
-    "af816bb872305246c494c3537e6fe2bc77a0e9f14caad5d6a26ae05c5d423577",
-    "701026742fac479de5654c1aef5483c32889f1dd3f3c707d7935ec51f78e0f58",
-    "804b99112ce6ef613ccf1e92194bcfce4c4dd74fef1cade86c80c75f44999f21",
-    "354c996ca2ad8d7edd5f9293df515b962d231b3211c2fb1077cf31caeb1759e8",
+    "1f9944407c25de385e09287d6dd98f96ff160a9144d1f25ad692f07ac20e5a52",
+    "f847251d171b938af061eb406675aed7fbaa43d5d30676114a7534a09528e898",
+    "6e671b8a2443560f4f737f47bfe30207292eafdc30c1de424717dca4d2986335",
+    "763b23a856a3f3c875639c4e687c1ecb7a278367e52f8b686570884f5071a903",
+    "f99c8f5845fcee12e37a4019e30b37249d58b57417ad67568477bbe06591cf09",
+    "5ecb3f43906d95a81b5f8e2b68cf2660f7b8d4256292fe6498b75b7b4c331ca7",
+    "13a93f05e712adcf5151c2ae4008776823e6b706bd3be3e827ff957fb54ce26c",
+    "058bdd4545bd85d53338c5567b6fe8fb41abcc94c7b7fd722d21cded1a4fb81b",
+    "df4e80c1bf19a3bc6d7aa1bba5fdad046f756b69c91966ef934da1e443a7c164",
+    "a557f8887aa3bfbcb9358f9707b70fc062ba238d26bd3d9c698b968f0c1cb023",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -113,14 +123,6 @@ struct ConsumedReport {
     audit_corpora: Vec<Vec<CorpusRecord>>,
 }
 
-#[derive(Serialize)]
-struct AuditCorpusArtifact {
-    schema: &'static str,
-    specification_sha256: String,
-    audit_corpus_sha256: String,
-    audit_corpora: Vec<Vec<CorpusRecord>>,
-}
-
 #[derive(Debug, Serialize)]
 struct ExperimentSpec {
     version: &'static str,
@@ -128,7 +130,7 @@ struct ExperimentSpec {
     domain_identity: &'static str,
     development_corpus: &'static str,
     consumed_audit_corpus: &'static str,
-    bootstrap_comparator: &'static str,
+    historical_bootstrap_calibration: &'static str,
     training_generator: &'static str,
     training_verification_requests: u64,
     pilot_exclusion_cases: usize,
@@ -470,10 +472,14 @@ fn v5_outcome_matches(run: &RecordedRun) -> bool {
         && result.model_revision == model
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixed causal confirmation protocol remains contiguous and auditable"
+)]
 pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     let (output, specification, specification_sha256, environment) =
         confirm_configuration(arguments)?;
-    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v5");
+    let work = std::env::current_dir()?.join("target/reflex-causal-confirmation-v6");
     if work.exists() {
         return Err(format!(
             "causal work directory already exists; preserve and inspect it before proceeding: {}",
@@ -482,17 +488,20 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
         .into());
     }
     std::fs::create_dir_all(&work)?;
+    let output = match resolve_report_output(&output, &work) {
+        Ok(output) => output,
+        Err(error) => {
+            std::fs::remove_dir(&work)?;
+            return Err(error);
+        }
+    };
     let full = work.join("full.bundle");
     let bootstrap_revision = work.join("bootstrap-revision.bundle");
     build_training_bundles(&full, &bootstrap_revision)?;
-    let no_model = work.join("no-model.bundle");
-    let no_derived = work.join("no-derived.bundle");
-    ablate_causal_bundle(&full, &no_model, Some(&bootstrap_revision), false)?;
-    ablate_causal_bundle(&full, &no_derived, None, true)?;
-    validate_treatment_bundle(&no_model)?;
-    validate_treatment_bundle(&no_derived)?;
-
-    let audit_corpora = generate_audit_corpora()?;
+    let treatments = prepare_treatment_bundles(&work, &full, &bootstrap_revision)?;
+    let audit_corpora = generate_audit_corpora(&treatments.audit_exposure)?;
+    let no_model = treatments.no_model;
+    let no_derived = treatments.no_derived;
     let audit_corpus_sha256 = hash_json(&audit_corpora)?;
     persist_audit_corpora(&work, &audit_corpora)?;
     let executable = std::env::current_exe()?;
@@ -560,7 +569,18 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+    let mut report_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)?;
+    serde_json::to_writer_pretty(&mut report_file, &report)?;
+    report_file.sync_all()?;
+    std::fs::File::open(
+        output
+            .parent()
+            .ok_or("causal confirmation output has no resolved parent")?,
+    )?
+    .sync_all()?;
     std::fs::remove_dir_all(work)?;
     println!(
         "wrote {} ({})",
@@ -574,6 +594,27 @@ pub(super) fn run_confirm(arguments: &[String]) -> Result<(), AnyError> {
     Ok(())
 }
 
+fn resolve_report_output(output: &Path, work: &Path) -> Result<PathBuf, AnyError> {
+    let output = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(output)
+    };
+    let file_name = output
+        .file_name()
+        .ok_or("causal confirmation output must name a report file")?;
+    let parent = output
+        .parent()
+        .ok_or("causal confirmation output must have a parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let resolved_parent = std::fs::canonicalize(parent)?;
+    let resolved_work = std::fs::canonicalize(work)?;
+    if resolved_parent.starts_with(&resolved_work) {
+        return Err("causal confirmation output must live outside its fixed work directory".into());
+    }
+    Ok(resolved_parent.join(file_name))
+}
+
 fn persist_audit_corpora(work: &Path, audit_corpora: &[Vec<CorpusRecord>]) -> Result<(), AnyError> {
     std::fs::write(
         work.join("audit-corpora.json"),
@@ -585,34 +626,6 @@ fn persist_audit_corpora(work: &Path, audit_corpora: &[Vec<CorpusRecord>]) -> Re
             serde_json::to_vec(corpus)?,
         )?;
     }
-    Ok(())
-}
-
-pub(super) fn materialize_audit(arguments: &[String]) -> Result<(), AnyError> {
-    require_release("audit materialization")?;
-    let output = match arguments {
-        [flag, path] if flag == "--output" => PathBuf::from(path),
-        _ => return Err("causal-materialize-audit requires --output PATH".into()),
-    };
-    let specification_sha256 = hash_json(&specification())?;
-    if specification_sha256 != EXPECTED_SPEC_SHA256 {
-        return Err("cannot materialize an audit corpus for a modified specification".into());
-    }
-    require_clean(&environment()?, "audit materialization")?;
-    validate_bootstrap_comparator()?;
-    require_absent(&output, "audit artifact")?;
-    let audit_corpora = generate_audit_corpora()?;
-    let artifact = AuditCorpusArtifact {
-        schema: "reflex-consumed-audit-corpus-v1",
-        specification_sha256,
-        audit_corpus_sha256: hash_json(&audit_corpora)?,
-        audit_corpora,
-    };
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&output, serde_json::to_vec_pretty(&artifact)?)?;
-    println!("wrote {}", output.display());
     Ok(())
 }
 
@@ -633,7 +646,7 @@ fn confirm_configuration(
 ) -> Result<(PathBuf, ExperimentSpec, String, HostEnvironment), AnyError> {
     require_release("causal")?;
     let output = match arguments {
-        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v5.json"),
+        [] => PathBuf::from("docs/experiments/u8-causal-confirmation-v6.json"),
         [flag, path] if flag == "--output" => PathBuf::from(path),
         _ => return Err("causal-confirm accepts only an optional --output PATH".into()),
     };
@@ -648,11 +661,12 @@ fn confirm_configuration(
     }
     let environment = environment()?;
     require_clean(&environment, "confirmatory")?;
-    validate_bootstrap_comparator()?;
+    validate_historical_bootstrap_calibration()?;
     Ok((output, specification, specification_sha256, environment))
 }
 
 pub(super) fn run_child(arguments: &[String]) -> Result<(), AnyError> {
+    require_installed_domain_identity()?;
     let assignment = parse_child_assignment(arguments)?;
     let replicate = assignment.replicate;
     let treatment = assignment.treatment;
@@ -823,10 +837,10 @@ fn specification() -> ExperimentSpec {
     ExperimentSpec {
         version: SPEC_VERSION,
         hypothesis: "under equal evaluation envelopes, shared consolidated Reflex improves unseen unary u8 semantic Campaigns more than isolated Bootstrap",
-        domain_identity: "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v3",
-        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, and every consumed v1, v2, v3, and v4 audit semantic group",
-        consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c; v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081; v3 audit sha256 585c9e7ec1f2c64fb34fb2d9a300e72d5d29c2ea3ff34fca250807c4d990aaaf; v4 audit sha256 0eae44e4ca7a2ba050f02ab87c0e2de27fecde457d8744636e29afdd6d404787",
-        bootstrap_comparator: "reflex-bootstrap-baseline-v7 report file sha256 b8a5e2c8ef87a88c4576d934e8d9e234961942cc599973d789a5fe4e29ad6daa; protocol sha256 14b108b35f336c134fa94139de5430adba0904f8471ffa44de4fb7c55fc0b880; content sha256 18af93061337a068e4c883dd149632d87b8d197d2ff33ad87e1c074aedf1f117; semantic outcome sha256 ecaf1feba1d8d45511b2b3b01fd85d0a9be829ac48814f3bc29e9daa1b8d5582",
+        domain_identity: DOMAIN_IDENTITY,
+        development_corpus: "all x xor c semantics, the first 8190 enumerated add/rotate pilot groups, and every consumed v1, v2, v3, v4, and v5 audit semantic group",
+        consumed_audit_corpus: "v1 audit sha256 7c8d87d90691502a55396e3cb70561bbd63cc7179d213879f93d6c5e9bb1a81c; v2 audit sha256 ad7b01320496b67cecabd97aea949c7e0a198945eee45faad07d811e31b2e081; v3 audit sha256 585c9e7ec1f2c64fb34fb2d9a300e72d5d29c2ea3ff34fca250807c4d990aaaf; v4 audit sha256 0eae44e4ca7a2ba050f02ab87c0e2de27fecde457d8744636e29afdd6d404787; v5 audit sha256 5e1e3ad15fb06719b79855fbd18ce057c8f536f9d5e53d8575e13c9c4671a2ce",
+        historical_bootstrap_calibration: "historical v3 Semantic Identity calibration only: reflex-bootstrap-baseline-v7 report file sha256 b8a5e2c8ef87a88c4576d934e8d9e234961942cc599973d789a5fe4e29ad6daa; protocol sha256 14b108b35f336c134fa94139de5430adba0904f8471ffa44de4fb7c55fc0b880; content sha256 18af93061337a068e4c883dd149632d87b8d197d2ff33ad87e1c074aedf1f117; not an exact v4 comparator; the fresh in-protocol Bootstrap arm is authoritative",
         training_generator: "96 refuted Seeds xor(input,c) for c=1..96 followed by 96 useful Seeds xor(xor(xor(input,c),0),0) for c=97..192",
         training_verification_requests: 100_000,
         pilot_exclusion_cases: PILOT_EXCLUSION_CASES,
@@ -834,7 +848,7 @@ fn specification() -> ExperimentSpec {
         audit_generator: "sha256(seed || little-endian counter) rejection sampling into globally unique add/rotate truth-table groups; ordinal-balanced surface categories",
         audit_surface_categories: "bytes map to c1=(b0 mod 255)+1,r1=(b1 mod 7)+1,c2=(b2 mod 255)+1,r2=(b3 mod 7)+1; accepted ordinal category cycles [xor(base,31),xor(base,0),xor(xor(base,0),0)] where base=rotl(add(rotl(add(input,c1),r1),c2),r2)",
         semantic_group_digest: "sha256('reflex-u8-semantic-function-v1\\0' || outputs for inputs 0..255 in ascending order)",
-        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1, v2, v3, and v4 audit truth-table group, and every v5 audit group accepted by an earlier replicate",
+        semantic_split: "reject every xor(input,c) truth-table group, every observed pilot truth-table group, every consumed v1, v2, v3, v4, and v5 audit truth-table group, and every v6 audit group accepted by an earlier replicate",
         audit_exposure: "build and validate all training and ablation bundles before generating any audit corpus; persist the complete corpus artifact and every per-replicate corpus before the first assignment; execute immediately after generation and publish every record",
         audit_seeds: AUDIT_SEEDS.to_vec(),
         independent_replicates: REPLICATES,
@@ -843,7 +857,7 @@ fn specification() -> ExperimentSpec {
             .iter()
             .map(|treatment| treatment.as_str())
             .collect(),
-        ablations: "full=trained bundle; no-model=identical full bundle with Learning state and Model Revision ID from a production-created Bootstrap bundle; no-derived=identical full bundle with Derived Operators removed and canonical Knowledge Revision ID recomputed; bootstrap=fresh isolated production Runtime",
+        ablations: "full=trained bundle; no-model=identical full bundle with the exact empty Bootstrap Model Ecology; no-derived=identical full bundle with executable and promotable Derived Operator Knowledge removed and canonical Knowledge Revision ID recomputed; bootstrap=fresh isolated production Runtime and the authoritative comparator",
         treatment_order: "replicate-index cyclic rotation of [full,no-model,no-derived,bootstrap]",
         worker_threads: 1,
         resident_bytes: RESIDENT_BYTES,
@@ -880,14 +894,14 @@ fn specification() -> ExperimentSpec {
     }
 }
 
-fn validate_bootstrap_comparator() -> Result<(), AnyError> {
+fn validate_historical_bootstrap_calibration() -> Result<(), AnyError> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("xtask manifest must have a workspace parent")?;
     let report_path = workspace.join(BOOTSTRAP_COMPARATOR_REPORT);
     if hash_file(&report_path)? != BOOTSTRAP_COMPARATOR_FILE_SHA256 {
         return Err(
-            "Bootstrap comparator report does not match its preregistered file hash".into(),
+            "historical Bootstrap calibration does not match its registered file hash".into(),
         );
     }
     let report: BootstrapComparatorReport = serde_json::from_slice(&std::fs::read(report_path)?)?;
@@ -909,13 +923,27 @@ fn validate_bootstrap_comparator() -> Result<(), AnyError> {
         });
     if !valid {
         return Err(
-            "Bootstrap comparator report is incomplete or contains a Protocol Deviation".into(),
+            "historical Bootstrap calibration is incomplete or contains a Protocol Deviation"
+                .into(),
         );
     }
     Ok(())
 }
 
+fn require_installed_domain_identity() -> Result<(), AnyError> {
+    let installed = BitVecDomain::unary_u8().semantic_identity();
+    if installed.as_str() != DOMAIN_IDENTITY {
+        return Err(format!(
+            "causal protocol requires Domain Semantic Identity {DOMAIN_IDENTITY}, installed {}",
+            installed.as_str(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn build_training_bundles(full: &Path, bootstrap: &Path) -> Result<(), AnyError> {
+    require_installed_domain_identity()?;
     improve(
         BitVecDomain::unary_u8(),
         request(
@@ -954,13 +982,44 @@ fn training_seeds() -> Vec<Expression> {
     refuted.chain(useful).collect()
 }
 
-fn generate_audit_corpora() -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
+struct AuditExposureAuthority;
+
+struct PreparedTreatments {
+    no_model: PathBuf,
+    no_derived: PathBuf,
+    audit_exposure: AuditExposureAuthority,
+}
+
+fn prepare_treatment_bundles(
+    work: &Path,
+    full: &Path,
+    bootstrap_revision: &Path,
+) -> Result<PreparedTreatments, AnyError> {
+    validate_treatment_bundle(full)?;
+    let no_model = work.join("no-model.bundle");
+    let no_derived = work.join("no-derived.bundle");
+    ablate_causal_bundle(full, &no_model, Some(bootstrap_revision), false)?;
+    ablate_causal_bundle(full, &no_derived, None, true)?;
+    validate_treatment_bundle(&no_model)?;
+    validate_treatment_bundle(&no_derived)?;
+    Ok(PreparedTreatments {
+        no_model,
+        no_derived,
+        audit_exposure: AuditExposureAuthority,
+    })
+}
+
+fn generate_audit_corpora(
+    _authority: &AuditExposureAuthority,
+) -> Result<Vec<Vec<CorpusRecord>>, AnyError> {
+    require_installed_domain_identity()?;
     let mut excluded = development_semantics();
     excluded.extend(pilot_semantics());
     excluded.extend(consumed_v1_semantics()?);
     excluded.extend(consumed_v2_semantics()?);
     excluded.extend(consumed_v3_semantics()?);
     excluded.extend(consumed_v4_semantics()?);
+    excluded.extend(consumed_v5_semantics()?);
     let mut global = excluded.clone();
     let mut corpora = Vec::with_capacity(REPLICATES);
     for seed in AUDIT_SEEDS {
@@ -1010,6 +1069,10 @@ fn consumed_v3_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
 
 fn consumed_v4_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
     consumed_semantics(CONSUMED_V4_REPORT, CONSUMED_V4_AUDIT_SHA256)
+}
+
+fn consumed_v5_semantics() -> Result<BTreeSet<[u8; 32]>, AnyError> {
+    consumed_semantics(CONSUMED_V5_REPORT, CONSUMED_V5_AUDIT_SHA256)
 }
 
 fn consumed_semantics(
@@ -1413,11 +1476,12 @@ fn run_assignment_capture(
             prefix.as_os_str().to_owned(),
         )]
     });
-    let capture = capture_child_with_environment(
+    let capture = capture_large_campaign_child(
         executable,
         &arguments,
         target,
         Some(Duration::from_secs(CHILD_TIMEOUT_SECONDS)),
+        None,
         &child_environment,
     )?;
     let (result, failure) = if capture.timed_out {
@@ -1426,6 +1490,11 @@ fn run_assignment_capture(
             Some(format!(
                 "child exceeded the {CHILD_TIMEOUT_SECONDS}-second process timeout"
             )),
+        )
+    } else if capture.output_limit_exceeded {
+        (
+            None,
+            Some("child exceeded the bounded diagnostic-output allowance".into()),
         )
     } else if capture.status.success() {
         match serde_json::from_str::<ChildResult>(capture.stdout.trim()) {
@@ -1606,75 +1675,81 @@ pub(super) fn ablate_bundle(
     let identity = bundle.identity().to_vec();
     let artifacts = bundle.segment(SegmentKind::Artifacts).to_vec();
     let revisions = bundle.segment(SegmentKind::Revisions);
-    let mut input = &revisions[64..];
-    let mut knowledge = take_sized(&mut input)?.to_vec();
-    let mut learning = take_sized(&mut input)?.to_vec();
-    if !input.is_empty() {
-        return Err("trailing Revisions bytes".into());
-    }
-    let mut model_id: [u8; 32] = revisions[32..64].try_into()?;
-    if let Some(template) = model_template {
-        let template_bundle =
-            CanonicalBundle::decode(&std::fs::read(template)?, maximum_logical_bytes)?;
-        let template_revisions = template_bundle.segment(SegmentKind::Revisions);
-        model_id = template_revisions[32..64].try_into()?;
-        let mut template_input = &template_revisions[64..];
-        take_sized(&mut template_input)?;
-        learning = take_sized(&mut template_input)?.to_vec();
-    }
-    let knowledge_id = if derived {
-        knowledge = knowledge_without_operators(&knowledge)?;
-        knowledge_revision_id(&identity, &artifacts, &knowledge)?
+    let checkpoint = current_intelligence_checkpoint(revisions)?;
+    let template_bundle = if let Some(template) = model_template {
+        Some(CanonicalBundle::decode(
+            &std::fs::read(template)?,
+            maximum_logical_bytes,
+        )?)
     } else {
-        revisions[..32].try_into()?
+        None
     };
+    let template_checkpoint = template_bundle
+        .as_ref()
+        .map(|template| {
+            current_intelligence_checkpoint(template.segment(SegmentKind::Revisions))
+                .map(|checkpoint| IntelligenceTreatmentSource::new(template.identity(), checkpoint))
+        })
+        .transpose()?;
+    let treatment = ablate_intelligence_checkpoint(
+        IntelligenceTreatmentSource::new(&identity, checkpoint),
+        template_checkpoint,
+        derived,
+    )?;
+    let knowledge_id =
+        current_knowledge_revision_id(&identity, &artifacts, treatment.knowledge_product)?;
     let mut payload = Vec::new();
     payload.extend_from_slice(&knowledge_id);
-    payload.extend_from_slice(&model_id);
-    push_sized(&mut payload, &knowledge);
-    push_sized(&mut payload, &learning);
+    payload.extend_from_slice(&treatment.model_revision);
+    payload.extend_from_slice(&treatment.runtime_policy_revision);
+    payload.extend_from_slice(&treatment.intelligence_revision);
+    push_sized(&mut payload, &treatment.checkpoint);
     bundle.replace_segment(SegmentKind::Revisions, payload);
-    std::fs::write(target, bundle.encode())?;
+    rebind_completed_session_restart_root(&mut bundle)?;
+    publish_treatment_bundle(target, &bundle.encode())?;
     Ok(())
 }
 
-fn knowledge_without_operators(state: &[u8]) -> Result<Vec<u8>, AnyError> {
-    let mut input = state;
-    if take(&mut input, 5)? != b"RFKS\x02" {
-        return Err("invalid Knowledge State".into());
+fn publish_treatment_bundle(target: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = AtomicWriteFile::open(target)?;
+    if let Err(error) = file.write_all(bytes) {
+        let _ = file.discard();
+        return Err(error);
     }
-    read_u64(&mut input)?;
-    let mut champion = take_sized(&mut input)?;
-    if take(&mut champion, 5)? != b"RFKR\x02" {
-        return Err("invalid Knowledge Revision".into());
-    }
-    let summarized_attempts = read_u64(&mut champion)?;
-    let active_count = read_u64(&mut champion)?;
-    let active = take(&mut champion, usize::try_from(active_count)? * 32)?;
-    let mut revision = b"RFKR\x02".to_vec();
-    revision.extend_from_slice(&summarized_attempts.to_le_bytes());
-    revision.extend_from_slice(&active_count.to_le_bytes());
-    revision.extend_from_slice(active);
-    revision.extend_from_slice(&0_u64.to_le_bytes());
-    let default_revision = [
-        b"RFKR\x02".as_slice(),
-        &0_u64.to_le_bytes(),
-        &0_u64.to_le_bytes(),
-        &0_u64.to_le_bytes(),
-    ]
-    .concat();
-    let mut output = b"RFKS\x02".to_vec();
-    output.extend_from_slice(&1_u64.to_le_bytes());
-    push_sized(&mut output, &revision);
-    output.push(1);
-    push_sized(&mut output, &default_revision);
-    Ok(output)
+    file.commit()
 }
 
-fn knowledge_revision_id(
+fn rebind_completed_session_restart_root(bundle: &mut CanonicalBundle) -> Result<(), AnyError> {
+    const DISPOSITION_BYTES: usize = 1;
+    const RUNTIME_REVISION_BYTES: usize = 8;
+    const RESTART_ROOT_BYTES: usize = 32;
+    let root_start = DISPOSITION_BYTES + RUNTIME_REVISION_BYTES;
+    let root_end = root_start + RESTART_ROOT_BYTES;
+    let mut session = bundle.segment(SegmentKind::Session).to_vec();
+    if session.first() != Some(&1) || session.get(root_start..root_end).is_none() {
+        return Err("causal ablations require a completed current Session".into());
+    }
+    session[root_start..root_end].copy_from_slice(&bundle.restart_state_root());
+    bundle.replace_segment(SegmentKind::Session, session);
+    Ok(())
+}
+
+fn current_intelligence_checkpoint(revisions: &[u8]) -> Result<&[u8], AnyError> {
+    const CURRENT_REVISION_IDS_BYTES: usize = 4 * 32;
+    let mut input = revisions
+        .get(CURRENT_REVISION_IDS_BYTES..)
+        .ok_or("truncated current Revisions header")?;
+    let checkpoint = take_sized(&mut input)?;
+    if !checkpoint.starts_with(b"RFIC") || !input.is_empty() {
+        return Err("invalid current Intelligence Revisions payload".into());
+    }
+    Ok(checkpoint)
+}
+
+fn current_knowledge_revision_id(
     identity: &[u8],
     artifacts: &[u8],
-    state: &[u8],
+    knowledge_product: [u8; 32],
 ) -> Result<[u8; 32], AnyError> {
     let mut input = artifacts;
     let count = read_u64(&mut input)?;
@@ -1698,6 +1773,9 @@ fn knowledge_revision_id(
         let provenance = take_sized(&mut input)?.to_vec();
         records.push((<[u8; 32]>::from(key.finalize()), origin, parent, provenance));
     }
+    if !input.is_empty() {
+        return Err("trailing bytes in current Artifacts payload".into());
+    }
     records.sort_unstable_by_key(|record| record.0);
     let mut digest = Sha256::new();
     digest.update(b"reflex-knowledge-revision-v1\0");
@@ -1715,16 +1793,7 @@ fn knowledge_revision_id(
         digest.update((provenance.len() as u64).to_le_bytes());
         digest.update(provenance);
     }
-    let mut state_input = state;
-    take(&mut state_input, 5)?;
-    read_u64(&mut state_input)?;
-    let champion = take_sized(&mut state_input)?;
-    let mut state_digest = Sha256::new();
-    state_digest.update(b"reflex-knowledge-revision-v1\0");
-    state_digest.update((identity.len() as u64).to_le_bytes());
-    state_digest.update(identity);
-    state_digest.update(champion);
-    digest.update(state_digest.finalize());
+    digest.update(knowledge_product);
     Ok(digest.finalize().into())
 }
 
@@ -1774,12 +1843,59 @@ mod tests {
 
     #[test]
     fn specification_is_content_addressed() {
-        assert_eq!(hash_json(&specification()).unwrap(), EXPECTED_SPEC_SHA256);
+        let spec = specification();
+        assert_eq!(spec.version, "reflex-u8-causal-confirmation-v6");
+        assert_eq!(
+            spec.domain_identity,
+            "reflex-bitvec/u8/unary/full-ops/masked-shifts/select-nonzero/canonical-dag/v4",
+        );
+        assert!(spec.ablations.contains("Model Ecology"));
+        assert_eq!(
+            AUDIT_SEEDS[0],
+            "1f9944407c25de385e09287d6dd98f96ff160a9144d1f25ad692f07ac20e5a52",
+        );
+        require_installed_domain_identity().unwrap();
+        assert_eq!(hash_json(&spec).unwrap(), EXPECTED_SPEC_SHA256);
     }
 
     #[test]
-    fn bootstrap_comparator_is_complete_and_content_addressed() {
-        validate_bootstrap_comparator().unwrap();
+    fn successor_audit_seeds_are_fresh_and_fixed() {
+        for (index, registered) in AUDIT_SEEDS.iter().enumerate() {
+            let mut digest = Sha256::new();
+            digest.update(b"reflex-u8-causal-confirmation-v6-seed\0");
+            digest.update(index.to_string().as_bytes());
+            assert_eq!(
+                <[u8; 32]>::from(digest.finalize()),
+                decode_hex_32(registered).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_output_cannot_live_inside_the_fixed_work_directory() {
+        let root =
+            std::env::temp_dir().join(format!("reflex-causal-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        let reports = root.join("reports");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&reports).unwrap();
+        assert!(resolve_report_output(&work.join("report.json"), &work).is_err());
+        assert_eq!(
+            resolve_report_output(&reports.join("report.json"), &work).unwrap(),
+            std::fs::canonicalize(&reports).unwrap().join("report.json")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&work, root.join("work-alias")).unwrap();
+            assert!(resolve_report_output(&root.join("work-alias/report.json"), &work).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_bootstrap_calibration_is_complete_and_content_addressed() {
+        validate_historical_bootstrap_calibration().unwrap();
     }
 
     #[test]
@@ -1873,6 +1989,14 @@ mod tests {
     }
 
     #[test]
+    fn consumed_v5_audit_is_complete_and_content_addressed() {
+        assert_eq!(
+            consumed_v5_semantics().unwrap().len(),
+            REPLICATES * CASES_PER_REPLICATE
+        );
+    }
+
+    #[test]
     fn treatment_ablations_pass_production_import() {
         let directory = std::env::temp_dir().join(format!(
             "reflex-causal-ablation-development-{}",
@@ -1883,7 +2007,24 @@ mod tests {
         let bootstrap = directory.join("bootstrap.bundle");
         let no_model = directory.join("no-model.bundle");
         let no_derived = directory.join("no-derived.bundle");
+        let cross_domain_template = directory.join("cross-domain-template.bundle");
+        let rejected = directory.join("rejected.bundle");
         build_training_bundles(&full, &bootstrap).unwrap();
+        let invalid_work = directory.join("invalid-full");
+        std::fs::create_dir(&invalid_work).unwrap();
+        let invalid_full = invalid_work.join("full.bundle");
+        let mut truncated = std::fs::read(&full).unwrap();
+        truncated.truncate(truncated.len() / 2);
+        std::fs::write(&invalid_full, truncated).unwrap();
+        assert!(
+            prepare_treatment_bundles(&invalid_work, &invalid_full, &bootstrap).is_err(),
+            "Full must pass production import before an ablation or audit authority exists"
+        );
+        assert!(!invalid_work.join("no-model.bundle").exists());
+        assert!(!invalid_work.join("no-derived.bundle").exists());
+        let bootstrap_bundle =
+            CanonicalBundle::decode(&std::fs::read(&bootstrap).unwrap(), RESIDENT_BYTES).unwrap();
+        assert_invalid_model_templates(&full, &bootstrap_bundle, &cross_domain_template, &rejected);
         let bootstrap_revision = revision_ids(&std::fs::read(&bootstrap).unwrap()).unwrap().1;
         assert!(
             ablate_bundle(&full, &no_model, Some(&bootstrap), false, 1).is_err(),
@@ -1893,11 +2034,137 @@ mod tests {
         ablate_bundle(&full, &no_derived, None, true, RESIDENT_BYTES).unwrap();
         validate_treatment_bundle(&no_model).unwrap();
         validate_treatment_bundle(&no_derived).unwrap();
+        let full_bundle =
+            CanonicalBundle::decode(&std::fs::read(&full).unwrap(), RESIDENT_BYTES).unwrap();
+        let no_model_bundle =
+            CanonicalBundle::decode(&std::fs::read(&no_model).unwrap(), RESIDENT_BYTES).unwrap();
+        let no_derived_bundle =
+            CanonicalBundle::decode(&std::fs::read(&no_derived).unwrap(), RESIDENT_BYTES).unwrap();
+        assert_treatment_isolation(
+            &bootstrap_bundle,
+            &full_bundle,
+            &no_model_bundle,
+            &no_derived_bundle,
+        );
         assert_eq!(
             revision_ids(&std::fs::read(&no_model).unwrap()).unwrap().1,
             bootstrap_revision
         );
+        assert!(
+            inspect_knowledge_revision_segment(no_derived_bundle.segment(SegmentKind::Revisions))
+                .unwrap()
+                .derived
+                .is_empty(),
+            "the no-Derived-Operator treatment must contain no executable Derived Operators"
+        );
+
+        assert_atomic_same_path_ablation(&directory, &full, &full_bundle);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn assert_invalid_model_templates(
+        full: &Path,
+        bootstrap: &CanonicalBundle,
+        cross_domain_template: &Path,
+        rejected: &Path,
+    ) {
+        let cross_domain = CanonicalBundle::new(
+            b"reflex-test/another-domain".to_vec(),
+            bootstrap.segment(SegmentKind::Session).to_vec(),
+            bootstrap.segment(SegmentKind::Revisions).to_vec(),
+            bootstrap.segment(SegmentKind::Artifacts).to_vec(),
+            bootstrap.segment(SegmentKind::Experience).to_vec(),
+            bootstrap.segment(SegmentKind::Recovery).to_vec(),
+        );
+        std::fs::write(cross_domain_template, cross_domain.encode()).unwrap();
+        assert!(
+            ablate_bundle(
+                full,
+                rejected,
+                Some(cross_domain_template),
+                false,
+                RESIDENT_BYTES,
+            )
+            .is_err(),
+            "a no-model template from another Domain must be rejected",
+        );
+        assert!(!rejected.exists());
+        assert!(
+            ablate_bundle(full, rejected, Some(full), false, RESIDENT_BYTES).is_err(),
+            "a no-model template must contain the exact empty Bootstrap Model Ecology",
+        );
+        assert!(!rejected.exists());
+    }
+
+    fn assert_treatment_isolation(
+        bootstrap: &CanonicalBundle,
+        full: &CanonicalBundle,
+        no_model: &CanonicalBundle,
+        no_derived: &CanonicalBundle,
+    ) {
+        let bootstrap_core = inspect_bundle_intelligence_components(bootstrap);
+        let full_core = inspect_bundle_intelligence_components(full);
+        let no_model_core = inspect_bundle_intelligence_components(no_model);
+        let no_derived_core = inspect_bundle_intelligence_components(no_derived);
+        assert_eq!(no_model_core.model_ecology, bootstrap_core.model_ecology);
+        assert_ne!(no_model_core.model_ecology, full_core.model_ecology);
+        assert_eq!(no_model_core.causal_experience, full_core.causal_experience);
+        assert_eq!(
+            no_model_core.knowledge_compiler,
+            full_core.knowledge_compiler
+        );
+        assert_eq!(no_model_core.runtime_policy, full_core.runtime_policy);
+        assert_eq!(no_derived_core.model_ecology, full_core.model_ecology);
+        assert_eq!(
+            no_derived_core.causal_experience,
+            full_core.causal_experience
+        );
+        assert_eq!(no_derived_core.runtime_policy, full_core.runtime_policy);
+        assert_eq!(no_derived_core.knowledge_records, 0);
+        assert!(!no_derived_core.pending_knowledge_verification);
+        assert_eq!(no_derived_core.active_derived_operators, 0);
+        for treatment in [no_model, no_derived] {
+            for kind in [
+                SegmentKind::Artifacts,
+                SegmentKind::Experience,
+                SegmentKind::Recovery,
+            ] {
+                assert_eq!(treatment.segment(kind), full.segment(kind));
+            }
+        }
+    }
+
+    fn assert_atomic_same_path_ablation(
+        directory: &Path,
+        full: &Path,
+        full_bundle: &CanonicalBundle,
+    ) {
+        let in_place = directory.join("in-place.bundle");
+        std::fs::copy(full, &in_place).unwrap();
+        ablate_bundle(&in_place, &in_place, None, true, RESIDENT_BYTES).unwrap();
+        validate_treatment_bundle(&in_place).unwrap();
+
+        let malformed = directory.join("malformed.bundle");
+        let mut malformed_bundle = full_bundle.clone();
+        let mut malformed_artifacts = malformed_bundle.segment(SegmentKind::Artifacts).to_vec();
+        malformed_artifacts.push(0);
+        malformed_bundle.replace_segment(SegmentKind::Artifacts, malformed_artifacts);
+        let malformed_bytes = malformed_bundle.encode();
+        std::fs::write(&malformed, &malformed_bytes).unwrap();
+        assert!(
+            ablate_bundle(&malformed, &malformed, None, true, RESIDENT_BYTES).is_err(),
+            "the ablation adapter must consume the complete Artifact framing",
+        );
+        assert_eq!(std::fs::read(&malformed).unwrap(), malformed_bytes);
+    }
+
+    fn inspect_bundle_intelligence_components(
+        bundle: &CanonicalBundle,
+    ) -> IntelligenceComponentInspection {
+        inspect_intelligence_components(
+            current_intelligence_checkpoint(bundle.segment(SegmentKind::Revisions)).unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]

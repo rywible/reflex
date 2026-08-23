@@ -26,7 +26,7 @@ fn v3_bundle_segments_preserve_refuted_experience() {
     let request = ImprovementRequest::new(
         GoalSet::one(OptimizationGoal::new([], objectives, preference, None).unwrap()),
         SeedScope::one(Expression::xor(
-            Expression::input(),
+            Expression::xor(Expression::input(), Expression::constant(225)),
             Expression::constant(1),
         )),
         ResourceEnvelope::new(
@@ -58,16 +58,48 @@ fn v3_bundle_segments_preserve_refuted_experience() {
             && segments
                 .iter()
                 .map(|(_, version, _)| *version)
-                .eq([1, 4, 3, 3, 2])
+                .eq([1, 7, 3, 3, 2])
+            && u64::from_le_bytes(
+                decoded.segment(SegmentKind::Session)[1..9]
+                    .try_into()
+                    .unwrap()
+            ) == 25
+            && revisions_segment_contains_only_rfic(&decoded)
             && experience
                 .attempts
                 .iter()
                 .any(|attempt| attempt.verdict == ExperienceVerdictInspection::Refuted)
             && outcome.usage().verification_requests
                 == u64::try_from(experience.attempts.len()).unwrap() + 1,
-        "the canonical Experience segment retains an ordinary Refuted verdict"
+        "the canonical Experience segment retains an ordinary Refuted verdict: versions={:?}, attempts={:?}, requests={}",
+        segments
+            .iter()
+            .map(|(_, version, _)| *version)
+            .collect::<Vec<_>>(),
+        experience
+            .attempts
+            .iter()
+            .map(|attempt| attempt.verdict)
+            .collect::<Vec<_>>(),
+        outcome.usage().verification_requests,
     );
     std::fs::remove_file(bundle_path).ok();
+}
+
+fn revisions_segment_contains_only_rfic(bundle: &CanonicalBundle) -> bool {
+    let Some(mut revisions) = bundle.segment(SegmentKind::Revisions).get(4 * 32..) else {
+        return false;
+    };
+    let Some(encoded_length) = revisions
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+        .and_then(|length| usize::try_from(length).ok())
+    else {
+        return false;
+    };
+    revisions = &revisions[8..];
+    revisions.len() == encoded_length && revisions.starts_with(b"RFIC\x11")
 }
 
 #[test]
@@ -264,7 +296,8 @@ fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches(
     let experience =
         force_first_experience_accepted(false_verdict.segment(SegmentKind::Experience)).unwrap();
     false_verdict.replace_segment(SegmentKind::Experience, experience);
-    std::fs::write(&bundle_path, false_verdict.encode()).unwrap();
+    let false_verdict = false_verdict.encode();
+    std::fs::write(&bundle_path, &false_verdict).unwrap();
     assert!(matches!(
         improve(
             BitVecDomain::unary_u8(),
@@ -276,48 +309,11 @@ fn resume_rejects_runtime_or_segment_revision_drift_and_model_digest_mismatches(
         ),
         Err(SessionError::CorruptBundle)
     ));
-
-    let mut future_training_watermark = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
-    let mut revisions = future_training_watermark
-        .segment(SegmentKind::Revisions)
-        .to_vec();
-    let knowledge_length =
-        usize::try_from(u64::from_le_bytes(revisions[64..72].try_into().unwrap())).unwrap();
-    let learning = 72 + knowledge_length + 8;
-    assert_eq!(&revisions[learning..learning + 5], b"RFLS\x03");
-    revisions[learning + 13..learning + 21].copy_from_slice(&u64::MAX.to_le_bytes());
-    future_training_watermark.replace_segment(SegmentKind::Revisions, revisions);
-    std::fs::write(&bundle_path, future_training_watermark.encode()).unwrap();
-    assert!(matches!(
-        improve(
-            BitVecDomain::unary_u8(),
-            make_request(BundlePlan::Resume {
-                source: bundle_path.clone(),
-                target: bundle_path.clone(),
-            }),
-            |_| ControlFlow::Continue(())
-        ),
-        Err(SessionError::CorruptBundle)
-    ));
-
-    let mut impossible_online_progress = CanonicalBundle::decode(&valid, 16 * 1024 * 1024).unwrap();
-    let mut revisions = impossible_online_progress
-        .segment(SegmentKind::Revisions)
-        .to_vec();
-    revisions[learning + 21] = 2;
-    impossible_online_progress.replace_segment(SegmentKind::Revisions, revisions);
-    std::fs::write(&bundle_path, impossible_online_progress.encode()).unwrap();
-    assert!(matches!(
-        improve(
-            BitVecDomain::unary_u8(),
-            make_request(BundlePlan::Resume {
-                source: bundle_path.clone(),
-                target: bundle_path.clone(),
-            }),
-            |_| ControlFlow::Continue(())
-        ),
-        Err(SessionError::CorruptBundle)
-    ));
+    assert_eq!(
+        std::fs::read(&bundle_path).unwrap(),
+        false_verdict,
+        "same-path semantic replay failure must preserve the completed source byte-for-byte",
+    );
 
     let mut bad_model_digest = valid.clone();
     let (_, payload, length, checksum) = segment_location(&bad_model_digest, 2);

@@ -146,6 +146,7 @@ pub(crate) struct VerifiedArtifactRecord<D: DomainDefinition> {
     pub environment: MeasurementEnvironment,
     pub provenance: Vec<u8>,
     pub dynamic_resident_bytes: u64,
+    pub bundle_record: Box<[u8]>,
 }
 
 pub struct VerifiedArtifact<D: DomainDefinition> {

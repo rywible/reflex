@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 mod build;
 mod causal;
+mod directional;
 mod harness;
 mod lean;
 mod lean_audit;
@@ -28,8 +29,11 @@ mod performance;
 mod scaling;
 
 use harness::{
-    AnyError, HostEnvironment, capture_child, completion_name, duration_ns, environment, hash_json,
-    hex, require_absent, require_clean, require_release,
+    AnyError, HOST_ISOLATION_EXEC_COMMAND, HOST_ISOLATION_RELAY_COMMAND,
+    HOST_ISOLATION_TARGET_COMMAND, HostEnvironment, LargeCampaign, capture_large_campaign_child,
+    completion_name, duration_ns, enter_large_campaign, environment, hash_json, hex,
+    require_absent, require_clean, require_release, run_host_isolation_exec,
+    run_host_isolation_relay, run_host_isolation_target,
 };
 
 const PROTOCOL_VERSION: &str = "reflex-bootstrap-baseline-v7";
@@ -42,6 +46,7 @@ const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
 const DURABLE_BYTES: u64 = 256 * 1024 * 1024;
 const TIME_SECONDS: u64 = 120;
 const VERIFICATION_REQUESTS: u64 = 100_000;
+const DIRECTIONAL_RECEIPT_REQUIRED_COMMANDS: [&str; 9] = LargeCampaign::COMMANDS;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Assignment {
@@ -139,106 +144,140 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), AnyError> {
-    let mut arguments = std::env::args().skip(1);
-    match arguments.next().as_deref() {
-        Some("baseline") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            let output = parse_output(&arguments)?;
-            run_baseline(&output)
-        }
-        Some("baseline-child") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            run_child(&arguments)
-        }
-        Some("causal-confirm") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            causal::run_confirm(&arguments)
-        }
-        Some("causal-child") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            causal::run_child(&arguments)
-        }
-        Some("causal-materialize-audit") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            causal::materialize_audit(&arguments)
-        }
-        Some("causal-development-performance") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            causal::run_development_performance(&arguments)
-        }
-        Some("build-native") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            build::build_native(&arguments)
-        }
-        Some("perf-smoke") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            performance::run(&arguments)
-        }
-        Some("instrumentation-overhead") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            performance::run_instrumentation_overhead(&arguments)
-        }
-        Some("verification-scaling") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            scaling::run(&arguments)
-        }
-        Some("verification-scaling-child") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            scaling::run_child(&arguments)
-        }
-        Some("lean-development") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean::run_development(&arguments)
-        }
-        Some("lean-catalog") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean::build_catalog(&arguments)
-        }
-        Some("lean-catalog-check") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean::check_catalog(&arguments)
-        }
-        Some("lean-fixed-latency") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean::fixed_latency(&arguments)
-        }
-        Some("lean-taste-development") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_taste::run(&arguments)
-        }
-        Some("lean-public-optimizer-development") =>
-            lean_optimizer_audit::development(&arguments.collect::<Vec<_>>()),
-        Some("lean-public-optimizer-development-child") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_optimizer_audit::development_child(&arguments)
-        }
-        Some("lean-bundle-summary") => lean_bundle_summary(arguments),
-        Some("lean-model-feature-development") => lean_model_features(arguments),
-        Some("lean-temporal-audit-freeze") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_audit::freeze(&arguments)
-        }
-        Some("lean-temporal-audit-lock") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_audit::lock(&arguments)
-        }
-        Some("lean-temporal-audit-confirm") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_audit_confirm::confirm(&arguments)
-        }
-        Some("lean-temporal-audit-confirm-child") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_audit_confirm::confirm_child(&arguments)
-        }
-        Some("lean-temporal-audit-finalize") => {
-            let arguments = arguments.collect::<Vec<_>>();
-            lean_audit_confirm::finalize(&arguments)
-        }
-        _ => Err(
-            "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-materialize-audit|causal-development-performance|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-bundle-summary|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-model-feature-development|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
-                .into(),
-        ),
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let (command, arguments) = arguments
+        .split_first()
+        .map_or((None, &[][..]), |(command, arguments)| {
+            (Some(command.as_str()), arguments)
+        });
+    if command == Some(HOST_ISOLATION_RELAY_COMMAND) {
+        return run_host_isolation_relay();
     }
+    if command == Some(HOST_ISOLATION_TARGET_COMMAND) {
+        return run_host_isolation_target();
+    }
+    if command == Some(HOST_ISOLATION_EXEC_COMMAND) {
+        return run_host_isolation_exec();
+    }
+    require_directional_receipt_for(command)?;
+    if let Some(campaign) = command.and_then(LargeCampaign::for_command) {
+        match enter_large_campaign(campaign, arguments) {
+            Ok(Some(capture)) => {
+                if !capture.stdout.is_empty() {
+                    print!("{}", capture.stdout);
+                }
+                if capture.status.success()
+                    && !capture.timed_out
+                    && !capture.resident_limit_exceeded
+                    && !capture.output_limit_exceeded
+                    && !capture.boundary.evidence_failed
+                    && !capture.boundary.cleanup_failed
+                {
+                    return Ok(());
+                }
+                let error = format!(
+                    "host-isolated {} failed{}{}{}{}{}: {}",
+                    campaign.command(),
+                    if capture.timed_out {
+                        " after exceeding its wall limit"
+                    } else {
+                        ""
+                    },
+                    if capture.resident_limit_exceeded {
+                        " after exceeding its memory boundary"
+                    } else {
+                        ""
+                    },
+                    if capture.output_limit_exceeded {
+                        " after exceeding its bounded diagnostic-output allowance"
+                    } else {
+                        ""
+                    },
+                    if capture.boundary.evidence_failed {
+                        " after losing kernel cgroup evidence"
+                    } else {
+                        ""
+                    },
+                    if capture.boundary.cleanup_failed {
+                        " after failing to confirm cgroup cleanup"
+                    } else {
+                        ""
+                    },
+                    capture.stderr
+                );
+                if campaign == LargeCampaign::LeanTemporalAuditConfirmation {
+                    lean_audit_confirm::retain_outer_supervisor_failure_if_exposed(
+                        &capture, &error,
+                    )?;
+                }
+                return Err(error.into());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if campaign == LargeCampaign::LeanTemporalAuditConfirmation {
+                    lean_audit_confirm::retain_outer_supervisor_error_if_exposed(
+                        &error.to_string(),
+                    )?;
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Some(command) = command
+        && LargeCampaign::CHILD_COMMANDS.contains(&command)
+    {
+        harness::require_large_campaign_child(command)?;
+    }
+    dispatch(command, arguments)
+}
+
+fn dispatch(command: Option<&str>, arguments: &[String]) -> Result<(), AnyError> {
+    match command {
+        Some("baseline") => run_baseline(&parse_output(arguments)?),
+        Some("baseline-child" | "performance-child") => run_child(arguments),
+        Some("causal-confirm") => causal::run_confirm(arguments),
+        Some("causal-child") => causal::run_child(arguments),
+        Some("causal-development-performance") => causal::run_development_performance(arguments),
+        Some("directional") => directional::run(arguments),
+        Some("build-native") => build::build_native(arguments),
+        Some("perf-smoke") => performance::run(arguments),
+        Some("instrumentation-overhead") => performance::run_instrumentation_overhead(arguments),
+        Some("verification-scaling") => scaling::run(arguments),
+        Some("verification-scaling-child") => scaling::run_child(arguments),
+        Some("lean-development") => lean::run_development(arguments),
+        Some("lean-catalog") => lean::build_catalog(arguments),
+        Some("lean-catalog-check") => lean::check_catalog(arguments),
+        Some("lean-fixed-latency") => lean::fixed_latency(arguments),
+        Some("lean-taste-development") => lean_taste::run(arguments),
+        Some("lean-public-optimizer-development") => lean_optimizer_audit::development(arguments),
+        Some("lean-public-optimizer-development-child") => {
+            lean_optimizer_audit::development_child(arguments)
+        }
+        Some("lean-bundle-summary") => lean_bundle_summary(arguments.iter().cloned()),
+        Some("lean-model-feature-development") => lean_model_features(arguments.iter().cloned()),
+        Some("lean-temporal-audit-freeze") => lean_audit::freeze(arguments),
+        Some("lean-temporal-audit-lock") => lean_audit::lock(arguments),
+        Some("lean-temporal-audit-confirm") => lean_audit_confirm::confirm(arguments),
+        Some("lean-temporal-audit-confirm-child") => lean_audit_confirm::confirm_child(arguments),
+        Some("lean-temporal-audit-finalize") => lean_audit_confirm::finalize(arguments),
+        _ => Err(usage_error()),
+    }
+}
+
+fn requires_directional_receipt(command: &str) -> bool {
+    DIRECTIONAL_RECEIPT_REQUIRED_COMMANDS.contains(&command)
+}
+
+fn require_directional_receipt_for(command: Option<&str>) -> Result<(), AnyError> {
+    if command.is_some_and(requires_directional_receipt) {
+        directional::require_current_passed_receipt()?;
+    }
+    Ok(())
+}
+
+fn usage_error() -> AnyError {
+    "usage: cargo run --release -p xtask -- <baseline|causal-confirm|causal-development-performance|directional|build-native|perf-smoke|instrumentation-overhead|verification-scaling|lean-bundle-summary|lean-catalog|lean-catalog-check|lean-development|lean-fixed-latency|lean-model-feature-development|lean-taste-development|lean-temporal-audit-freeze|lean-temporal-audit-lock|lean-temporal-audit-confirm|lean-temporal-audit-finalize> [arguments]"
+        .into()
 }
 
 fn lean_model_features(arguments: impl Iterator<Item = String>) -> Result<(), AnyError> {
@@ -406,9 +445,12 @@ fn run_assignment(
         OsString::from("--target"),
         target.as_os_str().to_owned(),
     ];
-    let capture = capture_child(executable, &arguments, target, None)?;
-    let (result, failure) =
-        parse_child_output(capture.status.success(), &capture.stdout, &capture.stderr);
+    let capture = capture_large_campaign_child(executable, &arguments, target, None, None, &[])?;
+    let (result, failure) = parse_child_output(
+        capture.status.success() && !capture.output_limit_exceeded,
+        &capture.stdout,
+        &capture.stderr,
+    );
     Ok(RecordedRun {
         assignment,
         exit_code: capture.status.code(),
@@ -746,5 +788,89 @@ mod tests {
         assert_eq!(quantile(vec![40, 10, 30, 20], 50), 30);
         assert_eq!(quantile(vec![40, 10, 30, 20], 95), 40);
         assert_eq!(quantile(Vec::new(), 50), 0);
+    }
+
+    #[test]
+    fn parent_campaigns_require_directional_receipts_but_children_do_not() {
+        let registered_parents = [
+            "baseline",
+            "causal-confirm",
+            "causal-development-performance",
+            "verification-scaling",
+            "lean-development",
+            "lean-taste-development",
+            "lean-public-optimizer-development",
+            "lean-model-feature-development",
+            "lean-temporal-audit-confirm",
+        ];
+        assert_eq!(DIRECTIONAL_RECEIPT_REQUIRED_COMMANDS, registered_parents);
+        for command in registered_parents {
+            assert!(requires_directional_receipt(command));
+            assert!(
+                harness::LargeCampaign::for_command(command).is_some(),
+                "every receipt-gated parent must enter the host-isolated supervisor: {command}",
+            );
+        }
+        for command in [
+            "directional",
+            "baseline-child",
+            "causal-child",
+            "verification-scaling-child",
+            "lean-public-optimizer-development-child",
+            "lean-temporal-audit-confirm-child",
+            "perf-smoke",
+        ] {
+            assert!(!requires_directional_receipt(command));
+            assert!(harness::LargeCampaign::for_command(command).is_none());
+        }
+    }
+
+    #[test]
+    fn scientific_children_are_bound_to_their_exact_large_parent() {
+        let expected = [
+            ("baseline-child", "baseline"),
+            ("causal-child", "causal-confirm"),
+            ("verification-scaling-child", "verification-scaling"),
+            (
+                "lean-public-optimizer-development-child",
+                "lean-public-optimizer-development",
+            ),
+            (
+                "lean-temporal-audit-confirm-child",
+                "lean-temporal-audit-confirm",
+            ),
+        ];
+        for (child, parent) in expected {
+            let campaign = LargeCampaign::for_command(parent).unwrap();
+            assert!(campaign.permits_child(child));
+            if child != "causal-child" {
+                assert!(
+                    LargeCampaign::COMMANDS
+                        .into_iter()
+                        .filter_map(LargeCampaign::for_command)
+                        .filter(|candidate| *candidate != campaign)
+                        .all(|candidate| !candidate.permits_child(child))
+                );
+            }
+        }
+        assert!(LargeCampaign::CausalDevelopment.permits_child("causal-child"));
+        assert!(
+            LargeCampaign::COMMANDS
+                .into_iter()
+                .filter_map(LargeCampaign::for_command)
+                .all(|campaign| !campaign.permits_child("performance-child"))
+        );
+    }
+
+    #[test]
+    fn frozen_v6_has_no_standalone_audit_materialization_command() {
+        let error = dispatch(Some("causal-materialize-audit"), &[])
+            .expect_err("v6 audit exposure must remain inside causal-confirm");
+        assert_eq!(error.to_string(), usage_error().to_string());
+        assert!(
+            !usage_error()
+                .to_string()
+                .contains("causal-materialize-audit")
+        );
     }
 }

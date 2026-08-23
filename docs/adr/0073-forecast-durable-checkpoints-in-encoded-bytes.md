@@ -14,7 +14,7 @@ A minimized BitVec regression reproduced the same defect in milliseconds: a 5,12
 
 ## Consequences
 
-The bundle codec becomes the deep module for durable framing and compression bounds; the Runtime no longer needs to understand stored-segment overhead or LZ4 expansion. Resident reservations remain separately conservative and now include retained canonical Candidate storage. Exact post-Verification checkpoints are still checked before publication, so the bound is a pre-dispatch safety proof rather than a replacement for atomic durability checks.
+The bundle codec becomes the deep module for durable framing, compression bounds, and seal residency; the Runtime no longer needs to understand stored-segment overhead or LZ4 expansion. Its allocation-free seal plan separately derives the stored output-capacity bound and the peak overlap of logical payloads, compression temporaries, canonical ownership, and final bytes, so a large durable allowance does not become a fictitious resident charge. Resident reservations also include retained canonical Candidate storage. Exact post-Verification checkpoints are admitted before materialization and the encoder enforces the admitted capacity, so publication cannot be followed by a resource refusal.
 
 Internal phase reports now record the first normal Resource refusal category. A future activation-null can distinguish durable preflight, resident preflight, epoch residency, time, and Verification allowance without inference from aggregate usage.
 

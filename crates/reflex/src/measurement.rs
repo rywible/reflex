@@ -31,6 +31,11 @@ impl MeasurementEnvironment {
     pub fn identity(&self) -> &str {
         &self.identity
     }
+
+    #[must_use]
+    pub(crate) fn dynamic_resident_bytes(&self) -> u64 {
+        u64::try_from(self.identity.capacity()).unwrap_or(u64::MAX)
+    }
 }
 
 fn cpu_feature_identity() -> String {
@@ -159,6 +164,18 @@ pub trait MeasurementSpace<D: DomainDefinition>: Send + Sync + 'static {
     type Scratch: Default + Send + 'static;
 
     fn schema(&self) -> &[MeasurementDescriptor<Self::Metric>];
+    fn measurement_scratch_resident_bytes(&self, artifacts: &[&D::Artifact]) -> u64;
+    fn scratch_dynamic_resident_bytes(&self, scratch: &Self::Scratch) -> u64;
+    fn observation_dynamic_resident_bytes_bound(
+        &self,
+        artifact: &D::Artifact,
+        metric: Self::Metric,
+    ) -> u64;
+    fn observation_dynamic_resident_bytes(
+        &self,
+        metric: Self::Metric,
+        observation: &Self::Observation,
+    ) -> u64;
     fn measure_batch(
         &self,
         artifacts: VerifiedBatch<'_, D>,

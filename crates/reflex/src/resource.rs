@@ -53,6 +53,7 @@ pub(crate) struct ResourceEnvelopeGuard {
     peak_resident: Cell<u64>,
     peak_durable: Cell<u64>,
     elapsed_before: Cell<Duration>,
+    external_elapsed: Cell<Duration>,
     cpu_before: Cell<Duration>,
     external_cpu: Cell<Duration>,
 }
@@ -71,6 +72,7 @@ impl ResourceEnvelopeGuard {
             peak_resident: Cell::new(0),
             peak_durable: Cell::new(0),
             elapsed_before: Cell::new(Duration::ZERO),
+            external_elapsed: Cell::new(Duration::ZERO),
             cpu_before: Cell::new(Duration::ZERO),
             external_cpu: Cell::new(Duration::ZERO),
         })
@@ -119,10 +121,7 @@ impl ResourceEnvelopeGuard {
         worker_lanes: usize,
         resident_overlap: u64,
     ) -> Result<VerificationAllowance, ()> {
-        let elapsed_spent = self
-            .elapsed_before
-            .get()
-            .saturating_add(self.wall_started.elapsed());
+        let elapsed_spent = self.current_elapsed();
         let cpu_spent = self.current_cpu()?;
         Ok(VerificationAllowance::new(
             worker_lanes,
@@ -141,15 +140,17 @@ impl ResourceEnvelopeGuard {
     ) -> Result<(), ()> {
         self.external_cpu
             .set(self.external_cpu.get().saturating_add(usage.cpu_time()));
+        self.external_elapsed.set(
+            self.external_elapsed
+                .get()
+                .saturating_add(usage.elapsed_time()),
+        );
         let observed_resident = resident_overlap
             .saturating_sub(requirements.resident_bytes())
             .saturating_add(usage.peak_resident_bytes());
         self.peak_resident
             .set(self.peak_resident.get().max(observed_resident));
-        let elapsed_spent = self
-            .elapsed_before
-            .get()
-            .saturating_add(self.wall_started.elapsed());
+        let elapsed_spent = self.current_elapsed();
         let cpu_spent = self.current_cpu()?;
         if usage.worker_lanes() > requirements.worker_lanes()
             || usage.worker_lanes() > allowance.worker_lanes()
@@ -183,12 +184,7 @@ impl ResourceEnvelopeGuard {
         elapsed_limit: Duration,
         cpu_limit: Duration,
     ) -> Result<bool, ()> {
-        Ok(self
-            .elapsed_before
-            .get()
-            .saturating_add(self.wall_started.elapsed())
-            >= elapsed_limit
-            || self.current_cpu()? >= cpu_limit)
+        Ok(self.current_elapsed() >= elapsed_limit || self.current_cpu()? >= cpu_limit)
     }
 
     pub(crate) fn usage(
@@ -201,10 +197,7 @@ impl ResourceEnvelopeGuard {
             resident_bytes: self.peak_resident.get(),
             verification_requests,
             durable_bytes: self.peak_durable.get().max(durable_bytes),
-            elapsed_time: self
-                .elapsed_before
-                .get()
-                .saturating_add(self.wall_started.elapsed()),
+            elapsed_time: self.current_elapsed(),
             cpu_time: self.current_cpu()?,
         })
     }
@@ -216,6 +209,17 @@ impl ResourceEnvelopeGuard {
             .saturating_add(self.cpu_started.try_elapsed().map_err(|_| ())?)
             .saturating_add(self.external_cpu.get()))
     }
+
+    fn current_elapsed(&self) -> Duration {
+        self.elapsed_before.get().saturating_add(overlapped_elapsed(
+            self.wall_started.elapsed(),
+            self.external_elapsed.get(),
+        ))
+    }
+}
+
+fn overlapped_elapsed(controller: Duration, external: Duration) -> Duration {
+    controller.max(external)
 }
 
 #[cfg(test)]
@@ -228,7 +232,7 @@ mod tests {
         VerificationWorkerRequirements,
     };
 
-    use super::{ResidentReservation, ResourceEnvelopeGuard};
+    use super::{ResidentReservation, ResourceEnvelopeGuard, overlapped_elapsed};
 
     #[test]
     fn reservation_accounts_for_every_memory_category() {
@@ -308,6 +312,19 @@ mod tests {
         );
         let usage = guard.usage(1, 0).unwrap();
         assert!(usage.cpu_time >= Duration::from_secs(2));
+        assert!(usage.elapsed_time >= Duration::from_millis(1));
         assert!(usage.resident_bytes >= 300);
+    }
+
+    #[test]
+    fn external_elapsed_overlaps_controller_wall_time_instead_of_double_charging_it() {
+        assert_eq!(
+            overlapped_elapsed(Duration::from_secs(3), Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            overlapped_elapsed(Duration::from_secs(7), Duration::from_secs(2)),
+            Duration::from_secs(7)
+        );
     }
 }

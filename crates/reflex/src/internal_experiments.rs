@@ -196,6 +196,341 @@ pub fn inspect_experience_segment(
     crate::runtime::inspect_experience_segment(bytes).map_err(|()| ExperienceInspectionError)
 }
 
+/// Repository-facing projection of a private autonomous-intelligence checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntelligenceInspection {
+    pub active_specialists: usize,
+    pub receipts: usize,
+    pub settlements: usize,
+    pub consequences: usize,
+    pub contextual_contrasts: usize,
+    pub provisional_knowledge: usize,
+    pub verified_knowledge: usize,
+    pub promoted_knowledge: usize,
+    pub invalidated_knowledge: usize,
+    pub open_shadows: usize,
+    pub completed_shadows: usize,
+    pub interrupted_shadows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntelligenceInspectionError;
+
+impl std::fmt::Display for IntelligenceInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("malformed Intelligence checkpoint")
+    }
+}
+
+impl std::error::Error for IntelligenceInspectionError {}
+
+/// Authenticated current-Core state for one frozen causal-ablation treatment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntelligenceTreatmentCheckpoint {
+    pub checkpoint: Vec<u8>,
+    pub knowledge_product: [u8; 32],
+    pub model_revision: [u8; 32],
+    pub runtime_policy_revision: [u8; 32],
+    pub intelligence_revision: [u8; 32],
+}
+
+/// Canonical root and byte identity for one Intelligence component.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntelligenceComponentIdentity {
+    pub root: [u8; 32],
+    pub bytes: [u8; 32],
+}
+
+/// Repository-only causal-ablation inspection of one authenticated Core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntelligenceComponentInspection {
+    pub model_ecology: IntelligenceComponentIdentity,
+    pub causal_experience: IntelligenceComponentIdentity,
+    pub knowledge_compiler: IntelligenceComponentIdentity,
+    pub runtime_policy: IntelligenceComponentIdentity,
+    pub knowledge_records: usize,
+    pub pending_knowledge_verification: bool,
+    pub active_derived_operators: usize,
+}
+
+/// One Domain-bound Intelligence checkpoint supplied to the repository's
+/// causal-ablation adapter.
+#[derive(Clone, Copy, Debug)]
+pub struct IntelligenceTreatmentSource<'a> {
+    semantic_identity: &'a [u8],
+    checkpoint: &'a [u8],
+}
+
+impl<'a> IntelligenceTreatmentSource<'a> {
+    #[must_use]
+    pub const fn new(semantic_identity: &'a [u8], checkpoint: &'a [u8]) -> Self {
+        Self {
+            semantic_identity,
+            checkpoint,
+        }
+    }
+}
+
+/// Inspects authenticated Core component identities for repository ablation
+/// invariants without exposing them through the normal consumer interface.
+///
+/// # Errors
+///
+/// Returns an error when `checkpoint` is not a current authenticated Core.
+pub fn inspect_intelligence_components(
+    checkpoint: &[u8],
+) -> Result<IntelligenceComponentInspection, IntelligenceInspectionError> {
+    let core = crate::intelligence::IntelligenceCore::restore(checkpoint)
+        .map_err(|_| IntelligenceInspectionError)?;
+    let (roots, bytes, knowledge_records, pending, active_derived_operators) =
+        core.treatment_component_inspection();
+    let identity = |index| IntelligenceComponentIdentity {
+        root: roots[index],
+        bytes: bytes[index],
+    };
+    Ok(IntelligenceComponentInspection {
+        model_ecology: identity(0),
+        causal_experience: identity(1),
+        knowledge_compiler: identity(2),
+        runtime_policy: identity(3),
+        knowledge_records,
+        pending_knowledge_verification: pending,
+        active_derived_operators,
+    })
+}
+
+/// Applies exactly one repository causal-ablation treatment through the
+/// production Intelligence checkpoint codec.
+///
+/// A `model_template` replaces only the Model Ecology. Setting
+/// `without_derived_operators` removes executable and promotable Derived
+/// Operator knowledge while retaining causal Experience, Runtime Policy, and
+/// the active Artifact scheduling index.
+///
+/// # Errors
+///
+/// Returns an error when either checkpoint is invalid or contains open work,
+/// when the template belongs to a different semantic identity, when its Model
+/// Ecology is not the exact empty Bootstrap ecology, or when that ecology does
+/// not fit the source Core's limits.
+pub fn ablate_intelligence_checkpoint(
+    source: IntelligenceTreatmentSource<'_>,
+    model_template: Option<IntelligenceTreatmentSource<'_>>,
+    without_derived_operators: bool,
+) -> Result<IntelligenceTreatmentCheckpoint, IntelligenceInspectionError> {
+    if model_template.is_some() == without_derived_operators {
+        return Err(IntelligenceInspectionError);
+    }
+    let core = crate::intelligence::IntelligenceCore::restore(source.checkpoint)
+        .map_err(|_| IntelligenceInspectionError)?;
+    let template = model_template
+        .map(|template| {
+            crate::intelligence::IntelligenceCore::restore(template.checkpoint)
+                .map(|core| (core, template.semantic_identity))
+        })
+        .transpose()
+        .map_err(|_| IntelligenceInspectionError)?;
+    let ablated = core
+        .treatment_ablation_for_experiment(
+            source.semantic_identity,
+            template
+                .as_ref()
+                .map(|(core, semantic_identity)| (core, *semantic_identity)),
+            without_derived_operators,
+        )
+        .map_err(|_| IntelligenceInspectionError)?;
+    let checkpoint = ablated.checkpoint();
+    Ok(IntelligenceTreatmentCheckpoint {
+        checkpoint: checkpoint.as_bytes().to_vec(),
+        knowledge_product: ablated.knowledge_product().identity(),
+        model_revision: ablated.model_ecology_identity(),
+        runtime_policy_revision: ablated.runtime_policy_revision().identity(),
+        intelligence_revision: checkpoint.identity(),
+    })
+}
+
+/// Re-encodes a Bootstrap-policy Intelligence checkpoint using the legacy v12
+/// wire format for repository migration fixtures.
+///
+/// # Errors
+///
+/// Returns an error when the input checkpoint is invalid or already contains
+/// retained Runtime Policy state that v12 could not represent.
+pub fn legacy_v12_intelligence_checkpoint(
+    bytes: &[u8],
+) -> Result<Vec<u8>, IntelligenceInspectionError> {
+    let core = crate::intelligence::IntelligenceCore::restore(bytes)
+        .map_err(|_| IntelligenceInspectionError)?;
+    if core.runtime_policy_identity() != crate::policy::RuntimePolicyState::bootstrap().identity() {
+        return Err(IntelligenceInspectionError);
+    }
+    Ok(core.legacy_v12_checkpoint_for_test().as_bytes().to_vec())
+}
+
+/// Re-encodes an Intelligence checkpoint using the legacy v13 wire format,
+/// whose Knowledge Compiler did not own the active Knowledge Revision.
+///
+/// # Errors
+///
+/// Returns an error when the input checkpoint is invalid.
+pub fn legacy_v13_intelligence_checkpoint(
+    bytes: &[u8],
+) -> Result<Vec<u8>, IntelligenceInspectionError> {
+    let core = crate::intelligence::IntelligenceCore::restore(bytes)
+        .map_err(|_| IntelligenceInspectionError)?;
+    Ok(core.legacy_v13_checkpoint_for_test().as_bytes().to_vec())
+}
+
+/// Re-snapshots a current Core with a structurally valid active Knowledge
+/// lineage that refers to a foreign Artifact.
+///
+/// This repository-only fixture proves that Domain Bundle recovery checks the
+/// Core-owned Knowledge semantics against the installed Domain Definition
+/// instead of trusting authenticated Core framing alone.
+///
+/// # Errors
+///
+/// Returns an error when the checkpoint is invalid or has no promoted
+/// predecessor that can carry the hostile Artifact reference.
+pub fn hostile_current_knowledge_checkpoint(
+    bytes: &[u8],
+) -> Result<Vec<u8>, IntelligenceInspectionError> {
+    let core = crate::intelligence::IntelligenceCore::restore(bytes)
+        .map_err(|_| IntelligenceInspectionError)?;
+    core.hostile_domain_invalid_knowledge_checkpoint_for_test()
+        .map(|checkpoint| checkpoint.as_bytes().to_vec())
+        .map_err(|_| IntelligenceInspectionError)
+}
+
+/// Counts the correctness-bearing Knowledge obligations that current recovery
+/// must replay through the installed Verification Kernel.
+///
+/// # Errors
+///
+/// Returns an error when the checkpoint or its authenticated recovery manifest
+/// is invalid.
+pub fn inspect_knowledge_recovery_obligation_count(
+    bytes: &[u8],
+) -> Result<usize, IntelligenceInspectionError> {
+    let core = crate::intelligence::IntelligenceCore::restore(bytes)
+        .map_err(|_| IntelligenceInspectionError)?;
+    core.knowledge_recovery_manifest()
+        .map(|manifest| manifest.obligation_count())
+        .map_err(|_| IntelligenceInspectionError)
+}
+
+/// Encodes the empty legacy learner used by repository bundle-migration fixtures.
+#[must_use]
+pub fn empty_legacy_learning_state() -> Vec<u8> {
+    crate::learning::LearningState::default().encode()
+}
+
+/// Computes the authenticated legacy learner revision for migration fixtures.
+pub fn legacy_learning_revision(
+    bytes: &[u8],
+    semantic_identity: &str,
+) -> Result<[u8; 32], IntelligenceInspectionError> {
+    crate::learning::LearningState::decode(bytes)
+        .map(|state| state.revision_digest(semantic_identity))
+        .map_err(|()| IntelligenceInspectionError)
+}
+
+/// Decodes private Intelligence state through its production checkpoint codec.
+///
+/// # Errors
+///
+/// Returns an error when canonical framing, limits, references, or checksums are invalid.
+pub fn inspect_intelligence_checkpoint(
+    bytes: &[u8],
+) -> Result<IntelligenceInspection, IntelligenceInspectionError> {
+    let inspection = crate::runtime::inspect_intelligence_checkpoint(bytes)
+        .map_err(|()| IntelligenceInspectionError)?;
+    Ok(intelligence_inspection(inspection))
+}
+
+/// Decodes private Intelligence from a current Revisions segment.
+///
+/// # Errors
+///
+/// Returns an error when the segment framing or Intelligence checkpoint is malformed.
+pub fn inspect_intelligence_revision_segment(
+    bytes: &[u8],
+) -> Result<IntelligenceInspection, IntelligenceInspectionError> {
+    let inspection = crate::runtime::inspect_intelligence_revision_segment(bytes)
+        .map_err(|()| IntelligenceInspectionError)?;
+    Ok(intelligence_inspection(inspection))
+}
+
+fn intelligence_inspection(
+    inspection: (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+) -> IntelligenceInspection {
+    IntelligenceInspection {
+        active_specialists: inspection.0,
+        receipts: inspection.1,
+        settlements: inspection.2,
+        consequences: inspection.3,
+        contextual_contrasts: inspection.4,
+        provisional_knowledge: inspection.5,
+        verified_knowledge: inspection.6,
+        promoted_knowledge: inspection.7,
+        invalidated_knowledge: inspection.8,
+        open_shadows: inspection.9,
+        completed_shadows: inspection.10,
+        interrupted_shadows: inspection.11,
+    }
+}
+
+/// Repository-facing summary of a Derived Operator retained in Knowledge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DerivedKnowledgeInspection {
+    pub active: bool,
+    pub steps: usize,
+    pub support: usize,
+}
+
+/// Repository-facing Knowledge projection decoded through the production codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnowledgeInspection {
+    pub generation: u64,
+    pub derived: Vec<DerivedKnowledgeInspection>,
+}
+
+/// Decodes the Knowledge State embedded in a current Revisions segment.
+///
+/// # Errors
+///
+/// Returns an error when the segment framing or Knowledge payload is malformed.
+pub fn inspect_knowledge_revision_segment(
+    bytes: &[u8],
+) -> Result<KnowledgeInspection, IntelligenceInspectionError> {
+    let (generation, derived) = crate::runtime::inspect_knowledge_revision_segment(bytes)
+        .map_err(|()| IntelligenceInspectionError)?;
+    Ok(KnowledgeInspection {
+        generation,
+        derived: derived
+            .into_iter()
+            .map(|(active, steps, support)| DerivedKnowledgeInspection {
+                active,
+                steps,
+                support,
+            })
+            .collect(),
+    })
+}
+
 /// Re-encodes an Experience segment after forcing its first verdict to Accepted.
 ///
 /// This deliberately test-only mutation lets corruption tests exercise semantic
@@ -206,6 +541,14 @@ pub fn inspect_experience_segment(
 /// Returns `Err(())` when the segment is malformed or contains no attempts.
 pub fn force_first_experience_accepted(bytes: &[u8]) -> Result<Vec<u8>, ExperienceInspectionError> {
     crate::runtime::force_first_experience_accepted(bytes).map_err(|()| ExperienceInspectionError)
+}
+
+/// Re-encodes current Experience through the frozen pre-action-provenance v23
+/// framing for migration fixtures.
+pub fn pre_action_v23_experience_segment(
+    bytes: &[u8],
+) -> Result<Vec<u8>, ExperienceInspectionError> {
+    crate::runtime::pre_action_v23_experience_segment(bytes).map_err(|()| ExperienceInspectionError)
 }
 
 /// Paired fixed-Experience comparison of two equal-capacity Candidate feature families.

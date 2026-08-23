@@ -29,6 +29,7 @@ const FAULT_OCCURRENCE_ENV: &str = "REFLEX_INTERNAL_TEST_FAULT_OCCURRENCE";
 #[test]
 fn observer_boundary_checkpoint_survives_an_abrupt_process_exit() {
     let bundle_path = crash_checkpoint("observer-boundary");
+    assert_eq!(revisions_rfic_magic(&bundle_path), *b"RFIC\x11");
 
     let outcome = improve(
         BitVecDomain::unary_u8(),
@@ -45,7 +46,21 @@ fn observer_boundary_checkpoint_survives_an_abrupt_process_exit() {
             && outcome.usage().verification_requests == 7,
         "interrupted Resume must retain prior usage and charge Artifact, Experience, Seed, and continued-work Verification"
     );
+    assert_eq!(revisions_rfic_magic(&bundle_path), *b"RFIC\x11");
     std::fs::remove_file(bundle_path).ok();
+}
+
+fn revisions_rfic_magic(path: &std::path::Path) -> [u8; 5] {
+    let encoded = std::fs::read(path).unwrap();
+    let bundle = CanonicalBundle::decode(&encoded, 64 * 1024 * 1024).unwrap();
+    let revisions = bundle.segment(SegmentKind::Revisions);
+    let length_offset = 4 * 32;
+    let payload_offset = length_offset + 8;
+    let length = u64::from_le_bytes(revisions[length_offset..payload_offset].try_into().unwrap());
+    assert!(length >= 5);
+    revisions[payload_offset..payload_offset + 5]
+        .try_into()
+        .unwrap()
 }
 
 #[test]
@@ -188,6 +203,10 @@ fn refuted_cohort_checkpoint_recovers_the_deferred_tail() {
         !status.success() && status.code().is_none(),
         "the helper must abort immediately after publishing a refuted cohort"
     );
+    let published = std::fs::read(&interrupted_path)
+        .expect("the cohort-published fault must leave its durable checkpoint");
+    CanonicalBundle::decode(&published, 16 * 1024 * 1024)
+        .expect("the published crash checkpoint must be canonically framed");
     improve(
         BitVecDomain::unary_u8(),
         cohort_request(BundlePlan::Resume {
@@ -203,6 +222,68 @@ fn refuted_cohort_checkpoint_recovers_the_deferred_tail() {
         experience_identities(&uninterrupted_path),
         "Resume must decide the exact deferred Candidate tail retained by the uninterrupted run"
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn earlier_interrupted_session_cannot_splice_onto_later_restart_state() {
+    let directory = std::env::temp_dir().join(format!(
+        "reflex-session-state-root-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("unnamed")
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let earlier = directory.join("earlier.bundle");
+    let later = directory.join("later.bundle");
+    let crossed = directory.join("crossed.bundle");
+    let earlier_status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(FAULT_PHASE_ENV, "candidate-created")
+        .env(FAULT_OCCURRENCE_ENV, "1")
+        .env(TARGET_ENV, &earlier)
+        .status()
+        .unwrap();
+    assert!(!earlier_status.success() && earlier_status.code().is_none());
+    let later_status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(COHORT_ENV, "1")
+        .env(FAULT_PHASE_ENV, "cohort-published")
+        .env(FAULT_OCCURRENCE_ENV, "1")
+        .env(TARGET_ENV, &later)
+        .status()
+        .unwrap();
+    assert!(!later_status.success() && later_status.code().is_none());
+    let earlier_bytes = std::fs::read(&earlier).unwrap();
+    let mut later_bundle =
+        CanonicalBundle::decode(&std::fs::read(&later).unwrap(), 64 * 1024 * 1024).unwrap();
+    let earlier_bundle = CanonicalBundle::decode(&earlier_bytes, 64 * 1024 * 1024).unwrap();
+    assert_ne!(
+        earlier_bundle.restart_state_root(),
+        later_bundle.restart_state_root(),
+        "the two fault occurrences must retain distinct restart-complete state"
+    );
+    later_bundle.replace_segment(
+        SegmentKind::Session,
+        earlier_bundle.segment(SegmentKind::Session).to_vec(),
+    );
+    let crossed_bytes = later_bundle.encode();
+    std::fs::write(&crossed, &crossed_bytes).unwrap();
+
+    let result = improve(
+        BitVecDomain::unary_u8(),
+        cohort_request(BundlePlan::Resume {
+            source: crossed.clone(),
+            target: crossed.clone(),
+        }),
+        |_| ControlFlow::Continue(()),
+    );
+
+    assert!(matches!(result, Err(reflex::SessionError::CorruptBundle)));
+    assert_eq!(std::fs::read(&crossed).unwrap(), crossed_bytes);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -401,8 +482,6 @@ fn online_promotion_checkpoint_recovers_the_exact_next_cohort_policy() {
     ));
     std::fs::create_dir(&directory).unwrap();
     let uninterrupted = directory.join("uninterrupted.bundle");
-    let interrupted = directory.join("interrupted.bundle");
-
     improve(
         BitVecDomain::unary_u8(),
         online_cohort_request(BundlePlan::Fresh {
@@ -411,28 +490,6 @@ fn online_promotion_checkpoint_recovers_the_exact_next_cohort_policy() {
         |_| ControlFlow::Continue(()),
     )
     .unwrap();
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
-        .env(HELPER_ENV, "1")
-        .env(COHORT_ENV, "1")
-        .env(ONLINE_COHORT_ENV, "1")
-        .env(FAULT_PHASE_ENV, "candidate-created")
-        .env(FAULT_OCCURRENCE_ENV, "2")
-        .env(TARGET_ENV, &interrupted)
-        .status()
-        .unwrap();
-    assert!(!status.success() && status.code().is_none());
-
-    improve(
-        BitVecDomain::unary_u8(),
-        online_cohort_request(BundlePlan::Resume {
-            source: interrupted.clone(),
-            target: interrupted.clone(),
-        }),
-        |_| ControlFlow::Continue(()),
-    )
-    .unwrap();
-
     let expected = allocation_trace(&uninterrupted);
     assert!(expected.iter().any(|fate| {
         matches!(
@@ -443,7 +500,41 @@ fn online_promotion_checkpoint_recovers_the_exact_next_cohort_policy() {
             }
         )
     }));
-    assert_eq!(allocation_trace(&interrupted), expected);
+    for phase in [
+        "operational-actions-staged",
+        "operational-actions-published",
+    ] {
+        let interrupted = directory.join(format!("{phase}.bundle"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpoint_crash_helper", "--nocapture"])
+            .env(HELPER_ENV, "1")
+            .env(COHORT_ENV, "1")
+            .env(ONLINE_COHORT_ENV, "1")
+            .env(FAULT_PHASE_ENV, phase)
+            .env(FAULT_OCCURRENCE_ENV, "2")
+            .env(TARGET_ENV, &interrupted)
+            .status()
+            .unwrap();
+        assert!(
+            !status.success() && status.code().is_none(),
+            "{phase} must terminate at its exact barrier side"
+        );
+
+        improve(
+            BitVecDomain::unary_u8(),
+            online_cohort_request(BundlePlan::Resume {
+                source: interrupted.clone(),
+                target: interrupted.clone(),
+            }),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+        assert_eq!(
+            allocation_trace(&interrupted),
+            expected,
+            "crashing {phase} must preserve the uninterrupted allocation trace"
+        );
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -647,7 +738,7 @@ fn narrow_initial_frontier(source: &std::path::Path, target: &std::path::Path) -
         pending_records.push(record);
         pending_input = rest;
     }
-    assert!(pending_input.is_empty());
+    assert_eq!(pending_input, &[0; 9]);
 
     let mut narrowed = Vec::with_capacity(recovery.len() - 64);
     narrowed.extend_from_slice(&recovery[..frontier_count_offset]);
@@ -662,16 +753,20 @@ fn narrow_initial_frontier(source: &std::path::Path, target: &std::path::Path) -
     for record in retained_pending {
         narrowed.extend_from_slice(record);
     }
-    let encoded = CanonicalBundle::new(
+    narrowed.extend_from_slice(&0_u64.to_le_bytes());
+    narrowed.push(0);
+    let mut narrowed_bundle = CanonicalBundle::new(
         bundle.identity().to_vec(),
         bundle.segment(SegmentKind::Session).to_vec(),
         bundle.segment(SegmentKind::Revisions).to_vec(),
         bundle.segment(SegmentKind::Artifacts).to_vec(),
         bundle.segment(SegmentKind::Experience).to_vec(),
         narrowed,
-    )
-    .encode();
-    std::fs::write(target, encoded).unwrap();
+    );
+    let mut session = bundle.segment(SegmentKind::Session).to_vec();
+    session[9..41].copy_from_slice(&narrowed_bundle.restart_state_root());
+    narrowed_bundle.replace_segment(SegmentKind::Session, session);
+    std::fs::write(target, narrowed_bundle.encode()).unwrap();
     frontier_count as u64 - 1
 }
 

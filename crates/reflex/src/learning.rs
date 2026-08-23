@@ -1,8 +1,15 @@
+#[cfg(any(test, feature = "internal-experiments"))]
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(feature = "internal-experiments")]
+use std::collections::HashSet;
+#[cfg(not(any(test, feature = "internal-experiments")))]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(test, feature = "internal-experiments"))]
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, feature = "internal-experiments"))]
 use crate::policy::{AllocationQueue, OperationalPartition, operational_ranked_selections};
 
 pub(crate) const BASE_FEATURE_COUNT: usize = 16;
@@ -11,11 +18,11 @@ pub(crate) const HEAD_COUNT: usize = 7;
 const FEATURE_REVISION: u32 = 2;
 const TARGET_REVISION: u32 = 1;
 const CALIBRATION_REVISION: u32 = 1;
+#[cfg(feature = "internal-experiments")]
 const MAX_REPLAY_BATCH: usize = 16_384;
+#[cfg(feature = "internal-experiments")]
 const TRAINING_EPOCHS: usize = 8;
 const MAX_SELECTION_USES: u8 = 3;
-const MIN_SELECTION_CASES: usize = 8;
-const MIN_REPLAY_CASES: usize = 8;
 const MAX_SPECIALISTS: usize = 8;
 pub(crate) const MIN_ONLINE_TRAINING_EXAMPLES: usize = 32;
 pub(crate) const ONLINE_TRAINING_GROWTH: usize = 16;
@@ -23,9 +30,11 @@ pub(crate) const ONLINE_TRAINING_GROWTH: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Features(pub(crate) [f32; FEATURE_COUNT]);
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Targets(pub(crate) [f32; HEAD_COUNT]);
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Forecast {
     pub(crate) estimate: f32,
@@ -33,16 +42,21 @@ pub(crate) struct Forecast {
     pub(crate) uncertainty: f32,
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PotentialForecast(pub(crate) [Forecast; HEAD_COUNT]);
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VerdictTarget {
     Accepted,
+    #[cfg(feature = "internal-experiments")]
     Refuted,
+    #[cfg(feature = "internal-experiments")]
     Unknown,
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptObservation {
     pub(crate) id: [u8; 32],
@@ -76,9 +90,11 @@ pub(crate) enum CorpusRole {
     Selection { uses: u8 },
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 #[derive(Clone, Debug)]
 pub(crate) struct TrainingExample {
     pub(crate) key: [u8; 32],
+    #[cfg(feature = "internal-experiments")]
     pub(crate) corpus_key: [u8; 32],
     behavior_rank: u32,
     behavior_sequence: u32,
@@ -87,6 +103,7 @@ pub(crate) struct TrainingExample {
     pub(crate) features: Features,
     active_features: u32,
     pub(crate) targets: Targets,
+    #[cfg(feature = "internal-experiments")]
     pub(crate) role: CorpusRole,
 }
 
@@ -101,28 +118,113 @@ pub(crate) struct FtrlModel {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum LegacyFtrlHead {
+    ImmediateImprovement = 1,
+    UsefulDescendants = 2,
+    CrossGoalLeverage = 3,
+    CompressionValue = 4,
+    KernelAcceptance = 5,
+    VerificationCost = 6,
+    DeadEndRisk = 7,
+}
+
+impl LegacyFtrlHead {
+    const fn tag(self) -> u8 {
+        self as u8
+    }
+}
+
+const LEGACY_FTRL_HEADS: [LegacyFtrlHead; HEAD_COUNT] = [
+    LegacyFtrlHead::ImmediateImprovement,
+    LegacyFtrlHead::UsefulDescendants,
+    LegacyFtrlHead::CrossGoalLeverage,
+    LegacyFtrlHead::CompressionValue,
+    LegacyFtrlHead::KernelAcceptance,
+    LegacyFtrlHead::VerificationCost,
+    LegacyFtrlHead::DeadEndRisk,
+];
+
+#[derive(Clone, Copy)]
+pub(crate) struct FtrlConversionView<'a> {
+    weights: &'a [[f32; HEAD_COUNT]; FEATURE_COUNT],
+    second_moments: &'a [[f32; HEAD_COUNT]; FEATURE_COUNT],
+    calibration_counts: &'a [u64; HEAD_COUNT],
+    calibration_errors: &'a [f32; HEAD_COUNT],
+}
+
+impl<'a> FtrlConversionView<'a> {
+    pub(crate) const fn semantic_heads() -> &'static [LegacyFtrlHead; HEAD_COUNT] {
+        &LEGACY_FTRL_HEADS
+    }
+
+    pub(crate) const fn weights(self) -> &'a [[f32; HEAD_COUNT]; FEATURE_COUNT] {
+        self.weights
+    }
+
+    pub(crate) const fn second_moments(self) -> &'a [[f32; HEAD_COUNT]; FEATURE_COUNT] {
+        self.second_moments
+    }
+
+    pub(crate) const fn calibration_counts(self) -> &'a [u64; HEAD_COUNT] {
+        self.calibration_counts
+    }
+
+    pub(crate) const fn calibration_errors(self) -> &'a [f32; HEAD_COUNT] {
+        self.calibration_errors
+    }
+
+    pub(crate) fn content_identity(self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"reflex-ftrl-conversion-view-v1\0");
+        digest.update(FEATURE_REVISION.to_le_bytes());
+        digest.update(TARGET_REVISION.to_le_bytes());
+        digest.update(CALIBRATION_REVISION.to_le_bytes());
+        digest.update(
+            u64::try_from(FEATURE_COUNT)
+                .expect("the fixed FTRL feature count fits u64")
+                .to_le_bytes(),
+        );
+        digest.update(
+            u64::try_from(HEAD_COUNT)
+                .expect("the fixed FTRL head count fits u64")
+                .to_le_bytes(),
+        );
+        for (head, semantic_head) in LEGACY_FTRL_HEADS.into_iter().enumerate() {
+            digest.update([semantic_head.tag()]);
+            for feature in self.weights {
+                digest.update(feature[head].to_bits().to_le_bytes());
+            }
+            for feature in self.second_moments {
+                digest.update(feature[head].to_bits().to_le_bytes());
+            }
+            digest.update(self.calibration_counts[head].to_le_bytes());
+            digest.update(self.calibration_errors[head].to_bits().to_le_bytes());
+        }
+        digest.finalize().into()
+    }
+}
+
+#[cfg(feature = "internal-experiments")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromotionDecision {
     Promote,
     Specialist,
     Reject,
-    Rollback,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObservedPolicyComparison {
-    InsufficientEvidence,
-    ChallengerWins,
-    IncumbentWins,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LearningState {
+    #[cfg(any(test, feature = "internal-experiments"))]
     generation: u64,
     last_training_examples: u64,
     online_comparisons: u8,
     champion: Option<FtrlModel>,
+    #[cfg(any(test, feature = "internal-experiments"))]
     predecessor: Option<FtrlModel>,
+    #[cfg(any(test, feature = "internal-experiments"))]
     predecessor_is_bootstrap: bool,
+    #[cfg(any(test, feature = "internal-experiments"))]
     specialists: Vec<FtrlModel>,
     roles: BTreeMap<[u8; 32], CorpusRole>,
 }
@@ -161,26 +263,8 @@ impl LearningState {
         self.champion.as_ref()
     }
 
-    pub(crate) fn last_training_examples(&self) -> usize {
-        usize::try_from(self.last_training_examples).unwrap_or(usize::MAX)
-    }
-
-    pub(crate) const fn online_comparison_budget() -> u32 {
+    const fn online_comparison_budget() -> u32 {
         (MAX_SELECTION_USES - 1) as u32
-    }
-
-    pub(crate) fn online_comparisons(&self) -> u8 {
-        self.online_comparisons
-    }
-
-    pub(crate) fn resident_bytes(&self) -> u64 {
-        let inline = std::mem::size_of_val(self) as u64;
-        let specialists = (self.specialists.capacity() as u64)
-            .saturating_mul(std::mem::size_of::<FtrlModel>() as u64);
-        let corpus_index = (self.roles.len() as u64).saturating_mul(128);
-        inline
-            .saturating_add(specialists)
-            .saturating_add(corpus_index)
     }
 
     pub(crate) fn corpus_is_valid(&self, attempts: &[([u8; 32], [u8; 32])]) -> bool {
@@ -204,87 +288,6 @@ impl LearningState {
         watermark >= minimum_online_examples
             && self.roles.len() == trained_claims.len()
             && self.roles.keys().all(|key| trained_claims.contains(key))
-    }
-
-    pub(crate) fn training_scratch_bytes(example_count: usize) -> u64 {
-        let total = example_count as u64;
-        let retained = example_count.min(MAX_REPLAY_BATCH) as u64;
-        let example = std::mem::size_of::<TrainingExample>() as u64;
-        total
-            .saturating_mul(example)
-            .saturating_add(retained.saturating_mul(example).saturating_mul(2))
-            .saturating_add(retained.saturating_mul(192))
-    }
-
-    #[cfg(test)]
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    #[cfg(test)]
-    fn specialist_count(&self) -> usize {
-        self.specialists.len()
-    }
-
-    pub(crate) fn learn(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
-        self.last_training_examples = u64::try_from(examples.len()).unwrap_or(u64::MAX);
-        self.assign_new_corpus_roles(examples);
-        let selection = bounded_corpus(examples, true);
-        if let Some(champion) = &self.champion {
-            let predecessor_wins = if self.predecessor_is_bootstrap {
-                compare_bootstrap_policy(champion, &selection)
-                    == ObservedPolicyComparison::IncumbentWins
-            } else {
-                self.predecessor.as_ref().is_some_and(|predecessor| {
-                    compare_learned_revisions(champion, predecessor, &selection)
-                        == PromotionDecision::Promote
-                })
-            };
-            if predecessor_wins {
-                let decision = self.rollback();
-                self.finish_selection(examples);
-                return decision;
-            }
-        }
-        let replay = bounded_corpus(examples, false);
-        let mut challenger = FtrlModel::zero();
-        for _ in 0..TRAINING_EPOCHS {
-            for example in &replay {
-                challenger.update(example);
-            }
-        }
-        let decision = if let Some(champion) = &self.champion {
-            compare_learned_revisions(champion, &challenger, &selection)
-        } else {
-            let calibration = compare_models(&FtrlModel::zero(), &challenger, &selection);
-            if calibration == PromotionDecision::Promote
-                && compare_bootstrap_policy(&challenger, &selection)
-                    == ObservedPolicyComparison::ChallengerWins
-            {
-                PromotionDecision::Promote
-            } else {
-                PromotionDecision::Reject
-            }
-        };
-        match decision {
-            PromotionDecision::Promote => {
-                self.predecessor = self.champion.replace(challenger);
-                self.predecessor_is_bootstrap = self.predecessor.is_none();
-                self.generation = self.generation.saturating_add(1);
-            }
-            PromotionDecision::Specialist => {
-                self.retain_specialist(challenger);
-            }
-            PromotionDecision::Reject | PromotionDecision::Rollback => {}
-        }
-        self.finish_selection(examples);
-        decision
-    }
-
-    pub(crate) fn learn_online(&mut self, examples: &mut [TrainingExample]) -> PromotionDecision {
-        let decision = self.learn(examples);
-        self.online_comparisons = self.online_comparisons.saturating_add(1);
-        decision
     }
 
     #[cfg(feature = "internal-experiments")]
@@ -394,93 +397,7 @@ impl LearningState {
         })
     }
 
-    fn assign_new_corpus_roles(&mut self, examples: &mut [TrainingExample]) {
-        let mut unseen = examples
-            .iter()
-            .map(|example| example.corpus_key)
-            .filter(|key| !self.roles.contains_key(key))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        unseen.sort_unstable_by_key(|key| {
-            (
-                !matches!(assign_role(*key), CorpusRole::Selection { .. }),
-                *key,
-            )
-        });
-        let current_selection = self
-            .roles
-            .values()
-            .filter(|role| matches!(role, CorpusRole::Selection { .. }))
-            .count();
-        let total_cases = self.roles.len().saturating_add(unseen.len());
-        let minimum_replay = if self.champion.is_some() {
-            0
-        } else {
-            MIN_REPLAY_CASES
-        };
-        let maximum_selection = total_cases.saturating_sub(minimum_replay);
-        let target_selection = total_cases
-            .div_ceil(5)
-            .max(MIN_SELECTION_CASES)
-            .min(maximum_selection);
-        let new_selection = target_selection
-            .saturating_sub(current_selection)
-            .min(unseen.len());
-        for (index, key) in unseen.into_iter().enumerate() {
-            self.roles.insert(
-                key,
-                if index < new_selection {
-                    CorpusRole::Selection { uses: 0 }
-                } else {
-                    CorpusRole::Replay
-                },
-            );
-        }
-        for example in examples {
-            example.role = self.roles[&example.corpus_key];
-        }
-    }
-
-    fn finish_selection(&mut self, examples: &mut [TrainingExample]) {
-        rotate_selection(examples, MAX_SELECTION_USES);
-        for example in examples {
-            self.roles.insert(example.corpus_key, example.role);
-        }
-    }
-
-    pub(crate) fn rollback(&mut self) -> PromotionDecision {
-        if self.predecessor_is_bootstrap {
-            if let Some(regressed) = self.champion.take() {
-                self.retain_specialist(regressed);
-            }
-            self.predecessor_is_bootstrap = false;
-            self.generation = self.generation.saturating_add(1);
-            return PromotionDecision::Rollback;
-        }
-        let Some(predecessor) = self.predecessor.take() else {
-            return PromotionDecision::Reject;
-        };
-        if let Some(regressed) = self.champion.replace(predecessor) {
-            self.retain_specialist(regressed);
-        }
-        self.generation = self.generation.saturating_add(1);
-        PromotionDecision::Rollback
-    }
-
-    fn retain_specialist(&mut self, specialist: FtrlModel) {
-        if !self
-            .specialists
-            .iter()
-            .any(|model| revision_digest(model) == revision_digest(&specialist))
-        {
-            self.specialists.push(specialist);
-            if self.specialists.len() > MAX_SPECIALISTS {
-                self.specialists.remove(0);
-            }
-        }
-    }
-
+    #[cfg(any(test, feature = "internal-experiments"))]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
         output.extend_from_slice(b"RFLS\x03");
@@ -595,12 +512,16 @@ impl LearningState {
             return Err(());
         }
         Ok(Self {
+            #[cfg(any(test, feature = "internal-experiments"))]
             generation,
             last_training_examples,
             online_comparisons,
             champion,
+            #[cfg(any(test, feature = "internal-experiments"))]
             predecessor,
+            #[cfg(any(test, feature = "internal-experiments"))]
             predecessor_is_bootstrap,
+            #[cfg(any(test, feature = "internal-experiments"))]
             specialists,
             roles,
         })
@@ -622,6 +543,7 @@ impl LearningState {
     }
 }
 
+#[cfg(feature = "internal-experiments")]
 const RANKING_BUDGETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 #[cfg(feature = "internal-experiments")]
@@ -715,6 +637,7 @@ fn accepted_ranking(model: &FtrlModel, examples: &[TrainingExample]) -> Accepted
     }
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 pub(crate) fn compare_forecasts(left: PotentialForecast, right: PotentialForecast) -> Ordering {
     for head in [0, 1, 2, 3, 4] {
         let left_value = left.0[head].estimate
@@ -755,6 +678,61 @@ impl FtrlModel {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn deterministic_conversion_fixture() -> Self {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"RFLM\x02");
+        for revision in [FEATURE_REVISION, TARGET_REVISION, CALIBRATION_REVISION] {
+            encoded.extend_from_slice(&revision.to_le_bytes());
+        }
+        for state in 0..2 {
+            for head in 0..HEAD_COUNT {
+                for feature in 0..FEATURE_COUNT {
+                    let ordinal = u16::try_from((head + 1) * (feature + 1))
+                        .expect("the fixed fixture ordinal fits u16");
+                    let value = if state == 0 {
+                        let magnitude = f32::from(ordinal) / 4096.0;
+                        if (head + feature).is_multiple_of(2) {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
+                    } else {
+                        f32::from(ordinal) / 2048.0
+                    };
+                    encoded.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for head in 0..HEAD_COUNT {
+            let count = if head == 5 {
+                0
+            } else {
+                u64::try_from(head + 1).expect("the fixed head index fits u64") * 17
+            };
+            encoded.extend_from_slice(&count.to_le_bytes());
+        }
+        for head in 0..HEAD_COUNT {
+            let error = if head == 5 {
+                0.0
+            } else {
+                f32::from(u16::try_from(head + 1).expect("the fixed head index fits u16")) / 32.0
+            };
+            encoded.extend_from_slice(&error.to_bits().to_le_bytes());
+        }
+        Self::decode(&encoded).expect("the deterministic conversion fixture is a valid FTRL model")
+    }
+
+    pub(crate) const fn conversion_view(&self) -> FtrlConversionView<'_> {
+        FtrlConversionView {
+            weights: &self.weights,
+            second_moments: &self.n,
+            calibration_counts: &self.calibration_count,
+            calibration_errors: &self.calibration_error,
+        }
+    }
+
+    #[cfg(any(test, feature = "internal-experiments"))]
     fn predict(&self, features: Features) -> Targets {
         let mut linear = [0.0_f32; HEAD_COUNT];
         for (feature_index, feature) in features.0.iter().copied().enumerate() {
@@ -765,6 +743,7 @@ impl FtrlModel {
         sigmoid_heads(linear)
     }
 
+    #[cfg(any(test, feature = "internal-experiments"))]
     fn predict_active(&self, features: Features, mut active_features: u32) -> Targets {
         let mut linear = [0.0_f32; HEAD_COUNT];
         while active_features != 0 {
@@ -778,6 +757,7 @@ impl FtrlModel {
         sigmoid_heads(linear)
     }
 
+    #[cfg(any(test, feature = "internal-experiments"))]
     pub(crate) fn forecast(&self, features: Features) -> PotentialForecast {
         let mut linear = [0.0_f32; HEAD_COUNT];
         let mut support = [0.0_f32; HEAD_COUNT];
@@ -803,29 +783,12 @@ impl FtrlModel {
         }))
     }
 
-    pub(crate) fn forecast_batch(
-        &self,
-        features: &[Features],
-        output: &mut Vec<PotentialForecast>,
-    ) {
-        output.clear();
-        output.reserve(features.len());
-        let mut unique = HashMap::<[u32; FEATURE_COUNT], PotentialForecast>::with_capacity(
-            features.len().min(1_024),
-        );
-        for features in features {
-            let key = features.0.map(f32::to_bits);
-            let forecast = *unique
-                .entry(key)
-                .or_insert_with(|| self.forecast(*features));
-            output.push(forecast);
-        }
-    }
-
+    #[cfg(any(test, feature = "internal-experiments"))]
     pub(crate) fn update(&mut self, example: &TrainingExample) {
         self.update_weighted(example, [1.0; HEAD_COUNT]);
     }
 
+    #[cfg(any(test, feature = "internal-experiments"))]
     fn update_weighted(&mut self, example: &TrainingExample, head_weights: [f32; HEAD_COUNT]) {
         const ALPHA: f32 = 0.1;
         let predictions = self.predict_active(example.features, example.active_features);
@@ -960,9 +923,11 @@ fn weight_from_state(z: f32, sqrt_n: f32) -> f32 {
     const ALPHA: f32 = 0.1;
     const BETA: f32 = 1.0;
     const L2: f32 = 1.0;
-    -z / ((BETA + sqrt_n) / ALPHA + L2)
+    let weight = -z / ((BETA + sqrt_n) / ALPHA + L2);
+    if weight == 0.0 { 0.0 } else { weight }
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 pub(crate) fn derive_targets(
     attempts: &[AttemptObservation],
     consequences: &[ConsequenceObservation],
@@ -1015,6 +980,7 @@ pub(crate) fn derive_targets(
             let dead_end = !accepted || (descendants == 0 && !immediate);
             TrainingExample {
                 key: attempt.id,
+                #[cfg(feature = "internal-experiments")]
                 corpus_key: attempt.claim,
                 behavior_rank: current_behavior_rank,
                 behavior_sequence: u32::try_from(sequence).unwrap_or(u32::MAX),
@@ -1031,12 +997,14 @@ pub(crate) fn derive_targets(
                     f32::from(dead_end),
                 ]),
                 active_features: active_feature_mask(attempt.features),
+                #[cfg(feature = "internal-experiments")]
                 role: assign_role(attempt.claim),
             }
         })
         .collect()
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 fn active_feature_mask(features: Features) -> u32 {
     features
         .0
@@ -1051,6 +1019,7 @@ fn active_feature_mask(features: Features) -> u32 {
         })
 }
 
+#[cfg(feature = "internal-experiments")]
 pub(crate) fn assign_role(key: [u8; 32]) -> CorpusRole {
     if key[0].is_multiple_of(5) {
         CorpusRole::Selection { uses: 0 }
@@ -1059,17 +1028,7 @@ pub(crate) fn assign_role(key: [u8; 32]) -> CorpusRole {
     }
 }
 
-pub(crate) fn rotate_selection(examples: &mut [TrainingExample], maximum_uses: u8) {
-    for example in examples {
-        if let CorpusRole::Selection { uses } = &mut example.role {
-            *uses = uses.saturating_add(1);
-            if *uses >= maximum_uses {
-                example.role = CorpusRole::Replay;
-            }
-        }
-    }
-}
-
+#[cfg(feature = "internal-experiments")]
 fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&TrainingExample> {
     let eligible = |example: &&TrainingExample| {
         matches!(example.role, CorpusRole::Selection { .. }) == selection
@@ -1101,118 +1060,7 @@ fn bounded_corpus(examples: &[TrainingExample], selection: bool) -> Vec<&Trainin
     corpus
 }
 
-fn compare_bootstrap_policy(
-    challenger: &FtrlModel,
-    selection: &[&TrainingExample],
-) -> ObservedPolicyComparison {
-    compare_observed_policy_prefixes(None, challenger, selection)
-}
-
-fn compare_learned_revisions(
-    incumbent: &FtrlModel,
-    challenger: &FtrlModel,
-    selection: &[&TrainingExample],
-) -> PromotionDecision {
-    match compare_models(incumbent, challenger, selection) {
-        PromotionDecision::Promote
-            if compare_observed_policy_prefixes(Some(incumbent), challenger, selection)
-                == ObservedPolicyComparison::ChallengerWins =>
-        {
-            PromotionDecision::Promote
-        }
-        PromotionDecision::Specialist => PromotionDecision::Specialist,
-        PromotionDecision::Promote | PromotionDecision::Reject | PromotionDecision::Rollback => {
-            PromotionDecision::Reject
-        }
-    }
-}
-
-fn compare_observed_policy_prefixes(
-    incumbent: Option<&FtrlModel>,
-    challenger: &FtrlModel,
-    selection: &[&TrainingExample],
-) -> ObservedPolicyComparison {
-    // This gate composes the real scheduler over the historically labeled
-    // subset. It is a conservative operational diagnostic, not an on-policy
-    // causal estimate: deferred Candidates have no verifier outcome.
-    let Some(incumbent) = observed_discovery_prefixes(incumbent, selection) else {
-        return ObservedPolicyComparison::InsufficientEvidence;
-    };
-    let challenger = observed_discovery_prefixes(Some(challenger), selection)
-        .expect("the same selection must produce the same evidence sufficiency");
-    let within_claim_noninferior = challenger
-        .within_claim
-        .iter()
-        .zip(incumbent.within_claim)
-        .all(|(challenger, incumbent)| *challenger >= incumbent);
-    let global_noninferior = challenger
-        .global
-        .iter()
-        .zip(incumbent.global)
-        .all(|(challenger, incumbent)| *challenger >= incumbent);
-    let within_claim_strictly_better = challenger
-        .within_claim
-        .iter()
-        .zip(incumbent.within_claim)
-        .any(|(challenger, incumbent)| *challenger > incumbent);
-    let global_strictly_better = challenger
-        .global
-        .iter()
-        .zip(incumbent.global)
-        .any(|(challenger, incumbent)| *challenger > incumbent);
-    if within_claim_noninferior
-        && global_noninferior
-        && (within_claim_strictly_better || global_strictly_better)
-    {
-        ObservedPolicyComparison::ChallengerWins
-    } else {
-        ObservedPolicyComparison::IncumbentWins
-    }
-}
-
-struct DiscoveryPrefixes {
-    within_claim: [usize; 7],
-    global: [usize; 7],
-}
-
-fn observed_discovery_prefixes(
-    model: Option<&FtrlModel>,
-    selection: &[&TrainingExample],
-) -> Option<DiscoveryPrefixes> {
-    let mut groups = BTreeMap::<[u8; 32], Vec<&TrainingExample>>::new();
-    for example in selection {
-        groups.entry(example.corpus_key).or_default().push(example);
-    }
-    if groups.len() < MIN_SELECTION_CASES {
-        return None;
-    }
-    let mut within_claim = [0_usize; 7];
-    for examples in groups.values_mut() {
-        let operational = observed_policy_examples(model, examples);
-        for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
-            within_claim[index] = within_claim[index].saturating_add(
-                operational[..operational.len().min(budget)]
-                    .iter()
-                    .filter(|candidate| candidate.targets.0[0] > 0.0)
-                    .count(),
-            );
-        }
-    }
-    let global_operational = observed_policy_examples(model, selection);
-    let mut global = [0_usize; 7];
-    for (index, budget) in RANKING_BUDGETS.into_iter().enumerate() {
-        let count = selection.len().min(budget);
-        global[index] = global_operational[..count]
-            .iter()
-            .filter(|candidate| candidate.targets.0[0] > 0.0)
-            .count();
-    }
-    Some(DiscoveryPrefixes {
-        within_claim,
-        global,
-    })
-}
-
+#[cfg(any(test, feature = "internal-experiments"))]
 fn observed_policy_examples<'a>(
     model: Option<&FtrlModel>,
     examples: &[&'a TrainingExample],
@@ -1315,25 +1163,7 @@ fn bounded_u32(value: u32) -> f32 {
     f32::from(u16::try_from(value).unwrap_or(u16::MAX))
 }
 
-pub(crate) fn compare_models(
-    champion: &FtrlModel,
-    challenger: &FtrlModel,
-    selection: &[&TrainingExample],
-) -> PromotionDecision {
-    if selection
-        .iter()
-        .map(|example| example.corpus_key)
-        .collect::<BTreeSet<_>>()
-        .len()
-        < MIN_SELECTION_CASES
-    {
-        return PromotionDecision::Reject;
-    }
-    let champion_loss = losses(champion, selection);
-    let challenger_loss = losses(challenger, selection);
-    promotion_from_losses(champion_loss, challenger_loss)
-}
-
+#[cfg(feature = "internal-experiments")]
 fn promotion_from_losses(
     champion_loss: [f32; HEAD_COUNT],
     challenger_loss: [f32; HEAD_COUNT],
@@ -1365,6 +1195,7 @@ pub(crate) fn revision_digest(model: &FtrlModel) -> [u8; 32] {
     digest.finalize().into()
 }
 
+#[cfg(feature = "internal-experiments")]
 fn losses(model: &FtrlModel, selection: &[&TrainingExample]) -> [f32; HEAD_COUNT] {
     let mut groups = BTreeMap::<[u8; 32], ([f32; HEAD_COUNT], u32)>::new();
     for example in selection {
@@ -1392,6 +1223,7 @@ fn losses(model: &FtrlModel, selection: &[&TrainingExample]) -> [f32; HEAD_COUNT
     losses
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 fn sigmoid(value: f32) -> f32 {
     if value >= 0.0 {
         1.0 / (1.0 + (-value).exp())
@@ -1401,6 +1233,7 @@ fn sigmoid(value: f32) -> f32 {
     }
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 fn sigmoid_heads(linear: [f32; HEAD_COUNT]) -> Targets {
     let mut predictions = [0.0_f32; HEAD_COUNT];
     for head in 0..HEAD_COUNT {
@@ -1411,6 +1244,7 @@ fn sigmoid_heads(linear: [f32; HEAD_COUNT]) -> Targets {
     Targets(predictions)
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 fn push_model(output: &mut Vec<u8>, model: Option<&FtrlModel>) {
     match model {
         Some(model) => {
@@ -1429,6 +1263,7 @@ fn read_model(input: &mut &[u8]) -> Result<Option<FtrlModel>, ()> {
     }
 }
 
+#[cfg(any(test, feature = "internal-experiments"))]
 fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     output.extend_from_slice(bytes);
@@ -1468,96 +1303,43 @@ fn target_map(examples: &[TrainingExample]) -> BTreeMap<[u8; 32], Targets> {
 mod tests {
     use super::*;
 
-    struct UncachedFtrlModel {
-        z: [[f32; FEATURE_COUNT]; HEAD_COUNT],
-        n: [[f32; FEATURE_COUNT]; HEAD_COUNT],
-        calibration_count: [u64; HEAD_COUNT],
-        calibration_error: [f32; HEAD_COUNT],
+    fn forecast_from_conversion(
+        conversion: FtrlConversionView<'_>,
+        features: Features,
+    ) -> PotentialForecast {
+        let mut linear = [0.0_f32; HEAD_COUNT];
+        let mut support = [0.0_f32; HEAD_COUNT];
+        for (feature_index, feature) in features.0.iter().copied().enumerate() {
+            for head in 0..HEAD_COUNT {
+                linear[head] += conversion.weights()[feature_index][head] * feature;
+                support[head] +=
+                    conversion.second_moments()[feature_index][head] * feature * feature;
+            }
+        }
+        let estimates = sigmoid_heads(linear);
+        PotentialForecast(std::array::from_fn(|head| {
+            let epistemic = (1.0 / (1.0 + support[head].max(0.0))).sqrt();
+            let calibration_error = if conversion.calibration_counts()[head] == 0 {
+                1.0
+            } else {
+                conversion.calibration_errors()[head]
+            };
+            Forecast {
+                estimate: estimates.0[head],
+                calibration_error,
+                uncertainty: epistemic.max(calibration_error).clamp(0.0, 1.0),
+            }
+        }))
     }
 
-    impl UncachedFtrlModel {
-        fn zero() -> Self {
-            Self {
-                z: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
-                n: [[0.0; FEATURE_COUNT]; HEAD_COUNT],
-                calibration_count: [0; HEAD_COUNT],
-                calibration_error: [0.0; HEAD_COUNT],
-            }
-        }
-
-        fn weights(&self, head: usize) -> [f32; FEATURE_COUNT] {
-            const ALPHA: f32 = 0.1;
-            const BETA: f32 = 1.0;
-            const L1: f32 = 0.0;
-            const L2: f32 = 1.0;
-            std::array::from_fn(|index| {
-                let z = self.z[head][index];
-                if z.abs() <= L1 {
-                    0.0
-                } else {
-                    -(z - z.signum() * L1) / ((BETA + self.n[head][index].sqrt()) / ALPHA + L2)
-                }
-            })
-        }
-
-        fn predict(&self, features: Features) -> Targets {
-            let mut predictions = [0.0; HEAD_COUNT];
-            for (head, prediction) in predictions.iter_mut().enumerate() {
-                *prediction = sigmoid(
-                    self.weights(head)
-                        .iter()
-                        .zip(features.0)
-                        .map(|(weight, feature)| weight * feature)
-                        .sum(),
-                );
-            }
-            Targets(predictions)
-        }
-
-        fn update(&mut self, example: &TrainingExample) {
-            const ALPHA: f32 = 0.1;
-            let predictions = self.predict(example.features);
-            for head in 0..HEAD_COUNT {
-                let weights = self.weights(head);
-                for (index, (feature, weight)) in
-                    example.features.0.iter().copied().zip(weights).enumerate()
-                {
-                    let gradient = (predictions.0[head] - example.targets.0[head]) * feature;
-                    let sigma = ((self.n[head][index] + gradient * gradient).sqrt()
-                        - self.n[head][index].sqrt())
-                        / ALPHA;
-                    self.z[head][index] += gradient - sigma * weight;
-                    self.n[head][index] += gradient * gradient;
-                }
-                self.calibration_count[head] = self.calibration_count[head].saturating_add(1);
-                let count =
-                    f32::from(u16::try_from(self.calibration_count[head]).unwrap_or(u16::MAX));
-                let absolute_error = (predictions.0[head] - example.targets.0[head]).abs();
-                self.calibration_error[head] +=
-                    (absolute_error - self.calibration_error[head]) / count;
-            }
-        }
-
-        fn forecast(&self, features: Features) -> PotentialForecast {
-            let estimates = self.predict(features);
-            PotentialForecast(std::array::from_fn(|head| {
-                let support = self.n[head]
-                    .iter()
-                    .zip(features.0)
-                    .map(|(accumulated_gradient, feature)| accumulated_gradient * feature * feature)
-                    .sum::<f32>();
-                let epistemic = (1.0 / (1.0 + support.max(0.0))).sqrt();
-                let calibration_error = if self.calibration_count[head] == 0 {
-                    1.0
-                } else {
-                    self.calibration_error[head]
-                };
-                Forecast {
-                    estimate: estimates.0[head],
-                    calibration_error,
-                    uncertainty: epistemic.max(calibration_error).clamp(0.0, 1.0),
-                }
-            }))
+    fn assert_forecast_bits_eq(left: PotentialForecast, right: PotentialForecast) {
+        for (left, right) in left.0.into_iter().zip(right.0) {
+            assert_eq!(left.estimate.to_bits(), right.estimate.to_bits());
+            assert_eq!(
+                left.calibration_error.to_bits(),
+                right.calibration_error.to_bits()
+            );
+            assert_eq!(left.uncertainty.to_bits(), right.uncertainty.to_bits());
         }
     }
 
@@ -1644,11 +1426,14 @@ mod tests {
     }
 
     fn example(key: u8, bucket: usize, accepted: bool, role: CorpusRole) -> TrainingExample {
+        #[cfg(not(feature = "internal-experiments"))]
+        let _ = role;
         let mut targets = [0.0; HEAD_COUNT];
         targets[0] = f32::from(accepted);
         targets[6] = f32::from(!accepted);
         TrainingExample {
             key: [key; 32],
+            #[cfg(feature = "internal-experiments")]
             corpus_key: [key; 32],
             behavior_rank: 0,
             behavior_sequence: u32::from(key),
@@ -1657,6 +1442,7 @@ mod tests {
             features: features(bucket),
             active_features: active_feature_mask(features(bucket)),
             targets: Targets(targets),
+            #[cfg(feature = "internal-experiments")]
             role,
         }
     }
@@ -1759,100 +1545,129 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "release-mode development microbenchmark"]
-    fn cached_ftrl_training_and_forecasting_are_four_times_faster() {
-        const SAMPLES: usize = 5;
-        const TRAINING_UPDATES: usize = 20_000;
-        const FORECASTS: usize = 100_000;
+    fn conversion_view_preserves_every_semantic_forecast_bit_exactly() {
         let examples = (0..64_u8)
             .map(|key| {
-                let mut example = example(
+                example(
                     key,
                     usize::from(key % 8),
                     key.is_multiple_of(3),
                     CorpusRole::Replay,
-                );
-                example.features.0[1] = f32::from(key) / 255.0;
-                example.features.0[2] = f32::from(key.saturating_add(1)) / 255.0;
-                example.features.0[3] = f32::from(key) / 128.0 - 0.25;
-                example.features.0[4] = f32::from(key) / 1024.0;
-                example.features.0[13] = example.features.0[3];
-                example.features.0[14] = f32::from(key.is_multiple_of(2));
-                example.features.0[15] = f32::from(key) / 256.0;
-                example.active_features = active_feature_mask(example.features);
-                example
+                )
             })
             .collect::<Vec<_>>();
-        let mut trained = FtrlModel::zero();
-        let mut uncached_trained = UncachedFtrlModel::zero();
-        for sample in &examples {
-            trained.update(sample);
-            uncached_trained.update(sample);
-        }
-        let forecast_features = (0..FORECASTS)
-            .map(|index| examples[index % examples.len()].features)
-            .collect::<Vec<_>>();
-        let measure = |work: &mut dyn FnMut()| {
-            let started = std::time::Instant::now();
-            work();
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-        };
-        let mut cached_training = Vec::new();
-        let mut reference_training = Vec::new();
-        let mut cached_forecasting = Vec::new();
-        let mut reference_forecasting = Vec::new();
-        for sample in 0..SAMPLES {
-            let mut run_cached_training = || {
-                let mut model = FtrlModel::zero();
-                for index in 0..TRAINING_UPDATES {
-                    model.update(std::hint::black_box(&examples[index % examples.len()]));
-                }
-                std::hint::black_box(model.encode());
-            };
-            let mut run_reference_training = || {
-                let mut model = UncachedFtrlModel::zero();
-                for index in 0..TRAINING_UPDATES {
-                    model.update(std::hint::black_box(&examples[index % examples.len()]));
-                }
-                std::hint::black_box(model);
-            };
-            let mut run_cached_forecasting = || {
-                let mut output = Vec::with_capacity(forecast_features.len());
-                trained.forecast_batch(std::hint::black_box(&forecast_features), &mut output);
-                std::hint::black_box(output);
-            };
-            let mut run_reference_forecasting = || {
-                for features in &forecast_features {
-                    std::hint::black_box(
-                        uncached_trained.forecast(std::hint::black_box(*features)),
-                    );
-                }
-            };
-            if sample.is_multiple_of(2) {
-                cached_training.push(measure(&mut run_cached_training));
-                reference_training.push(measure(&mut run_reference_training));
-                cached_forecasting.push(measure(&mut run_cached_forecasting));
-                reference_forecasting.push(measure(&mut run_reference_forecasting));
-            } else {
-                reference_training.push(measure(&mut run_reference_training));
-                cached_training.push(measure(&mut run_cached_training));
-                reference_forecasting.push(measure(&mut run_reference_forecasting));
-                cached_forecasting.push(measure(&mut run_cached_forecasting));
+        let mut model = FtrlModel::zero();
+        for _ in 0..5 {
+            for sample in &examples {
+                model.update(sample);
             }
         }
-        let median = |values: &mut Vec<u64>| {
-            values.sort_unstable();
-            values[values.len() / 2]
-        };
-        let cached_training = median(&mut cached_training);
-        let reference_training = median(&mut reference_training);
-        let cached_forecasting = median(&mut cached_forecasting);
-        let reference_forecasting = median(&mut reference_forecasting);
-        eprintln!(
-            "training: reference={reference_training}ns cached={cached_training}ns; forecasting: reference={reference_forecasting}ns cached={cached_forecasting}ns"
+        let conversion = model.conversion_view();
+        assert_eq!(
+            FtrlConversionView::semantic_heads(),
+            &[
+                LegacyFtrlHead::ImmediateImprovement,
+                LegacyFtrlHead::UsefulDescendants,
+                LegacyFtrlHead::CrossGoalLeverage,
+                LegacyFtrlHead::CompressionValue,
+                LegacyFtrlHead::KernelAcceptance,
+                LegacyFtrlHead::VerificationCost,
+                LegacyFtrlHead::DeadEndRisk,
+            ]
         );
-        assert!(reference_training >= cached_training.saturating_mul(4));
-        assert!(reference_forecasting >= cached_forecasting.saturating_mul(4));
+        let adversarial = [
+            Features([0.0; FEATURE_COUNT]),
+            Features(std::array::from_fn(|index| {
+                if index.is_multiple_of(2) { -0.0 } else { 0.0 }
+            })),
+            Features(std::array::from_fn(|index| {
+                let magnitude = f32::from_bits(
+                    1_u32.saturating_add(u32::try_from(index).expect("feature index fits u32")),
+                );
+                if index.is_multiple_of(2) {
+                    magnitude
+                } else {
+                    -magnitude
+                }
+            })),
+            Features(std::array::from_fn(|index| {
+                let magnitude = (f32::from(u16::try_from(index).expect("feature index fits u16"))
+                    + 1.0)
+                    * 1_000_000.0;
+                if index.is_multiple_of(3) {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            })),
+            Features(std::array::from_fn(|index| {
+                const VALUES: [f32; 8] = [
+                    f32::MIN_POSITIVE,
+                    -f32::MIN_POSITIVE,
+                    1.0,
+                    -1.0,
+                    core::f32::consts::PI,
+                    -core::f32::consts::E,
+                    65_504.0,
+                    -65_504.0,
+                ];
+                VALUES[index % VALUES.len()]
+            })),
+        ];
+
+        for features in adversarial {
+            assert_forecast_bits_eq(
+                model.forecast(features),
+                forecast_from_conversion(conversion, features),
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_view_has_a_stable_inference_content_identity() {
+        let examples = (0..16_u8)
+            .map(|key| {
+                example(
+                    key,
+                    usize::from(key % 8),
+                    key.is_multiple_of(3),
+                    CorpusRole::Replay,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut model = FtrlModel::zero();
+        for sample in &examples {
+            model.update(sample);
+        }
+
+        let identity = model.conversion_view().content_identity();
+        let restored = FtrlModel::decode(&model.encode()).unwrap();
+        let restored_conversion = restored.conversion_view();
+        for feature in 0..FEATURE_COUNT {
+            for head in 0..HEAD_COUNT {
+                assert_eq!(
+                    restored_conversion.weights()[feature][head].to_bits(),
+                    model.conversion_view().weights()[feature][head].to_bits(),
+                    "weight mismatch at feature {feature}, head {head}"
+                );
+                assert_eq!(
+                    restored_conversion.second_moments()[feature][head].to_bits(),
+                    model.conversion_view().second_moments()[feature][head].to_bits(),
+                    "second-moment mismatch at feature {feature}, head {head}"
+                );
+            }
+        }
+
+        assert_eq!(
+            identity,
+            [
+                239, 6, 195, 225, 233, 76, 126, 141, 74, 247, 124, 216, 72, 244, 173, 132, 174,
+                228, 57, 252, 135, 128, 71, 68, 103, 254, 253, 193, 208, 209, 35, 162,
+            ]
+        );
+        assert_eq!(restored_conversion.content_identity(), identity);
+        model.update(&examples[0]);
+        assert_ne!(model.conversion_view().content_identity(), identity);
     }
 
     #[test]
@@ -1903,300 +1718,6 @@ mod tests {
                 && parent.verdict == VerdictTarget::Accepted
         );
     }
-
-    #[test]
-    fn selection_is_disjoint_rotates_and_gates_promotion() {
-        let mut examples = (0..50)
-            .map(|key| {
-                example(
-                    key,
-                    usize::from(key % 2),
-                    key % 2 == 0,
-                    assign_role([key; 32]),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            examples
-                .iter()
-                .any(|example| matches!(example.role, CorpusRole::Replay))
-        );
-        assert!(
-            examples
-                .iter()
-                .any(|example| matches!(example.role, CorpusRole::Selection { .. }))
-        );
-        let mut challenger = FtrlModel::zero();
-        for _ in 0..8 {
-            for sample in examples
-                .iter()
-                .filter(|sample| matches!(sample.role, CorpusRole::Replay))
-            {
-                challenger.update(sample);
-            }
-        }
-        let selection = examples
-            .iter()
-            .filter(|sample| matches!(sample.role, CorpusRole::Selection { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            compare_models(&FtrlModel::zero(), &challenger, &selection),
-            PromotionDecision::Promote
-        );
-        for _ in 0..3 {
-            rotate_selection(&mut examples, 3);
-        }
-        assert!(
-            examples
-                .iter()
-                .all(|example| matches!(example.role, CorpusRole::Replay))
-        );
-        assert_ne!(
-            revision_digest(&challenger),
-            revision_digest(&FtrlModel::zero())
-        );
-    }
-
-    #[test]
-    fn bootstrap_requires_strict_operational_ranking_improvement() {
-        let mut selection_examples = Vec::new();
-        for claim in 0..8_u8 {
-            let mut accepted = example(claim, 0, true, CorpusRole::Selection { uses: 0 });
-            accepted.corpus_key = [claim; 32];
-            accepted.behavior_rank = 0;
-            let mut refuted = example(
-                claim.saturating_add(64),
-                1,
-                false,
-                CorpusRole::Selection { uses: 0 },
-            );
-            refuted.corpus_key = [claim; 32];
-            refuted.behavior_rank = 1;
-            selection_examples.extend([accepted, refuted]);
-        }
-        let mut challenger = FtrlModel::zero();
-        for _ in 0..8 {
-            for example in &selection_examples {
-                challenger.update(example);
-            }
-        }
-        let selection = selection_examples.iter().collect::<Vec<_>>();
-
-        assert_eq!(
-            compare_bootstrap_policy(&challenger, &selection),
-            ObservedPolicyComparison::IncumbentWins,
-            "better pointwise loss cannot replace Bootstrap without a better selected prefix"
-        );
-    }
-
-    #[test]
-    fn bootstrap_comparison_credits_the_executed_learned_prefix() {
-        let mut selection_examples = Vec::new();
-        for claim in 0..8_u8 {
-            let mut refuted = example(claim, 1, false, CorpusRole::Selection { uses: 0 });
-            refuted.corpus_key = [claim; 32];
-            refuted.behavior_rank = 0;
-            let mut accepted = example(
-                claim.saturating_add(64),
-                0,
-                true,
-                CorpusRole::Selection { uses: 0 },
-            );
-            accepted.corpus_key = [claim; 32];
-            accepted.behavior_rank = 1;
-            selection_examples.extend([refuted, accepted]);
-        }
-        let mut challenger = FtrlModel::zero();
-        for _ in 0..8 {
-            for example in &selection_examples {
-                challenger.update(example);
-            }
-        }
-        let selection = selection_examples.iter().collect::<Vec<_>>();
-
-        assert_eq!(
-            compare_bootstrap_policy(&challenger, &selection),
-            ObservedPolicyComparison::ChallengerWins,
-            "the executed cooperative policy must retain its learned top-1 gain while protecting later Bootstrap work"
-        );
-    }
-
-    #[test]
-    fn initial_learning_keeps_bootstrap_without_a_ranking_gain() {
-        let mut examples = Vec::new();
-        for claim in 0..16_u8 {
-            let mut accepted = example(claim, 0, true, CorpusRole::Replay);
-            accepted.corpus_key = [claim; 32];
-            accepted.behavior_rank = 0;
-            let mut refuted = example(claim.saturating_add(64), 1, false, CorpusRole::Replay);
-            refuted.corpus_key = [claim; 32];
-            refuted.behavior_rank = 1;
-            examples.extend([accepted, refuted]);
-        }
-        let mut state = LearningState::default();
-
-        assert_ne!(state.learn(&mut examples), PromotionDecision::Promote);
-        assert!(state.pinned_model().is_none());
-    }
-
-    #[test]
-    fn learned_revision_requires_strict_operational_ranking_gain() {
-        let mut selection_examples = Vec::new();
-        for claim in 0..8_u8 {
-            let mut accepted = example(claim, 0, true, CorpusRole::Selection { uses: 0 });
-            accepted.corpus_key = [claim; 32];
-            accepted.behavior_rank = 0;
-            let mut refuted = example(
-                claim.saturating_add(64),
-                1,
-                false,
-                CorpusRole::Selection { uses: 0 },
-            );
-            refuted.corpus_key = [claim; 32];
-            refuted.behavior_rank = 1;
-            selection_examples.extend([accepted, refuted]);
-        }
-        let champion = FtrlModel::zero();
-        let mut challenger = FtrlModel::zero();
-        for _ in 0..8 {
-            for example in &selection_examples {
-                challenger.update(example);
-            }
-        }
-        let selection = selection_examples.iter().collect::<Vec<_>>();
-
-        assert_eq!(
-            compare_models(&champion, &challenger, &selection),
-            PromotionDecision::Promote
-        );
-        assert_eq!(
-            compare_observed_policy_prefixes(Some(&champion), &challenger, &selection),
-            ObservedPolicyComparison::IncumbentWins
-        );
-    }
-
-    #[test]
-    fn initial_learning_reserves_exact_disjoint_minimum_corpora() {
-        let examples = |count: u8| {
-            (0..count)
-                .map(|key| example(key, usize::from(key % 2), key % 2 == 0, CorpusRole::Replay))
-                .collect::<Vec<_>>()
-        };
-        let mut sufficient = examples(16);
-        let mut state = LearningState::default();
-        state.assign_new_corpus_roles(&mut sufficient);
-        let selection = sufficient
-            .iter()
-            .filter(|example| matches!(example.role, CorpusRole::Selection { .. }))
-            .count();
-        let replay = sufficient.len() - selection;
-        assert_eq!((selection, replay), (8, 8));
-
-        let mut insufficient = examples(15);
-        let mut state = LearningState::default();
-        state.assign_new_corpus_roles(&mut insufficient);
-        let selection = insufficient
-            .iter()
-            .filter(|example| matches!(example.role, CorpusRole::Selection { .. }))
-            .count();
-        assert_eq!((selection, insufficient.len() - selection), (7, 8));
-        assert_eq!(
-            state.learn(&mut insufficient),
-            PromotionDecision::Reject,
-            "fewer than sixteen claims cannot satisfy both disjoint minimum cohorts"
-        );
-    }
-
-    #[test]
-    fn model_state_round_trips_promotions_and_rolls_back_to_bootstrap() {
-        let mut examples = Vec::new();
-        for claim in 0..16_u8 {
-            for rank in 0..6_u8 {
-                let accepted = rank >= 4;
-                let mut candidate = example(
-                    claim.saturating_add(rank.saturating_mul(16)),
-                    usize::from(!accepted),
-                    accepted,
-                    CorpusRole::Replay,
-                );
-                candidate.corpus_key = [claim; 32];
-                candidate.behavior_rank = u32::from(rank);
-                examples.push(candidate);
-            }
-        }
-        let mut state = LearningState::default();
-        assert_eq!(state.learn(&mut examples), PromotionDecision::Promote);
-        assert_eq!(state.last_training_examples(), examples.len());
-        let digest = state.revision_digest("domain");
-        let encoded = state.encode();
-        let mut recovered = LearningState::decode(&encoded).unwrap();
-
-        assert!(
-            recovered.generation() == 1
-                && recovered.pinned_model().is_some()
-                && recovered.last_training_examples() == examples.len()
-                && recovered.online_comparisons() == 0
-                && recovered.revision_digest("domain") == digest
-                && recovered.encode() == encoded
-                && recovered.specialist_count() == 0
-        );
-        assert_eq!(recovered.rollback(), PromotionDecision::Rollback);
-        assert!(recovered.pinned_model().is_none() && recovered.specialist_count() == 1);
-    }
-
-    #[test]
-    fn fresh_selection_evidence_automatically_rolls_back_a_regressed_champion() {
-        let mut regressed = FtrlModel::zero();
-        regressed.z[0][0] = 10.0;
-        regressed.n[0][0] = 1.0;
-        regressed.z[0][6] = -10.0;
-        regressed.n[0][6] = 1.0;
-        regressed.rebuild_cache();
-        let mut state = LearningState {
-            generation: 1,
-            last_training_examples: 0,
-            online_comparisons: 0,
-            champion: Some(regressed),
-            predecessor: None,
-            predecessor_is_bootstrap: true,
-            specialists: Vec::new(),
-            roles: BTreeMap::new(),
-        };
-        let mut examples = (0..8)
-            .map(|index| {
-                let key = u8::try_from(index * 5).unwrap();
-                example(key, 0, true, CorpusRole::Selection { uses: 0 })
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(state.learn(&mut examples), PromotionDecision::Rollback);
-        assert!(state.pinned_model().is_none() && state.specialist_count() == 1);
-    }
-
-    #[test]
-    fn comparison_retains_incomparable_specialists_and_rejects_non_improvements() {
-        let selection_examples = (0..8)
-            .map(|key| example(key, 0, true, CorpusRole::Selection { uses: 0 }))
-            .collect::<Vec<_>>();
-        let selection = selection_examples.iter().collect::<Vec<_>>();
-        let champion = FtrlModel::zero();
-        let mut incomparable = FtrlModel::zero();
-        incomparable.z[0][0] = -10.0;
-        incomparable.n[0][0] = 1.0;
-        incomparable.z[0][1] = -10.0;
-        incomparable.n[0][1] = 1.0;
-        incomparable.rebuild_cache();
-
-        assert_eq!(
-            compare_models(&champion, &incomparable, &selection),
-            PromotionDecision::Specialist
-        );
-        assert_eq!(
-            compare_models(&champion, &champion, &selection),
-            PromotionDecision::Reject
-        );
-    }
-
     #[test]
     fn learning_state_rejects_corpus_overlap_and_invalid_revision_ancestry() {
         let mut roles = BTreeMap::new();
