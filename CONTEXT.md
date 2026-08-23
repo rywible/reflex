@@ -180,6 +180,10 @@ _Avoid_: Toy example, benchmark fixture, application integration
 A domain-supplied transformation that proposes Candidates from existing search state.
 _Avoid_: Derived Operator, verifier, learned policy
 
+**Primitive Enumeration Cursor**:
+The Runtime-owned, restart-complete position of one pending Artifact within each Primitive Operator's deterministic legal-Application order. It lets bounded Verification Cohorts page through a search space without losing later alternatives or requiring Domain Definitions to manage recovery state.
+_Avoid_: Candidate queue, learned rank, Domain-owned continuation token
+
 **Premise Retrieval**:
 A deterministic, domain-owned ordering of verified library Artifacts that may legally support a Primitive Operator proposal. Retrieval controls bounded proposal availability but supplies neither correctness evidence nor goal-relative value; the Runtime still ranks emitted Candidates and the Verification Kernel still decides correctness.
 _Avoid_: Verification, learned allocation, theorem proof

@@ -388,6 +388,7 @@ impl<'a, D: DomainDefinition, O> OperatorEnumerationBatch<'a, D, O> {
 
 pub struct ApplicationWriter<'a, A> {
     output: &'a mut Vec<A>,
+    skip: usize,
     remaining: usize,
     overflowed: bool,
 }
@@ -396,6 +397,7 @@ impl<'a, A> ApplicationWriter<'a, A> {
     pub fn new(output: &'a mut Vec<A>) -> Self {
         Self {
             output,
+            skip: 0,
             remaining: usize::MAX,
             overflowed: false,
         }
@@ -404,13 +406,25 @@ impl<'a, A> ApplicationWriter<'a, A> {
     pub(crate) fn with_limit(output: &'a mut Vec<A>, limit: usize) -> Self {
         Self {
             output,
+            skip: 0,
+            remaining: limit,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn with_window(output: &'a mut Vec<A>, skip: usize, limit: usize) -> Self {
+        Self {
+            output,
+            skip,
             remaining: limit,
             overflowed: false,
         }
     }
 
     pub fn push(&mut self, application: A) {
-        if self.remaining == 0 {
+        if self.skip != 0 {
+            self.skip -= 1;
+        } else if self.remaining == 0 {
             self.overflowed = true;
         } else {
             self.remaining -= 1;
@@ -419,18 +433,29 @@ impl<'a, A> ApplicationWriter<'a, A> {
     }
 
     #[must_use]
+    /// Reports that bounded enumeration has supplied the one-Application
+    /// lookahead proving that this page is not final.
     pub fn is_full(&self) -> bool {
-        self.remaining == 0
+        self.overflowed
     }
 
-    /// Remaining applications accepted by this bounded enumeration batch.
+    /// Maximum additional legal Applications needed to skip the retained
+    /// prefix, fill this bounded page, and probe whether another page exists.
     #[must_use]
     pub fn remaining_capacity(&self) -> usize {
-        self.remaining
+        if self.remaining == usize::MAX {
+            usize::MAX
+        } else {
+            self.skip.saturating_add(self.remaining).saturating_add(1)
+        }
     }
 
     pub(crate) fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    pub(crate) fn consumed_prefix(&self) -> bool {
+        self.skip == 0
     }
 }
 
@@ -564,18 +589,84 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
     fn resident_bytes(&self) -> u64;
     /// Maximum scratch bytes needed for a batch with this output capacity.
     fn scratch_resident_bytes(&self, output_capacity: usize) -> u64;
+    /// Enumerates legal Applications in deterministic order for identical
+    /// requests under one Semantic Identity.
+    ///
+    /// Bounded Runtime pages may replay and discard an already-consumed prefix,
+    /// so an implementation must not reorder that prefix between calls.
     fn enumerate_legal(
         &self,
         requests: OperatorEnumerationBatch<'_, D, Self::Operator>,
         output: &mut ApplicationWriter<'_, Self::Application>,
         scratch: &mut Self::Scratch,
     ) -> Result<(), D::Error>;
+    /// Materializes exactly one Candidate for every supplied legal Application.
+    ///
+    /// The Candidate's `source_index` continues to address the Artifact batch
+    /// from which its Application was enumerated. Violating this cardinality
+    /// contract is a protocol defect and the Runtime terminates immediately.
     fn apply_batch(
         &self,
         applications: &[Self::Application],
         output: &mut CandidateWriter<'_, D>,
         scratch: &mut Self::Scratch,
     ) -> Result<(), D::Error>;
+}
+
+#[cfg(test)]
+mod application_writer_tests {
+    use super::ApplicationWriter;
+
+    #[test]
+    fn bounded_window_skips_a_prefix_and_probes_for_a_later_page() {
+        let mut output = Vec::new();
+        let overflowed = {
+            let mut writer = ApplicationWriter::with_window(&mut output, 2, 2);
+            for value in 0..5 {
+                if writer.is_full() {
+                    break;
+                }
+                writer.push(value);
+            }
+            writer.overflowed()
+        };
+
+        assert_eq!(output, [2, 3]);
+        assert!(overflowed);
+    }
+
+    #[test]
+    fn bounded_window_identifies_an_exact_final_page() {
+        let mut output = Vec::new();
+        let overflowed = {
+            let mut writer = ApplicationWriter::with_window(&mut output, 2, 2);
+            for value in 0..4 {
+                if writer.is_full() {
+                    break;
+                }
+                writer.push(value);
+            }
+            writer.overflowed()
+        };
+
+        assert_eq!(output, [2, 3]);
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn bounded_window_detects_a_missing_retained_prefix() {
+        let mut output = Vec::new();
+        let consumed_prefix = {
+            let mut writer = ApplicationWriter::with_window(&mut output, 3, 2);
+            for value in 0..2 {
+                writer.push(value);
+            }
+            writer.consumed_prefix()
+        };
+
+        assert!(output.is_empty());
+        assert!(!consumed_prefix);
+    }
 }
 
 pub struct VerificationRequest<'a, D: DomainDefinition, C> {

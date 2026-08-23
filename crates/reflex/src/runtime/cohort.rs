@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
-use crate::{ArtifactKey, DomainDefinition};
+use crate::DomainDefinition;
 
-use super::ProposedCandidate;
+use super::{PendingParent, ProposedCandidate};
 
 const MIN_COHORT: usize = 8;
 
@@ -36,14 +36,17 @@ pub(super) fn limit<K: Copy + Ord>(
 pub(super) fn recovery_resident_bytes<D: DomainDefinition>(
     domain: &D,
     deferred_candidates: &Vec<ProposedCandidate<D>>,
-    pending_parent_keys: &Vec<ArtifactKey>,
+    pending_parents: &Vec<PendingParent>,
 ) -> u64 {
     super::vector_bytes(deferred_candidates)
         .saturating_add(super::candidate_pipeline_reserve(
             domain,
             deferred_candidates,
         ))
-        .saturating_add(super::vector_bytes(pending_parent_keys))
+        .saturating_add(super::vector_bytes(pending_parents))
+        .saturating_add(pending_parents.iter().fold(0_u64, |bytes, parent| {
+            bytes.saturating_add(parent.resident_bytes())
+        }))
 }
 
 pub(super) fn rollback_unverified_generation<D: DomainDefinition>(

@@ -45,7 +45,8 @@ impl SegmentKind {
     const fn current_version(self) -> u32 {
         match self {
             Self::Artifacts | Self::Experience => 3,
-            Self::Session | Self::Recovery => 1,
+            Self::Recovery => 2,
+            Self::Session => 1,
             Self::Revisions => 4,
         }
     }
@@ -53,6 +54,7 @@ impl SegmentKind {
     const fn legacy_version(self) -> u32 {
         match self {
             Self::Artifacts | Self::Experience => 2,
+            Self::Recovery => 1,
             _ => self.current_version(),
         }
     }
@@ -238,8 +240,10 @@ impl CanonicalBundle {
                 compress && matches!(kind, SegmentKind::Artifacts | SegmentKind::Experience);
             let version = if compressed {
                 kind.current_version()
-            } else {
+            } else if matches!(kind, SegmentKind::Artifacts | SegmentKind::Experience) {
                 kind.legacy_version()
+            } else {
+                kind.current_version()
             };
             let stored = if compressed {
                 compress_segment(payload)

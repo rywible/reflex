@@ -31,7 +31,7 @@ use crate::harness::{
     parse_flag_values, require_absent, require_clean, require_release,
 };
 
-const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v20";
+const DEVELOPMENT_SCHEMA: &str = "reflex-lean-public-optimizer-development-v21";
 const RUNTIME_RESIDENT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SUPERVISOR_RESIDENT_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 const HOST_MEMORY_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;

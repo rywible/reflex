@@ -539,22 +539,32 @@ fn narrow_initial_frontier(source: &std::path::Path, target: &std::path::Path) -
             .unwrap(),
     ))
     .unwrap();
-    let pending_start = pending_count_offset + 8;
-    let pending_end = pending_start + pending_count * 32;
-    assert_eq!(pending_end, recovery.len());
+    let mut pending_input = &recovery[pending_count_offset + 8..];
+    let mut pending_records = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        let offset_count = usize::try_from(u64::from_le_bytes(
+            pending_input[32..40].try_into().unwrap(),
+        ))
+        .unwrap();
+        let record_len = 32 + 8 + offset_count * 8 + 1;
+        let (record, rest) = pending_input.split_at(record_len);
+        pending_records.push(record);
+        pending_input = rest;
+    }
+    assert!(pending_input.is_empty());
 
     let mut narrowed = Vec::with_capacity(recovery.len() - 64);
     narrowed.extend_from_slice(&recovery[..frontier_count_offset]);
     narrowed.extend_from_slice(&(frontier_count as u64 - 1).to_le_bytes());
     narrowed.extend_from_slice(&recovery[frontier_start..frontier_end - 32]);
     narrowed.extend_from_slice(&0_u64.to_le_bytes());
-    let retained_pending = recovery[pending_start..pending_end]
-        .chunks_exact(32)
-        .filter(|key| *key != removed_key)
+    let retained_pending = pending_records
+        .into_iter()
+        .filter(|record| &record[..32] != removed_key)
         .collect::<Vec<_>>();
     narrowed.extend_from_slice(&(retained_pending.len() as u64).to_le_bytes());
-    for key in retained_pending {
-        narrowed.extend_from_slice(key);
+    for record in retained_pending {
+        narrowed.extend_from_slice(record);
     }
     let encoded = CanonicalBundle::new(
         bundle.identity().to_vec(),

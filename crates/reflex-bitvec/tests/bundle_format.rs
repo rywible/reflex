@@ -58,7 +58,7 @@ fn v3_bundle_segments_preserve_refuted_experience() {
             && segments
                 .iter()
                 .map(|(_, version, _)| *version)
-                .eq([1, 4, 3, 3, 1])
+                .eq([1, 4, 3, 3, 2])
             && experience
                 .attempts
                 .iter()

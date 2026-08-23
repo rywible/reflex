@@ -67,7 +67,7 @@ struct RecoveredBundle<D: DomainDefinition> {
     pareto_keys: Vec<ArtifactKey>,
     frontier_keys: Vec<ArtifactKey>,
     deferred_candidates: Vec<DeferredCandidate<D>>,
-    pending_parent_keys: Vec<ArtifactKey>,
+    pending_parents: Vec<PendingParent>,
     ledger: ExperienceLedger,
     revisions: Option<RevisionIds>,
     interrupted_usage: Option<ResourceUsage>,
@@ -83,7 +83,7 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
             pareto_keys: Vec::new(),
             frontier_keys: Vec::new(),
             deferred_candidates: Vec::new(),
-            pending_parent_keys: Vec::new(),
+            pending_parents: Vec::new(),
             ledger: ExperienceLedger::default(),
             revisions: None,
             interrupted_usage: None,
@@ -119,10 +119,41 @@ struct ProposedCandidate<D: DomainDefinition> {
     generated_in_epoch: bool,
 }
 
+const ENUMERATION_COMPLETE: u64 = u64::MAX;
+
+#[derive(Clone)]
+struct PendingParent {
+    key: ArtifactKey,
+    primitive_offsets: Vec<u64>,
+    derived_sampled: bool,
+}
+
+impl PendingParent {
+    fn new(key: ArtifactKey, primitive_operator_count: usize, has_derived: bool) -> Self {
+        Self {
+            key,
+            primitive_offsets: vec![0; primitive_operator_count],
+            derived_sampled: !has_derived,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.derived_sampled
+            && self
+                .primitive_offsets
+                .iter()
+                .all(|offset| *offset == ENUMERATION_COMPLETE)
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        (self.primitive_offsets.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64)
+    }
+}
+
 struct SearchTailView<'a, D: DomainDefinition> {
     frontier: &'a [(VerifiedArtifact<D>, usize)],
     deferred_candidates: &'a [ProposedCandidate<D>],
-    pending_parent_keys: &'a [ArtifactKey],
+    pending_parents: &'a [PendingParent],
 }
 
 struct RestartBundleState<'a, D: DomainDefinition> {
@@ -158,12 +189,12 @@ impl<'a, D: DomainDefinition> SearchTailView<'a, D> {
     const fn new(
         frontier: &'a [(VerifiedArtifact<D>, usize)],
         deferred_candidates: &'a [ProposedCandidate<D>],
-        pending_parent_keys: &'a [ArtifactKey],
+        pending_parents: &'a [PendingParent],
     ) -> Self {
         Self {
             frontier,
             deferred_candidates,
-            pending_parent_keys,
+            pending_parents,
         }
     }
 }
@@ -311,7 +342,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 14;
+const RUNTIME_REVISION: u64 = 15;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -836,15 +867,15 @@ where
         }
         recovered_bundle.frontier_keys.clear();
         recovered_bundle.deferred_candidates.clear();
-        recovered_bundle.pending_parent_keys.clear();
+        recovered_bundle.pending_parents.clear();
     }
     let recovered_has_search_tail = !recovered_bundle.deferred_candidates.is_empty()
-        || !recovered_bundle.pending_parent_keys.is_empty();
+        || !recovered_bundle.pending_parents.is_empty();
     let recovered_resident_bytes = recovered_bundle.resident_bytes;
     let recovered_keys = recovered_bundle.pareto_keys;
     let recovered_frontier_keys = recovered_bundle.frontier_keys;
     let recovered_deferred = recovered_bundle.deferred_candidates;
-    let recovered_pending_parent_keys = recovered_bundle.pending_parent_keys;
+    let recovered_pending_parents = recovered_bundle.pending_parents;
     let recovered_stored = recovered_bundle.artifacts;
     let mut ledger = recovered_bundle.ledger;
     let mut knowledge = recovered_bundle.knowledge;
@@ -1141,19 +1172,37 @@ where
             })
         })
         .collect::<Result<Vec<_>, SessionError<D::Error>>>()?;
-    let mut pending_parent_keys = if restoring_search_tail {
-        recovered_pending_parent_keys
+    let has_derived_operators = pinned_knowledge
+        .operators()
+        .iter()
+        .any(crate::knowledge::DerivedOperator::active);
+    let primitive_operator_count = domain.operators().catalog().len();
+    let mut pending_parents = if restoring_search_tail {
+        recovered_pending_parents
     } else {
         frontier
             .iter()
-            .map(|(artifact, _)| artifact.key())
+            .map(|(artifact, _)| {
+                PendingParent::new(
+                    artifact.key(),
+                    primitive_operator_count,
+                    has_derived_operators,
+                )
+            })
             .collect()
     };
-    if pending_parent_keys
-        .iter()
-        .any(|key| !frontier.iter().any(|(artifact, _)| artifact.key() == *key))
-    {
+    if pending_parents.iter().any(|pending| {
+        pending.primitive_offsets.len() != primitive_operator_count
+            || !frontier
+                .iter()
+                .any(|(artifact, _)| artifact.key() == pending.key)
+    }) {
         return Err(SessionError::CorruptBundle);
+    }
+    if !has_derived_operators {
+        for pending in &mut pending_parents {
+            pending.derived_sampled = true;
+        }
     }
     let initial_usage = resource_meter
         .usage(verification_requests, 0)
@@ -1163,7 +1212,7 @@ where
         RestartBundleState::new(
             &known,
             &pareto,
-            SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+            SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
             &ledger,
             &knowledge,
             &learning,
@@ -1196,7 +1245,7 @@ where
         .saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
-            &pending_parent_keys,
+            &pending_parents,
         ));
     if !resource_meter.reserve(
         ResidentReservation::live(initial_resident).with_transient(checkpoint.capacity() as u64),
@@ -1269,7 +1318,7 @@ where
             .saturating_add(cohort::recovery_resident_bytes(
                 domain,
                 &deferred_candidates,
-                &pending_parent_keys,
+                &pending_parents,
             ));
         if !resource_meter.reserve(ResidentReservation::live(resident_before_epoch)) {
             resident_budget_exhausted = true;
@@ -1298,15 +1347,21 @@ where
             .iter()
             .map(|(_, origin)| *origin)
             .collect::<Vec<_>>();
-        let pending_parent_indexes = frontier
+        let frontier_index_by_key = frontier
             .iter()
             .enumerate()
-            .filter(|(_, (artifact, _))| pending_parent_keys.contains(&artifact.key()))
-            .map(|(index, _)| index)
+            .map(|(index, (artifact, _))| (artifact.key(), index))
+            .collect::<HashMap<_, _>>();
+        let pending_parent_indexes = pending_parents
+            .iter()
+            .map(|pending| {
+                *frontier_index_by_key
+                    .get(&pending.key)
+                    .expect("pending parent retains a Search Frontier Artifact")
+            })
             .collect::<Vec<_>>();
         let mut candidates = Vec::new();
         let mut application_bytes = vector_bytes(&pending_parent_indexes);
-        let mut choice_window_exhausted = false;
         let mut covered_claims = ledger
             .entries()
             .iter()
@@ -1343,11 +1398,10 @@ where
             resident_budget_exhausted = true;
             break;
         }
-        let has_derived = !pending_parent_indexes.is_empty()
-            && pinned_knowledge
-                .operators()
+        let has_derived = has_derived_operators
+            && pending_parents
                 .iter()
-                .any(crate::knowledge::DerivedOperator::active);
+                .any(|pending| !pending.derived_sampled);
         let derived_budget = if has_derived {
             generation_limit.div_ceil(4)
         } else {
@@ -1360,14 +1414,9 @@ where
             &pending_parent_indexes,
             &parent_claims,
         );
-        let derived_parent_capacity = if has_derived {
-            derived_budget.max(1)
-        } else {
-            usize::MAX
-        };
         let parent_capacity = generation_limit
             .min(primitive_parent_capacity)
-            .min(derived_parent_capacity);
+            .max(usize::from(primitive_budget == 0));
         let generation_parent_indexes = generation::select_pending_parents(
             &pending_parent_indexes,
             &parent_claims,
@@ -1377,9 +1426,24 @@ where
             .iter()
             .map(|index| parents[*index])
             .collect::<Vec<_>>();
+        let mut staged_parent_progress = generation_parent_indexes
+            .iter()
+            .map(|index| {
+                let key = frontier[*index].0.key();
+                pending_parents
+                    .iter()
+                    .find(|pending| pending.key == key)
+                    .cloned()
+                    .expect("selected pending parent retains enumeration progress")
+            })
+            .collect::<Vec<_>>();
         application_bytes = application_bytes
             .saturating_add(vector_bytes(&generation_parent_indexes))
-            .saturating_add(vector_bytes(&generation_parents));
+            .saturating_add(vector_bytes(&generation_parents))
+            .saturating_add(vector_bytes(&staged_parent_progress))
+            .saturating_add(staged_parent_progress.iter().fold(0_u64, |bytes, parent| {
+                bytes.saturating_add(parent.resident_bytes())
+            }));
         let candidate_epoch = selection_epoch;
         selection_epoch = selection_epoch
             .checked_add(1)
@@ -1407,9 +1471,10 @@ where
             candidate.generated_in_epoch = false;
         }
         let mut remaining_primitive_budget = primitive_budget;
-        for (parent_position, (parent, source_index)) in generation_parents
+        for (parent_position, ((parent, source_index), progress)) in generation_parents
             .iter()
             .zip(&generation_parent_indexes)
+            .zip(&mut staged_parent_progress)
             .enumerate()
         {
             if resource_meter
@@ -1424,13 +1489,14 @@ where
             let before = candidates.len();
             let parent_artifacts = [*parent];
             let parent_indexes = [*source_index];
-            let (primitive_bytes, primitive_truncated) = append_primitive_candidates(
+            let primitive_bytes = append_primitive_candidates(
                 domain,
                 &GenerationParents {
                     artifacts: &parent_artifacts,
                     frontier_indexes: &parent_indexes,
                 },
                 &mut operator_scratch,
+                &mut progress.primitive_offsets,
                 parent_budget,
                 candidate_epoch,
                 &mut candidates,
@@ -1438,7 +1504,6 @@ where
             remaining_primitive_budget =
                 remaining_primitive_budget.saturating_sub(candidates.len() - before);
             application_bytes = application_bytes.max(primitive_bytes);
-            choice_window_exhausted |= primitive_truncated;
         }
         if time_exhausted {
             deferred_candidates = cohort::rollback_unverified_generation(candidates, Vec::new());
@@ -1453,17 +1518,23 @@ where
             break;
         }
         let mut remaining_derived_budget = derived_budget;
-        for (parent_position, (parent, source_index)) in generation_parents
+        let derived_positions = staged_parent_progress
             .iter()
-            .zip(&generation_parent_indexes)
             .enumerate()
-        {
-            let parents_left = generation_parents.len() - parent_position;
+            .filter_map(|(position, progress)| (!progress.derived_sampled).then_some(position))
+            .collect::<Vec<_>>();
+        for (derived_position, parent_position) in derived_positions.iter().copied().enumerate() {
+            let parents_left = derived_positions.len() - derived_position;
             let parent_budget = remaining_derived_budget.div_ceil(parents_left);
+            if parent_budget == 0 {
+                break;
+            }
             let before = candidates.len();
-            let parent_artifacts = [*parent];
-            let parent_indexes = [*source_index];
-            let (derived_bytes, derived_truncated) = append_derived_candidates(
+            let parent = generation_parents[parent_position];
+            let source_index = generation_parent_indexes[parent_position];
+            let parent_artifacts = [parent];
+            let parent_indexes = [source_index];
+            let (derived_bytes, _derived_truncated) = append_derived_candidates(
                 domain,
                 &GenerationParents {
                     artifacts: &parent_artifacts,
@@ -1478,12 +1549,8 @@ where
             remaining_derived_budget =
                 remaining_derived_budget.saturating_sub(candidates.len() - before);
             application_bytes = application_bytes.max(derived_bytes);
-            choice_window_exhausted |= derived_truncated;
+            staged_parent_progress[parent_position].derived_sampled = true;
         }
-        let processed_parent_keys = generation_parent_indexes
-            .iter()
-            .map(|index| frontier[*index].0.key())
-            .collect::<HashSet<_>>();
         instrumentation.generated(candidates.len().saturating_sub(carried_candidate_count));
         instrumentation.finish(Phase::Generation, generation_started);
         test_fault_point("candidate-created");
@@ -1534,16 +1601,15 @@ where
         instrumentation.selected(candidates.len());
         instrumentation.finish(Phase::Selection, selection_started);
         if candidates.is_empty() {
-            pending_parent_keys.retain(|key| !processed_parent_keys.contains(key));
+            commit_pending_progress(&mut pending_parents, staged_parent_progress);
             ledger.append_candidate_fates(candidate_fates);
-            if !pending_parent_keys.is_empty() {
+            if !pending_parents.is_empty() {
                 continue;
             }
-            resident_budget_exhausted |= choice_window_exhausted;
             break;
         }
         let deferred_resident =
-            cohort::recovery_resident_bytes(domain, &deferred_candidates, &pending_parent_keys);
+            cohort::recovery_resident_bytes(domain, &deferred_candidates, &pending_parents);
         let transient_bytes = application_bytes
             .saturating_add(vector_bytes(&candidates))
             .saturating_add(candidate_pipeline_reserve(domain, &candidates))
@@ -1636,7 +1702,7 @@ where
         let experience_checkpoint_state = ledger.checkpoint_entries();
         let candidate_fate_checkpoint = ledger.checkpoint_candidate_fates();
         let measurement_checkpoint = ledger.checkpoint_measurements();
-        pending_parent_keys.retain(|key| !processed_parent_keys.contains(key));
+        commit_pending_progress(&mut pending_parents, staged_parent_progress);
         ledger.append_entries(verification.experience);
         ledger.append_candidate_fates(candidate_fates);
         test_fault_point("experience-appended");
@@ -1648,7 +1714,7 @@ where
             RestartBundleState::new(
                 &known,
                 &pareto,
-                SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+                SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
                 &ledger,
                 &knowledge,
                 &learning,
@@ -1729,7 +1795,7 @@ where
                 RestartBundleState::new(
                     &known,
                     &pareto,
-                    SearchTailView::new(&frontier, &deferred_candidates, &pending_parent_keys),
+                    SearchTailView::new(&frontier, &deferred_candidates, &pending_parents),
                     &ledger,
                     &knowledge,
                     &learning,
@@ -1778,9 +1844,8 @@ where
             if time_exhausted {
                 break;
             }
-            if deferred_candidates.is_empty() && pending_parent_keys.is_empty() {
+            if deferred_candidates.is_empty() && pending_parents.is_empty() {
                 frontier.clear();
-                resident_budget_exhausted |= choice_window_exhausted;
                 break;
             }
             continue;
@@ -1788,7 +1853,11 @@ where
         instrumentation.admitted(admitted.len());
         let mut epoch = EpochTransition::begin(&mut known, &mut frontier, &mut ledger);
         for (artifact, origin) in admitted {
-            pending_parent_keys.push(artifact.key());
+            pending_parents.push(PendingParent::new(
+                artifact.key(),
+                primitive_operator_count,
+                has_derived_operators,
+            ));
             epoch.admit(artifact, origin);
         }
         let previous_keys = pareto.iter().map(VerifiedArtifact::key).collect::<Vec<_>>();
@@ -1812,7 +1881,7 @@ where
             RestartBundleState::new(
                 epoch.known(),
                 &proposed_pareto,
-                SearchTailView::new(epoch.frontier(), &deferred_candidates, &pending_parent_keys),
+                SearchTailView::new(epoch.frontier(), &deferred_candidates, &pending_parents),
                 epoch.ledger(),
                 &knowledge,
                 &learning,
@@ -1841,7 +1910,7 @@ where
         let proposed_live = proposed_live.saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
-            &pending_parent_keys,
+            &pending_parents,
         ));
         let proposed_reservation = ResidentReservation::live(proposed_live)
             .with_transient(proposed_checkpoint.capacity() as u64)
@@ -1883,13 +1952,6 @@ where
             .search_time_exhausted()
             .map_err(|()| SessionError::Resource)?;
         if verification_budget_exhausted {
-            break;
-        }
-        if choice_window_exhausted
-            && deferred_candidates.is_empty()
-            && pending_parent_keys.is_empty()
-        {
-            resident_budget_exhausted = true;
             break;
         }
     }
@@ -1934,7 +1996,7 @@ where
         .saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
-            &pending_parent_keys,
+            &pending_parents,
         ));
     let consolidation_transient = (ledger.len() as u64)
         .saturating_mul((std::mem::size_of::<DerivationObservation>() as u64).saturating_add(512))
@@ -2008,7 +2070,7 @@ where
             .saturating_add(cohort::recovery_resident_bytes(
                 domain,
                 &deferred_candidates,
-                &pending_parent_keys,
+                &pending_parents,
             ));
         let promoted_transient = (observations.len() as u64)
             .saturating_mul(std::mem::size_of::<DerivationObservation>() as u64);
@@ -2025,6 +2087,11 @@ where
     } else if completion != Completion::StoppedByObserver {
         completion = Completion::ResourceEnvelopeExhausted;
     }
+    reconcile_derived_progress(
+        &mut pending_parents,
+        &pinned_knowledge,
+        knowledge.pinned_revision(),
+    );
     instrumentation.finish(Phase::Consolidation, consolidation_started);
     let training_started = instrumentation.start();
     let learning_live = worker_resident_bytes
@@ -2043,7 +2110,7 @@ where
         .saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
-            &pending_parent_keys,
+            &pending_parents,
         ));
     let learning_transient = (ledger.len() as u64)
         .saturating_mul(std::mem::size_of::<AttemptObservation>() as u64)
@@ -2067,7 +2134,7 @@ where
     instrumentation.finish(Phase::Training, training_started);
     let finalization_started = instrumentation.start();
     let (sealed_deferred, sealed_pending) = if completion == Completion::ResourceEnvelopeExhausted {
-        (&deferred_candidates[..], &pending_parent_keys[..])
+        (&deferred_candidates[..], &pending_parents[..])
     } else {
         (&[][..], &[][..])
     };
@@ -2117,7 +2184,7 @@ where
         .saturating_add(cohort::recovery_resident_bytes(
             domain,
             &deferred_candidates,
-            &pending_parent_keys,
+            &pending_parents,
         ));
     if !resource_meter.reserve(
         ResidentReservation::live(final_live)
@@ -2384,27 +2451,85 @@ fn operator_feature_values(operator_symbol: &str) -> [f32; 8] {
     values
 }
 
+fn commit_pending_progress(pending: &mut Vec<PendingParent>, staged: Vec<PendingParent>) {
+    let staged_keys = staged
+        .iter()
+        .map(|progress| progress.key)
+        .collect::<HashSet<_>>();
+    assert!(
+        staged_keys
+            .iter()
+            .all(|key| pending.iter().any(|retained| retained.key == *key)),
+        "staged enumeration progress retains every pending parent"
+    );
+    pending.retain(|retained| !staged_keys.contains(&retained.key));
+    for progress in staged {
+        if !progress.complete() {
+            pending.push(progress);
+        }
+    }
+}
+
+fn reconcile_derived_progress(
+    pending: &mut Vec<PendingParent>,
+    prior: &KnowledgeRevision,
+    current: &KnowledgeRevision,
+) {
+    let active_ids = |revision: &KnowledgeRevision| {
+        revision
+            .operators()
+            .iter()
+            .filter(|operator| operator.active())
+            .map(crate::knowledge::DerivedOperator::id)
+            .collect::<Vec<_>>()
+    };
+    let prior_active = active_ids(prior);
+    let current_active = active_ids(current);
+    if prior_active == current_active {
+        return;
+    }
+    let derived_sampled = current_active.is_empty();
+    for parent in pending.iter_mut() {
+        parent.derived_sampled = derived_sampled;
+    }
+    pending.retain(|parent| !parent.complete());
+}
+
 fn append_primitive_candidates<D: DomainDefinition>(
     domain: &D,
     parents: &GenerationParents<'_, D>,
     scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
+    operator_offsets: &mut [u64],
     limit: usize,
     epoch: u64,
     output: &mut Vec<ProposedCandidate<D>>,
-) -> Result<(u64, bool), SessionError<D::Error>> {
+) -> Result<u64, SessionError<D::Error>> {
     let mut application_bytes = 0_u64;
-    let mut truncated = false;
     let mut remaining = limit;
     let catalog = domain.operators().catalog();
+    assert_eq!(
+        operator_offsets.len(),
+        catalog.len(),
+        "pending primitive cursor must match the installed Operator catalog"
+    );
     let locations = root_locations(domain, parents.artifacts);
     for (operator_index, descriptor) in catalog.iter().enumerate() {
         if remaining == 0 {
             break;
         }
-        let operator_limit = remaining.div_ceil(catalog.len() - operator_index);
+        let offset = operator_offsets[operator_index];
+        if offset == ENUMERATION_COMPLETE {
+            continue;
+        }
+        let incomplete_operators = operator_offsets[operator_index..]
+            .iter()
+            .filter(|offset| **offset != ENUMERATION_COMPLETE)
+            .count();
+        let operator_limit = remaining.div_ceil(incomplete_operators);
+        let skip = usize::try_from(offset).map_err(|_| SessionError::CorruptBundle)?;
         let mut applications = Vec::new();
         let mut application_writer =
-            ApplicationWriter::with_limit(&mut applications, operator_limit);
+            ApplicationWriter::with_window(&mut applications, skip, operator_limit);
         domain
             .operators()
             .enumerate_legal(
@@ -2417,15 +2542,29 @@ fn append_primitive_candidates<D: DomainDefinition>(
                 scratch,
             )
             .map_err(SessionError::Domain)?;
-        truncated |= application_writer.overflowed();
+        assert!(
+            application_writer.consumed_prefix(),
+            "OperatorAlgebra::enumerate_legal ended before the retained Primitive Enumeration Cursor"
+        );
+        let has_more = application_writer.overflowed();
+        operator_offsets[operator_index] = if has_more {
+            offset
+                .checked_add(u64::try_from(applications.len()).map_err(|_| SessionError::Resource)?)
+                .ok_or(SessionError::Resource)?
+        } else {
+            ENUMERATION_COMPLETE
+        };
         let mut operator_candidates = Vec::new();
         let mut candidate_writer =
-            CandidateWriter::with_limit(&mut operator_candidates, operator_limit);
+            CandidateWriter::with_limit(&mut operator_candidates, applications.len());
         domain
             .operators()
             .apply_batch(&applications, &mut candidate_writer, scratch)
             .map_err(SessionError::Domain)?;
-        truncated |= candidate_writer.overflowed();
+        assert!(
+            !candidate_writer.overflowed() && operator_candidates.len() == applications.len(),
+            "OperatorAlgebra::apply_batch must emit exactly one Candidate per legal Application"
+        );
         application_bytes = application_bytes
             .max(vector_bytes(&locations).saturating_add(vector_bytes(&applications)))
             .max(vector_bytes(&operator_candidates));
@@ -2464,7 +2603,7 @@ fn append_primitive_candidates<D: DomainDefinition>(
             });
         }
     }
-    Ok((application_bytes, truncated))
+    Ok(application_bytes)
 }
 
 #[expect(
@@ -2540,7 +2679,10 @@ fn append_derived_candidates<D: DomainDefinition>(
                 .operators()
                 .apply_batch(&applications, &mut candidate_writer, scratch)
                 .map_err(SessionError::Domain)?;
-            truncated |= candidate_writer.overflowed();
+            assert!(
+                !candidate_writer.overflowed() && next.len() == applications.len(),
+                "OperatorAlgebra::apply_batch must emit exactly one Candidate per legal Application"
+            );
             if step_index > 0 {
                 for candidate in &mut next {
                     let Some(parent) = current.get(candidate.source_index) else {
@@ -3459,20 +3601,52 @@ fn decode_bundle<D: DomainDefinition>(
     }
     let pending_count = usize::try_from(read_bundle_u64(&mut recovery)?)
         .map_err(|_| SessionError::CorruptBundle)?;
-    if pending_count > recovery.len().saturating_div(32) {
+    if pending_count > recovery.len().saturating_div(41) {
         return Err(SessionError::CorruptBundle);
     }
-    let mut pending_parent_keys = Vec::with_capacity(pending_count);
+    let primitive_operator_count = domain.operators().catalog().len();
+    let mut pending_parents = Vec::with_capacity(pending_count);
     for _ in 0..pending_count {
         let key = ArtifactKey(
             take_bundle(&mut recovery, 32)?
                 .try_into()
                 .expect("exactly 32 pending-parent-key bytes were taken"),
         );
-        if pending_parent_keys.contains(&key) {
+        if pending_parents
+            .iter()
+            .any(|pending: &PendingParent| pending.key == key)
+        {
             return Err(SessionError::CorruptBundle);
         }
-        pending_parent_keys.push(key);
+        let offset_count = usize::try_from(read_bundle_u64(&mut recovery)?)
+            .map_err(|_| SessionError::CorruptBundle)?;
+        if offset_count != primitive_operator_count
+            || offset_count > recovery.len().saturating_div(8)
+        {
+            return Err(SessionError::CorruptBundle);
+        }
+        let mut primitive_offsets = Vec::with_capacity(offset_count);
+        for _ in 0..offset_count {
+            let offset = read_bundle_u64(&mut recovery)?;
+            if offset != ENUMERATION_COMPLETE && usize::try_from(offset).is_err() {
+                return Err(SessionError::CorruptBundle);
+            }
+            primitive_offsets.push(offset);
+        }
+        let derived_sampled = match take_bundle(&mut recovery, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(SessionError::CorruptBundle),
+        };
+        let pending = PendingParent {
+            key,
+            primitive_offsets,
+            derived_sampled,
+        };
+        if pending.complete() {
+            return Err(SessionError::CorruptBundle);
+        }
+        pending_parents.push(pending);
     }
     if !recovery.is_empty() {
         return Err(SessionError::CorruptBundle);
@@ -3658,7 +3832,7 @@ fn decode_bundle<D: DomainDefinition>(
         pareto_keys,
         frontier_keys,
         deferred_candidates,
-        pending_parent_keys,
+        pending_parents,
         ledger,
         revisions: Some(revisions),
         interrupted_usage,
@@ -4378,7 +4552,7 @@ fn encode_recovery_segment<D: DomainDefinition>(
 ) -> Result<Vec<u8>, SessionError<D::Error>> {
     let frontier = search_tail.frontier;
     let deferred_candidates = search_tail.deferred_candidates;
-    let pending_parent_keys = search_tail.pending_parent_keys;
+    let pending_parents = search_tail.pending_parents;
     let mut recovery = Vec::with_capacity(
         32_usize
             .saturating_add(pareto.len().saturating_mul(32))
@@ -4429,9 +4603,14 @@ fn encode_recovery_segment<D: DomainDefinition>(
             recovery.push(0);
         }
     }
-    push_u64(&mut recovery, pending_parent_keys.len() as u64);
-    for key in pending_parent_keys {
-        recovery.extend_from_slice(key.as_bytes());
+    push_u64(&mut recovery, pending_parents.len() as u64);
+    for pending in pending_parents {
+        recovery.extend_from_slice(pending.key.as_bytes());
+        push_u64(&mut recovery, pending.primitive_offsets.len() as u64);
+        for offset in &pending.primitive_offsets {
+            push_u64(&mut recovery, *offset);
+        }
+        recovery.push(u8::from(pending.derived_sampled));
     }
     Ok(recovery)
 }
@@ -4685,12 +4864,13 @@ mod tests {
     #[cfg(feature = "internal-experiments")]
     use sha2::Digest;
 
+    use super::{
+        ENUMERATION_COMPLETE, PendingParent, append_proposal_features, candidate_generation_limit,
+        commit_pending_progress, fixed_resident_categories, operator_feature_values,
+        protected_origin_keys, sort_prefix_by,
+    };
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
-    use super::{
-        append_proposal_features, candidate_generation_limit, fixed_resident_categories,
-        operator_feature_values, protected_origin_keys, sort_prefix_by,
-    };
     use crate::ProposalFeatures;
     use crate::learning::{FEATURE_COUNT, Features};
 
@@ -4743,6 +4923,50 @@ mod tests {
         assert_eq!(candidate_generation_limit(8, 10, 32, 8, u64::MAX), 80);
         assert_eq!(candidate_generation_limit(24, 1_008, 16, 9, 64 * 1024), 8);
         assert_eq!(candidate_generation_limit(0, 1_008, 16, 9, u64::MAX), 0);
+    }
+
+    #[test]
+    fn truncated_operator_progress_keeps_the_parent_pending() {
+        let key = crate::ArtifactKey([7; 32]);
+        let mut pending = vec![PendingParent::new(key, 2, false)];
+        let mut staged = pending[0].clone();
+        staged.primitive_offsets = vec![8, ENUMERATION_COMPLETE];
+
+        commit_pending_progress(&mut pending, vec![staged]);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].primitive_offsets, [8, ENUMERATION_COMPLETE]);
+    }
+
+    #[test]
+    fn completely_enumerated_parent_leaves_the_pending_tail() {
+        let key = crate::ArtifactKey([9; 32]);
+        let mut pending = vec![PendingParent::new(key, 2, false)];
+        let mut staged = pending[0].clone();
+        staged.primitive_offsets = vec![ENUMERATION_COMPLETE; 2];
+
+        commit_pending_progress(&mut pending, vec![staged]);
+
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn incomplete_parent_page_rotates_behind_unvisited_parents() {
+        let first = crate::ArtifactKey([1; 32]);
+        let second = crate::ArtifactKey([2; 32]);
+        let mut pending = vec![
+            PendingParent::new(first, 1, false),
+            PendingParent::new(second, 1, false),
+        ];
+        let mut staged = pending[0].clone();
+        staged.primitive_offsets[0] = 8;
+
+        commit_pending_progress(&mut pending, vec![staged]);
+
+        assert_eq!(
+            pending.iter().map(|parent| parent.key).collect::<Vec<_>>(),
+            [second, first]
+        );
     }
 
     #[test]
