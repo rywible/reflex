@@ -1,0 +1,144 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v25",
+  "status": "development-only; no 2026 exposure",
+  "source_report": {
+    "path": "/tmp/reflex-lean-public-optimizer-development-v25-32x8.json",
+    "content_sha256": "c5af64efabeac5a3a6f6ddda6532e102dcf5f311748199384a4a02cefad53f32",
+    "file_sha256": "8e3e0a1592feb8e977d4a866cb9a243cba6cdf35b0a66099e2dcd66db53cd5fe"
+  },
+  "corpus": {
+    "training_artifacts": 32,
+    "heldout_artifacts": 8,
+    "training_verification_limit": 1024,
+    "evaluation_verification_limit": 128,
+    "heldout_declarations": [
+      "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "Matrix.det_updateCol_eq_zero",
+      "hfdifferential_apply",
+      "Matrix.fromCols_mul_fromRows",
+      "Stream'.WSeq.get?_terminates",
+      "Metric.isUniformEmbedding_iff",
+      "ContinuousLinearEquiv.isUniformEmbedding",
+      "FiberBundle.Prod.isInducing_diag"
+    ],
+    "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+    "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398"
+  },
+  "training": {
+    "learning": {
+      "generation": 1,
+      "champion_present": true
+    },
+    "experience_entries": 992,
+    "accepted_attempts": 30,
+    "accepted_claims": 27,
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 19412297189,
+      "verification_requests": 1024,
+      "durable_bytes": 98370274,
+      "elapsed_ns": 238376990635,
+      "cpu_ns": 239093704745
+    },
+    "bundle_sha256": "b46a25dbcfb47f710310ccab3d6707ef1e74c9c9638a809f23f8443a71a1c5dd",
+    "phase_sha256": "1f4da6317c6cd66934153b2ed5c012814b60d00d66b8b76ddb6861633f1b8a2c"
+  },
+  "treatments": {
+    "bootstrap": {
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 1417,
+      "at_16": {
+        "strict_discoveries": 1,
+        "candidate_cpu_ns": 837243678
+      },
+      "final": {
+        "observed_candidate_requests": 120,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 10063882902
+      },
+      "usage": {
+        "resident_bytes": 18189476363,
+        "verification_requests": 128,
+        "elapsed_ns": 55848471185,
+        "cpu_ns": 55928136249
+      },
+      "bundle_sha256": "2db9ea3163b3a88141a62885d346f49ba51588844b454b32feab09362a11c603"
+    },
+    "full": {
+      "strict_proof_node_improvements": 8,
+      "proof_nodes_removed": 17233,
+      "at_16": {
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 854662033
+      },
+      "final": {
+        "observed_candidate_requests": 28,
+        "strict_discoveries": 8,
+        "candidate_cpu_ns": 1761598990
+      },
+      "usage": {
+        "resident_bytes": 23003821056,
+        "verification_requests": 128,
+        "elapsed_ns": 54542171942,
+        "cpu_ns": 54591943165
+      },
+      "bundle_sha256": "51bc720d0aaaea1ee436ea617ff1f34dd0fa2e1de7e2fae080b1bb9039caae4f"
+    },
+    "no_model": {
+      "strict_proof_node_improvements": 2,
+      "proof_nodes_removed": 405,
+      "final_observed_candidate_requests": 28,
+      "usage": {
+        "resident_bytes": 23003783301,
+        "verification_requests": 128,
+        "elapsed_ns": 53155354203,
+        "cpu_ns": 53202413944
+      },
+      "bundle_sha256": "cc12a93733165a40c38c5e94a953c6fd594a98d20532f668bcdc7bbf9afca076"
+    },
+    "no_derived": {
+      "strict_proof_node_improvements": 8,
+      "proof_nodes_removed": 17233,
+      "final_observed_candidate_requests": 28,
+      "usage": {
+        "resident_bytes": 23003821056,
+        "verification_requests": 128,
+        "elapsed_ns": 54496263370,
+        "cpu_ns": 54545118565
+      },
+      "bundle_sha256": "c6d0fa3b8ebdbd33f29942f3ef7f6b72b4a5e7db1969e138efc3f5b32e9928b7"
+    }
+  },
+  "gates": {
+    "full_has_more_improvements": true,
+    "full_uses_less_end_to_end_cpu_per_improvement": true,
+    "full_noninferior_after_16_requests": true,
+    "request_16_candidate_efficiency": {
+      "full_strict_discoveries": 4,
+      "bootstrap_strict_discoveries": 1,
+      "full_candidate_cpu_ns": 854662033,
+      "bootstrap_candidate_cpu_ns": 837243678,
+      "full_uses_less_candidate_cpu_per_improvement": true
+    }
+  },
+  "host": {
+    "git_revision": "b6454413c10cfeb98115ea426d8851d9e5fb298c",
+    "git_dirty": false,
+    "build_profile": "release",
+    "target_features": "neon",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [7]
+  },
+  "limits": [
+    "Development opportunity corpus; not confirmation sampling.",
+    "Eight held-out claims are insufficient for Scientific Confirmation.",
+    "All improvements reuse exact-statement library proofs; this is verified proof deduplication, not theorem invention.",
+    "Full and no-model pay mandatory replay from retained training state and have 28 fresh Candidate requests; Bootstrap is Fresh and has 120.",
+    "No-derived was an identity transformation because training produced no active Derived Operators."
+  ]
+}

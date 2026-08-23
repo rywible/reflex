@@ -11,3 +11,5 @@ After a valid 128-request Bootstrap treatment, the harness attempted to derive t
 ## Consequences
 
 The helper's interface now makes its logical decode limit visible and mandatory. BitVec callers preserve their 256 MiB bound; Lean callers use the registered 32 GiB Runtime resident limit. A regression test proves that the supplied limit governs import. Lean Development schema v25 preserves v24 as an activation-partial and reruns the frozen protocol without changing Runtime revision 18, corpus, models, search breadth, or Resource Envelopes.
+
+The v25 rerun completed all four treatments. Both large ablation seeds imported successfully, confirming the defect was isolated to the former shared ceiling.
