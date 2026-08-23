@@ -342,7 +342,7 @@ pub(crate) fn inspect_domain_resources<D: DomainDefinition>(
 ) -> Option<DomainResourcePlan> {
     domain_resource_plan(domain, requested_worker_threads)
 }
-const RUNTIME_REVISION: u64 = 16;
+const RUNTIME_REVISION: u64 = 17;
 const BUNDLE_DECODE_RESIDENT_MULTIPLIER: u64 = 12;
 #[cfg(debug_assertions)]
 static FAULT_OCCURRENCE: AtomicU64 = AtomicU64::new(0);
@@ -1616,11 +1616,20 @@ where
         }
         let deferred_resident =
             cohort::recovery_resident_bytes(domain, &deferred_candidates, &pending_parents);
-        let transient_bytes = application_bytes
+        let epoch_context_bytes = vector_bytes(&parents)
+            .saturating_add(vector_bytes(&parent_summaries))
+            .saturating_add(vector_bytes(&parent_claims))
+            .saturating_add(vector_bytes(&origins))
+            .saturating_add(
+                (frontier_index_by_key.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<(ArtifactKey, usize)>() as u64)
+                    .saturating_mul(2),
+            );
+        let transaction_bytes = application_bytes
+            .saturating_add(epoch_context_bytes)
             .saturating_add(vector_bytes(&candidates))
             .saturating_add(candidate_pipeline_reserve(domain, &candidates))
-            .saturating_add(vector_bytes(&candidate_fates))
-            .saturating_add(deferred_resident);
+            .saturating_add(vector_bytes(&candidate_fates));
         let prospective_durable = (checkpoint.len() as u64)
             .saturating_add(candidate_pipeline_reserve(domain, &candidates))
             .saturating_add(deferred_resident)
@@ -1631,9 +1640,23 @@ where
             durable_budget_exhausted = true;
             break;
         }
-        let verification_resident = ResidentReservation::live(resident_before_epoch)
-            .with_transient(transient_bytes)
-            .peak_bytes();
+        let stable_verification_live = worker_resident_bytes.saturating_add(resident_state_bytes(
+            &known,
+            &roots,
+            &pareto,
+            &frontier,
+            &recovered_keys,
+            &operators,
+            &checkpoint,
+            &ledger,
+            &knowledge,
+            &learning,
+        ));
+        let verification_resident = moved_tail_transaction_peak(
+            stable_verification_live,
+            deferred_resident,
+            transaction_bytes,
+        );
         if !resource_meter.reserve(
             ResidentReservation::live(verification_resident)
                 .with_transient(checkpoint.capacity() as u64)
@@ -2319,6 +2342,12 @@ fn candidate_generation_limit(
 
 fn generation_refill_limit(inventory_target: usize, deferred_candidates: usize) -> usize {
     inventory_target.saturating_sub(deferred_candidates)
+}
+
+fn moved_tail_transaction_peak(stable_live: u64, prospective_tail: u64, transient: u64) -> u64 {
+    ResidentReservation::live(stable_live.saturating_add(prospective_tail))
+        .with_transient(transient)
+        .peak_bytes()
 }
 
 fn opportunity_features<D: DomainDefinition>(
@@ -4877,7 +4906,8 @@ mod tests {
     use super::{
         ENUMERATION_COMPLETE, PendingParent, append_proposal_features, candidate_generation_limit,
         commit_pending_progress, fixed_resident_categories, generation_refill_limit,
-        operator_feature_values, protected_origin_keys, sort_prefix_by,
+        moved_tail_transaction_peak, operator_feature_values, protected_origin_keys,
+        sort_prefix_by,
     };
     #[cfg(feature = "internal-experiments")]
     use super::{RUNTIME_REVISION, inspect_session_segment, push_bytes, push_duration, push_u64};
@@ -4941,6 +4971,11 @@ mod tests {
         assert_eq!(generation_refill_limit(144, 144), 0);
         assert_eq!(generation_refill_limit(144, 136), 8);
         assert_eq!(generation_refill_limit(144, 0), 144);
+    }
+
+    #[test]
+    fn moved_deferred_payload_is_counted_once_in_the_prospective_transaction() {
+        assert_eq!(moved_tail_transaction_peak(100, 30, 20), 150);
     }
 
     #[test]
