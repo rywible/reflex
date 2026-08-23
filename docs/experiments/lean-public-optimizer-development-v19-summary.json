@@ -1,0 +1,178 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v19",
+  "status": "development-only; no 2026 exposure",
+  "source_report": {
+    "path": "/tmp/reflex-lean-public-optimizer-development-v19.json",
+    "content_sha256": "75ee66382b37c731cc3ea1490cf19e1c92d827cac076ee91c63a70e61f5f4963",
+    "file_sha256": "87d526c219321183a9906fde0d2fdad8afaeb47d29f9ed605675ed3c3f1a39e0"
+  },
+  "corpus": {
+    "training_artifacts": 16,
+    "heldout_artifacts": 4,
+    "training_verification_limit": 1024,
+    "evaluation_verification_limit": 128,
+    "training_declarations": [
+      "Nat.bitwise.eq_1",
+      "Filter.EventuallyLE.refl",
+      "exists_eq_ciSup_of_not_isSuccPrelimit'",
+      "LinearMap.map_coprod_prod",
+      "Nat.card_divisors",
+      "MeasureTheory.MeasurePreserving.setLIntegral_comp_emb",
+      "MeasureTheory.Supermartingale.setIntegral_le",
+      "Left.mul_lt_one_of_le_of_lt",
+      "Relation.EqvGen.is_equivalence",
+      "dist_triangle",
+      "contMDiffAt_finset_prod'",
+      "Lean.Omega.Fin.not_lt",
+      "lt_of_eq_of_lt",
+      "mul_lt_mul_left'",
+      "WithTop.top_ne_natCast",
+      "Derivation.map_natCast"
+    ],
+    "heldout_declarations": [
+      "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "Matrix.det_updateCol_eq_zero",
+      "hfdifferential_apply",
+      "Matrix.fromCols_mul_fromRows"
+    ],
+    "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+    "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398"
+  },
+  "training": {
+    "learning": {
+      "generation": 1,
+      "champion_present": true
+    },
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18700029374,
+      "verification_requests": 714,
+      "durable_bytes": 7978273,
+      "elapsed_ns": 124264425760,
+      "cpu_ns": 124670411557
+    }
+  },
+  "phase_zero": {
+    "proof_substitution_attempts": 123,
+    "accepted_proof_substitutions": 16,
+    "reconstructed_attempts": 123,
+    "ambiguous_attempts": 0,
+    "unmatched_attempts": 0,
+    "accepted_refuted_collision_groups": 0
+  },
+  "treatments": {
+    "bootstrap": {
+      "strict_proof_node_improvements": 3,
+      "proof_nodes_removed": 4756,
+      "at_16": {
+        "observed_requests": 16,
+        "strict_discoveries": 1,
+        "candidate_cpu_ns": 1308742950
+      },
+      "final": {
+        "observed_requests": 124,
+        "strict_discoveries": 3,
+        "candidate_cpu_ns": 8198594445
+      },
+      "usage": {
+        "resident_bytes": 17922727033,
+        "verification_requests": 128,
+        "elapsed_ns": 52537538869,
+        "cpu_ns": 52625233111
+      }
+    },
+    "full": {
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "at_16": {
+        "observed_requests": 16,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 2057899663
+      },
+      "final": {
+        "observed_requests": 76,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 11460405552
+      },
+      "usage": {
+        "resident_bytes": 19722114413,
+        "verification_requests": 128,
+        "elapsed_ns": 67240076780,
+        "cpu_ns": 67370792873
+      }
+    },
+    "no_model": {
+      "strict_proof_node_improvements": 2,
+      "proof_nodes_removed": 998,
+      "at_16": {
+        "observed_requests": 16,
+        "strict_discoveries": 1,
+        "candidate_cpu_ns": 1352854396
+      },
+      "final": {
+        "observed_requests": 76,
+        "strict_discoveries": 2,
+        "candidate_cpu_ns": 4289865951
+      },
+      "usage": {
+        "resident_bytes": 19722084578,
+        "verification_requests": 128,
+        "elapsed_ns": 56983280335,
+        "cpu_ns": 57052146204
+      }
+    },
+    "no_derived": {
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "at_16": {
+        "observed_requests": 16,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 2069144553
+      },
+      "final": {
+        "observed_requests": 76,
+        "strict_discoveries": 4,
+        "candidate_cpu_ns": 11436499971
+      },
+      "usage": {
+        "resident_bytes": 19722114413,
+        "verification_requests": 128,
+        "elapsed_ns": 67573310477,
+        "cpu_ns": 67703277491
+      }
+    }
+  },
+  "gates": {
+    "full_has_more_improvements": true,
+    "full_uses_less_end_to_end_cpu_per_improvement": true,
+    "full_noninferior_after_16_requests": true,
+    "request_16_candidate_efficiency": {
+      "full_strict_discoveries": 4,
+      "bootstrap_strict_discoveries": 1,
+      "full_candidate_cpu_ns": 2057899663,
+      "bootstrap_candidate_cpu_ns": 1308742950,
+      "full_uses_less_candidate_cpu_per_improvement": true
+    }
+  },
+  "host": {
+    "git_revision": "74ab88c5fa0e7cc1e7fc6651c3fdb98494f9f325",
+    "git_dirty": false,
+    "build_profile": "release",
+    "target_features": "neon",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "limits": [
+    "Development opportunity corpus; not confirmation sampling.",
+    "Four held-out claims are insufficient for Scientific Confirmation.",
+    "All improvements reuse an exact-statement one-node donor; this establishes allocation value for library deduplication, not theorem invention.",
+    "No-derived matched Full, so chaining admitted Artifacts had no causal value here."
+  ]
+}

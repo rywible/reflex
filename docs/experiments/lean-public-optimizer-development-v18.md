@@ -44,3 +44,5 @@ The release run used AArch64 NEON, six worker threads on CPUs 0–6, a 40 GiB su
 Do not increase model capacity. First reproduce the result with the corrected human-facing corpus. If it survives, broaden the number of independent correctness claims at a fixed total Verification budget and report paired per-claim discovery curves. Only then compare pointwise and claim-conditioned pairwise linear ranking on identical retained Experience. Derived-artifact and compression work remains behind an end-to-end treatment where a derived proof actually changes a later held-out search.
 
 This is positive Development evidence, not Scientific Confirmation.
+
+The corrected [v19 reproduction](./lean-public-optimizer-development-v19.md) replaces the two generated training declarations and reproduces the same causal treatment result.
