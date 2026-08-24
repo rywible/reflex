@@ -1,0 +1,107 @@
+{
+  "schema": "reflex-lean-model-feature-development-v5",
+  "status": "development-only; fixed retained Experience; no Verification requests; no 2026 exposure",
+  "retained_bundle_sha256": "7ba3e9a199a261b770d686060dc5a48d77fb1fad745885afe1991c15aa6797d3",
+  "examples": 1008,
+  "replay_claims": 8,
+  "selection_claims": 8,
+  "feature_count": 16,
+  "head_count": 7,
+  "baseline_selection_loss": [
+    0.014979359,
+    0.00008157443,
+    0.014979359,
+    0.014979359,
+    0.014979359,
+    0.00008350405,
+    0.01497936
+  ],
+  "structural_selection_loss": [
+    0.014944043,
+    0.000041373947,
+    0.014944043,
+    0.014944043,
+    0.014944043,
+    0.00009133612,
+    0.014944041
+  ],
+  "balanced_structural_selection_loss": [
+    0.099659644,
+    0.000041373947,
+    0.099659644,
+    0.099659644,
+    0.099659644,
+    0.00009133612,
+    0.099659674
+  ],
+  "baseline_training_cpu_ns": 525372,
+  "structural_training_cpu_ns": 482260,
+  "balanced_structural_training_cpu_ns": 501405,
+  "feature_extraction_cpu_ns": 600746246,
+  "baseline_model_revision": "8d2b0b7d85ee194e936b1f617827de08207bce260fc69e6bd963b9b89500c33d",
+  "structural_model_revision": "430a8b6e3e1dced946a701b09510fe80f928223594465fdf4b486dcfaa7d434d",
+  "balanced_structural_model_revision": "f0d69bceef122d7832b3380450146c95545918cbdeaff039e7b63b755b5c2cae",
+  "model_bytes": 997,
+  "baseline_reproduces_champion": true,
+  "structural_promotes_over_baseline": false,
+  "ranking_budgets": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64
+  ],
+  "baseline_accepted_at_k": [
+    3,
+    3,
+    3,
+    6,
+    6,
+    7,
+    7
+  ],
+  "structural_accepted_at_k": [
+    3,
+    3,
+    3,
+    6,
+    7,
+    7,
+    7
+  ],
+  "balanced_structural_accepted_at_k": [
+    3,
+    3,
+    3,
+    6,
+    6,
+    7,
+    7
+  ],
+  "evaluated_at_k": [
+    8,
+    15,
+    29,
+    57,
+    113,
+    211,
+    374
+  ],
+  "selection_accepted": 7,
+  "host": {
+    "git_revision": "151a00b9ba35ca162dd3dd455e48a156711379b3",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 8
+  },
+  "content_sha256": "1f44d0796bc7eb0fe9b3bf36e03b729d80b9819354b96fc63b93f65cced04515"
+}

@@ -1,0 +1,53 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v23-null-summary-v1",
+  "status": "development-only; activation-null; treatments not run",
+  "training_artifacts": 32,
+  "heldout_artifacts": 8,
+  "training": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 384,
+    "candidate_verification_requests": 352,
+    "candidate_fates": 789,
+    "candidates_generated": 601,
+    "candidates_selected": 360,
+    "accepted_attempts": 25,
+    "accepted_claims": 23,
+    "refuted_attempts": 327,
+    "artifacts_admitted": 25,
+    "model_generation": 0,
+    "elapsed_seconds": 110.216308287,
+    "cpu_seconds": 110.510999032,
+    "peak_resident_bytes": 18824201858,
+    "durable_bytes": 90731283,
+    "epochs": 41
+  },
+  "registered_envelope": {
+    "runtime_resident_bytes": 34359738368,
+    "durable_bytes": 1073741824,
+    "elapsed_seconds": 600,
+    "verification_requests": 1024
+  },
+  "candidate_fates": {
+    "novelty_filtered": 105,
+    "policy_deferred": 332
+  },
+  "verified_by_queue": {
+    "protected_origin": 32,
+    "protected_derived": 0,
+    "learned": 0,
+    "bootstrap": 320
+  },
+  "recovery": {
+    "pareto_artifacts": 57,
+    "frontier_artifacts": 57,
+    "deferred_candidates": 134,
+    "deferred_canonical_bytes": 84951685,
+    "pending_parents": 57
+  },
+  "current_bundle_durable_size_bound": 246819697,
+  "training_bundle_sha256": "87292585b88cb6b6a59938ce2d36d8d5fdffa86460f44137d40db6a9bd03944b",
+  "phase_sha256": "db600eab5ca61812895bbc08ecbdb7e34db66c3e567d1ba55c487ed44bc9842d",
+  "falsified_hypothesis": "move-aware resident accounting lowered the estimate but did not change the limiting gate",
+  "diagnosis": "pre-Verification durable admission mixed resident-memory estimates with encoded checkpoint bytes",
+  "decision": "forecast replacement bundle size in the codec before one identical v24 retry"
+}

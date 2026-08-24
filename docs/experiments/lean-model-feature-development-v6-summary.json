@@ -1,0 +1,46 @@
+{
+  "schema": "reflex-lean-model-feature-development-v15-summary-v1",
+  "status": "development-only; fixed retained Experience; no Verification requests; no 2026 exposure",
+  "source_report": {
+    "path": "/tmp/reflex-lean-model-feature-development-v25.json",
+    "content_sha256": "e43679a6cae6416565cad0832a8bcab13453adb4907d2247c677b24f44ce32e4",
+    "file_sha256": "c9526ba6735f0b344de147618a700b4934074e18197582d4596fedde81bae224"
+  },
+  "retained_bundle_sha256": "b46a25dbcfb47f710310ccab3d6707ef1e74c9c9638a809f23f8443a71a1c5dd",
+  "examples": 992,
+  "accepted_examples": 30,
+  "proposal_informed_examples": 991,
+  "replay_claims": 24,
+  "selection_claims": 8,
+  "feature_count": 24,
+  "head_count": 7,
+  "model_bytes": 1445,
+  "feature_diagnostics": {
+    "claim_operator_feature_groups": 992,
+    "mixed_verdict_claim_operator_feature_groups": 0,
+    "accepted_refuted_collision_groups": 0,
+    "accepted_in_accepted_refuted_groups": 0
+  },
+  "training_cpu_ns": {
+    "baseline": 1405659,
+    "structural": 1349364,
+    "balanced_structural": 1354716,
+    "feature_extraction": 1441208599
+  },
+  "promotion": {
+    "baseline_reproduces_champion": true,
+    "structural_promotes_over_baseline": false
+  },
+  "ranking_budgets": [1, 2, 4, 8, 16, 32, 64],
+  "evaluated_at_k": [8, 14, 26, 50, 98, 180, 194],
+  "selection_accepted": 7,
+  "bootstrap_accepted_at_k": [0, 0, 0, 2, 4, 7, 7],
+  "baseline_accepted_at_k": [0, 6, 6, 6, 7, 7, 7],
+  "structural_accepted_at_k": [0, 6, 6, 6, 7, 7, 7],
+  "balanced_structural_accepted_at_k": [0, 6, 6, 6, 7, 7, 7],
+  "global_bootstrap_accepted_at_k": [0, 0, 0, 0, 0, 1, 2],
+  "global_baseline_accepted_at_k": [0, 0, 0, 0, 4, 6, 6],
+  "global_structural_accepted_at_k": [0, 0, 0, 0, 4, 6, 6],
+  "global_balanced_structural_accepted_at_k": [0, 0, 0, 0, 4, 6, 6],
+  "decision": "freeze parameter count; broaden and harden verified Experience before another model-capacity change"
+}

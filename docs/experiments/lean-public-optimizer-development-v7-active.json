@@ -1,0 +1,502 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v7",
+  "status": "development-only; no 2026 exposure",
+  "training_artifacts": 16,
+  "heldout_artifacts": 4,
+  "training_verification_limit": 1024,
+  "evaluation_verification_limit": 128,
+  "primary_proof_node_limit": 100000,
+  "primary_selection": "human-facing declarations with <=100000 proof nodes, distinct statement fingerprints, and a kernel-accepted strictly shorter pre-2025 library proof; held-out names are absent from September and held-out statement fingerprints are disjoint from selected training; development opportunity corpus, not confirmation sampling",
+  "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+  "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398",
+  "selected_artifacts": [
+    {
+      "role": "training",
+      "declaration": "Nat.bitwise.eq_1",
+      "statement_hash": 2256915014,
+      "proof_nodes": 8602
+    },
+    {
+      "role": "training",
+      "declaration": "Filter.EventuallyLE.refl",
+      "statement_hash": 1635510259,
+      "proof_nodes": 39
+    },
+    {
+      "role": "training",
+      "declaration": "exists_eq_ciSup_of_not_isSuccPrelimit'",
+      "statement_hash": 2671693606,
+      "proof_nodes": 133
+    },
+    {
+      "role": "training",
+      "declaration": "LinearMap.map_coprod_prod",
+      "statement_hash": 3404489442,
+      "proof_nodes": 31189
+    },
+    {
+      "role": "training",
+      "declaration": "Nat.card_divisors",
+      "statement_hash": 856966758,
+      "proof_nodes": 1897
+    },
+    {
+      "role": "training",
+      "declaration": "MeasureTheory.MeasurePreserving.setLIntegral_comp_emb",
+      "statement_hash": 2196443133,
+      "proof_nodes": 921
+    },
+    {
+      "role": "training",
+      "declaration": "Init.Data.Int.Lemmas._auxLemma.1",
+      "statement_hash": 3038437444,
+      "proof_nodes": 67
+    },
+    {
+      "role": "training",
+      "declaration": "MeasureTheory.Supermartingale.setIntegral_le",
+      "statement_hash": 3190349787,
+      "proof_nodes": 2419
+    },
+    {
+      "role": "training",
+      "declaration": "Left.mul_lt_one_of_le_of_lt",
+      "statement_hash": 1949413740,
+      "proof_nodes": 119
+    },
+    {
+      "role": "training",
+      "declaration": "Mathlib.Data.Fin.Basic._auxLemma.9",
+      "statement_hash": 2125201122,
+      "proof_nodes": 75
+    },
+    {
+      "role": "training",
+      "declaration": "Relation.EqvGen.is_equivalence",
+      "statement_hash": 4285576660,
+      "proof_nodes": 55
+    },
+    {
+      "role": "training",
+      "declaration": "dist_triangle",
+      "statement_hash": 195425744,
+      "proof_nodes": 23
+    },
+    {
+      "role": "training",
+      "declaration": "contMDiffAt_finset_prod'",
+      "statement_hash": 3196050553,
+      "proof_nodes": 317
+    },
+    {
+      "role": "training",
+      "declaration": "Lean.Omega.Fin.not_lt",
+      "statement_hash": 319374104,
+      "proof_nodes": 375
+    },
+    {
+      "role": "training",
+      "declaration": "lt_of_eq_of_lt",
+      "statement_hash": 213406790,
+      "proof_nodes": 69
+    },
+    {
+      "role": "training",
+      "declaration": "mul_lt_mul_left'",
+      "statement_hash": 2554601593,
+      "proof_nodes": 69
+    },
+    {
+      "role": "heldout",
+      "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+      "statement_hash": 733579311,
+      "proof_nodes": 401
+    },
+    {
+      "role": "heldout",
+      "declaration": "Matrix.det_updateCol_eq_zero",
+      "statement_hash": 2750634327,
+      "proof_nodes": 599
+    },
+    {
+      "role": "heldout",
+      "declaration": "hfdifferential_apply",
+      "statement_hash": 1999279568,
+      "proof_nodes": 8167
+    },
+    {
+      "role": "heldout",
+      "declaration": "Matrix.fromCols_mul_fromRows",
+      "statement_hash": 3909116777,
+      "proof_nodes": 3759
+    },
+    {
+      "role": "training-library",
+      "declaration": "exists_eq_ciSup_of_not_isSuccLimit'",
+      "statement_hash": 2671693606,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "mul_lt_one_of_le_of_lt",
+      "statement_hash": 1949413740,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "smoothAt_finset_prod'",
+      "statement_hash": 3196050553,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "ArithmeticFunction.card_divisors",
+      "statement_hash": 856966758,
+      "proof_nodes": 23
+    },
+    {
+      "role": "training-library",
+      "declaration": "Eq.trans_lt",
+      "statement_hash": 213406790,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "EqvGen.is_equivalence",
+      "statement_hash": 4285576660,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "Fin.not_lt",
+      "statement_hash": 319374104,
+      "proof_nodes": 23
+    },
+    {
+      "role": "training-library",
+      "declaration": "Int.ofNat_add_ofNat",
+      "statement_hash": 3038437444,
+      "proof_nodes": 37
+    },
+    {
+      "role": "training-library",
+      "declaration": "Int.ofNat_add_out",
+      "statement_hash": 3038437444,
+      "proof_nodes": 37
+    },
+    {
+      "role": "training-library",
+      "declaration": "LinearMap.coprod_map_prod",
+      "statement_hash": 3404489442,
+      "proof_nodes": 17573
+    },
+    {
+      "role": "training-library",
+      "declaration": "OrderedCommGroup.mul_lt_mul_left'",
+      "statement_hash": 2554601593,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "PseudoMetricSpace.dist_triangle",
+      "statement_hash": 195425744,
+      "proof_nodes": 8
+    },
+    {
+      "role": "training-library",
+      "declaration": "Filter.EventuallyLE.rfl",
+      "statement_hash": 1635510259,
+      "proof_nodes": 27
+    },
+    {
+      "role": "training-library",
+      "declaration": "MeasureTheory.MeasurePreserving.set_lintegral_comp_emb",
+      "statement_hash": 2196443133,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "MeasureTheory.Supermartingale.set_integral_le",
+      "statement_hash": 3190349787,
+      "proof_nodes": 1
+    },
+    {
+      "role": "training-library",
+      "declaration": "Nat.bitwise.eq_def",
+      "statement_hash": 2256915014,
+      "proof_nodes": 17
+    },
+    {
+      "role": "training-library",
+      "declaration": "Batteries.Classes.Order._auxLemma.7",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.AlgebraicTopology.ExtraDegeneracy._auxLemma.5",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.AlgebraicTopology.SimplexCategory._auxLemma.13",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.CategoryTheory.ComposableArrows._auxLemma.3",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.Order.JordanHolder._auxLemma.8",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Init.Data.Fin.Lemmas._auxLemma.15",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Init.Data.Int.DivModLemmas._auxLemma.13",
+      "statement_hash": 3038437444,
+      "proof_nodes": 67
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.Algebra.BigOperators.Fin._auxLemma.3",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.AlgebraicTopology.DoldKan.Faces._auxLemma.5",
+      "statement_hash": 2125201122,
+      "proof_nodes": 45
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.LinearAlgebra.Matrix.ZPow._auxLemma.4",
+      "statement_hash": 3038437444,
+      "proof_nodes": 67
+    },
+    {
+      "role": "training-library",
+      "declaration": "Mathlib.Data.Int.Cast.Basic._auxLemma.6",
+      "statement_hash": 3038437444,
+      "proof_nodes": 67
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "apply_hfdifferential",
+      "statement_hash": 1999279568,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFounded",
+      "statement_hash": 733579311,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "Matrix.det_updateColumn_eq_zero",
+      "statement_hash": 2750634327,
+      "proof_nodes": 1
+    },
+    {
+      "role": "heldout-library",
+      "declaration": "Matrix.fromColumns_mul_fromRows",
+      "statement_hash": 3909116777,
+      "proof_nodes": 1
+    }
+  ],
+  "training_usage": {
+    "worker_threads": 6,
+    "resident_bytes": 18715222669,
+    "verification_requests": 1024,
+    "durable_bytes": 5631517,
+    "elapsed_ns": 71906496919,
+    "cpu_ns": 72232992350
+  },
+  "training_learning": {
+    "generation": 1,
+    "champion_present": true
+  },
+  "full": {
+    "treatment": "full",
+    "completion": "ResourceEnvelopeExhausted",
+    "heldout_pareto_artifacts": 6,
+    "strict_proof_node_improvements": 2,
+    "proof_nodes_removed": 998,
+    "strict_improvements": [
+      {
+        "observer_sequence": 2,
+        "artifact_key": "86c754cedca6761dcda10527c84c261f886c0da6e837381362d5ca8a721de501",
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "seed_proof_nodes": 401,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 400
+      },
+      {
+        "observer_sequence": 2,
+        "artifact_key": "fd82a887fb181a177344e8fce8ac6258d5a3824824cafa27338f8e070024588b",
+        "declaration": "Matrix.det_updateCol_eq_zero",
+        "seed_proof_nodes": 599,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 598
+      }
+    ],
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18985011831,
+      "verification_requests": 128,
+      "durable_bytes": 6416680,
+      "elapsed_ns": 49195686359,
+      "cpu_ns": 49260559131
+    },
+    "bundle_sha256": "5a5ba41ae630565c3ca5be76fbb7c53da5d5e3d9a52b758a2533ab0b1b01f604"
+  },
+  "no_model": {
+    "treatment": "no-model",
+    "completion": "ResourceEnvelopeExhausted",
+    "heldout_pareto_artifacts": 6,
+    "strict_proof_node_improvements": 2,
+    "proof_nodes_removed": 998,
+    "strict_improvements": [
+      {
+        "observer_sequence": 2,
+        "artifact_key": "86c754cedca6761dcda10527c84c261f886c0da6e837381362d5ca8a721de501",
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "seed_proof_nodes": 401,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 400
+      },
+      {
+        "observer_sequence": 2,
+        "artifact_key": "fd82a887fb181a177344e8fce8ac6258d5a3824824cafa27338f8e070024588b",
+        "declaration": "Matrix.det_updateCol_eq_zero",
+        "seed_proof_nodes": 599,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 598
+      }
+    ],
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18984988716,
+      "verification_requests": 128,
+      "durable_bytes": 6187456,
+      "elapsed_ns": 47975160858,
+      "cpu_ns": 48023654638
+    },
+    "bundle_sha256": "8d03ced9791ce8a3e556ca50cbb3d66b3bf379460674590bff879e72a6bf416c"
+  },
+  "no_derived": {
+    "treatment": "no-derived",
+    "completion": "ResourceEnvelopeExhausted",
+    "heldout_pareto_artifacts": 6,
+    "strict_proof_node_improvements": 2,
+    "proof_nodes_removed": 998,
+    "strict_improvements": [
+      {
+        "observer_sequence": 2,
+        "artifact_key": "86c754cedca6761dcda10527c84c261f886c0da6e837381362d5ca8a721de501",
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "seed_proof_nodes": 401,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 400
+      },
+      {
+        "observer_sequence": 2,
+        "artifact_key": "fd82a887fb181a177344e8fce8ac6258d5a3824824cafa27338f8e070024588b",
+        "declaration": "Matrix.det_updateCol_eq_zero",
+        "seed_proof_nodes": 599,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 598
+      }
+    ],
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18985011831,
+      "verification_requests": 128,
+      "durable_bytes": 6416680,
+      "elapsed_ns": 49518951311,
+      "cpu_ns": 49584162888
+    },
+    "bundle_sha256": "8cbbebd12804f2d1b63d00458e16a5983e61b1cb9f2308b38f21bd1f5dad4ecf"
+  },
+  "bootstrap": {
+    "treatment": "bootstrap",
+    "completion": "ResourceEnvelopeExhausted",
+    "heldout_pareto_artifacts": 7,
+    "strict_proof_node_improvements": 3,
+    "proof_nodes_removed": 9164,
+    "strict_improvements": [
+      {
+        "observer_sequence": 2,
+        "artifact_key": "86c754cedca6761dcda10527c84c261f886c0da6e837381362d5ca8a721de501",
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "seed_proof_nodes": 401,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 400
+      },
+      {
+        "observer_sequence": 2,
+        "artifact_key": "fd82a887fb181a177344e8fce8ac6258d5a3824824cafa27338f8e070024588b",
+        "declaration": "Matrix.det_updateCol_eq_zero",
+        "seed_proof_nodes": 599,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 598
+      },
+      {
+        "observer_sequence": 2,
+        "artifact_key": "1219ddf21981c1f28e38078de00cad8b098d1fad996a09d61ff76391128d8fa0",
+        "declaration": "hfdifferential_apply",
+        "seed_proof_nodes": 8167,
+        "proof_nodes": 1,
+        "proof_nodes_removed": 8166
+      }
+    ],
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 17360225113,
+      "verification_requests": 128,
+      "durable_bytes": 791380,
+      "elapsed_ns": 43067838153,
+      "cpu_ns": 43114426732
+    },
+    "bundle_sha256": "3f454ff9e3605488760055bcd69822aabf420d8436938b5cd3dbbf7cf4605343"
+  },
+  "full_has_more_improvements": false,
+  "full_uses_less_cpu_per_improvement": false,
+  "host": {
+    "git_revision": "722f93e969c3bfc295dbc75b3a1ce3684dc42f02",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "total_memory_bytes": 67306029056,
+    "available_memory_bytes": 63718088704,
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "content_sha256": "4435807b5bc3eab155514378ce7d7d5399d9f37af0d20e822c686457770c09fd"
+}

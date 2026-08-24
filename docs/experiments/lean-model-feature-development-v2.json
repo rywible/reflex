@@ -1,0 +1,50 @@
+{
+  "schema": "reflex-lean-model-feature-development-v2",
+  "status": "development-only; fixed retained Experience; no Verification requests; no 2026 exposure",
+  "retained_bundle_sha256": "7ba3e9a199a261b770d686060dc5a48d77fb1fad745885afe1991c15aa6797d3",
+  "examples": 1008,
+  "replay_claims": 8,
+  "selection_claims": 8,
+  "feature_count": 16,
+  "head_count": 7,
+  "baseline_selection_loss": [
+    0.014979359,
+    0.00008157443,
+    0.014979359,
+    0.014979359,
+    0.014979359,
+    0.00008350405,
+    0.01497936
+  ],
+  "structural_selection_loss": [
+    0.01555014,
+    0.000019992007,
+    0.01555014,
+    0.01555014,
+    0.01555014,
+    0.00021559755,
+    0.015550139
+  ],
+  "baseline_training_cpu_ns": 501005,
+  "structural_training_cpu_ns": 475391,
+  "feature_extraction_cpu_ns": 587113384,
+  "baseline_model_revision": "8d2b0b7d85ee194e936b1f617827de08207bce260fc69e6bd963b9b89500c33d",
+  "structural_model_revision": "e4bcb2a8ed21c3486cf200f7ca08a5e090b89ad77d152dd5dd40092ce33a3726",
+  "model_bytes": 997,
+  "baseline_reproduces_champion": true,
+  "structural_promotes_over_baseline": false,
+  "host": {
+    "git_revision": "893073e9bbb6fad4929adb32af93b217c3270484",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 8
+  },
+  "content_sha256": "f5b387a0de58b4853c427f8dc97fab4341dc43d917a389382e47fe7e1f48630d"
+}

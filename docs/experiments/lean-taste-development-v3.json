@@ -1,0 +1,317 @@
+{
+  "schema": "reflex-lean-taste-development-v2",
+  "status": "development",
+  "protocol_sha256": "ca2c2b6da2155fb434c7b59105554a4b9c63e7c2a4972f2340569066537acd80",
+  "protocol": {
+    "schema": "reflex-lean-taste-development-v2",
+    "cutoff": "2025-01-01T00:00:00Z",
+    "training_pair": [
+      "2024-06-30",
+      "2024-09-30"
+    ],
+    "selection_pair": [
+      "2024-09-30",
+      "2024-12-31"
+    ],
+    "treatments": [
+      "full",
+      "bootstrap",
+      "no-model",
+      "no-consolidation",
+      "immediate-only"
+    ],
+    "baselines": [
+      "uniform",
+      "dependency-light",
+      "historical-reuse"
+    ],
+    "ranking_limit": 256,
+    "certificate_limit": 48,
+    "migration_limit": 32,
+    "audit_access": "post-cutoff declarations forbidden",
+    "reuse_target": "new later theorem with a direct dependency on the earlier theorem",
+    "descendant_target": "increase in direct inbound declaration dependencies on the earlier theorem"
+  },
+  "catalogs": [
+    "9deacea7faeb8edcd400dd61348ec08a76fcbbd1aa85e08f349a3dfb63df4f10",
+    "9c027cede0fb0cb75a33a2afeabca1c9726df60c92c40f65fff00ee1bceb18ac",
+    "021e90ae7d642aa87f65108d5d8d5984a77a11b35ed9636b7ed6c48be3069090"
+  ],
+  "pairs": [
+    {
+      "earlier_environment_sha256": "75adeff5bb8ac9cf3a808a749548f25883e6cf21d3daede1923497b17b73fbb6",
+      "later_environment_sha256": "3f8572bad3c75080d15301771b2015a8ff827da6556dc7205b2ea738d06270bf",
+      "examples": 254225,
+      "later_new_declarations": 32955,
+      "relationship_candidates": 225513
+    },
+    {
+      "earlier_environment_sha256": "3f8572bad3c75080d15301771b2015a8ff827da6556dc7205b2ea738d06270bf",
+      "later_environment_sha256": "edcd4db2ae30dd1ac31451245bcf51b6388864e9a17c6b5d050d69d7eda35bf6",
+      "examples": 277002,
+      "later_new_declarations": 35421,
+      "relationship_candidates": 314335
+    }
+  ],
+  "selection_evaluation_examples": 168104,
+  "treatments": [
+    {
+      "treatment": "full",
+      "selected": 729,
+      "training_wall_ns": 3630457899,
+      "training_cpu_ns": 3630404266,
+      "ranking_wall_ns": 183960793,
+      "model_bytes": 35251,
+      "model_sha256": "18a3d5258462780275c2d9468c5986532681e262b2cb1077229f64478939a455",
+      "strategies": [
+        "historical-reuse",
+        "historical-reuse",
+        "historical-reuse",
+        "learned",
+        "historical-reuse",
+        "dependency-light",
+        "learned"
+      ],
+      "mean_targets": [
+        0.91015625,
+        0.8592345,
+        0.9541667,
+        0.29158843,
+        0.98828125,
+        0.21697135,
+        0.00390625
+      ]
+    },
+    {
+      "treatment": "bootstrap",
+      "selected": 256,
+      "training_wall_ns": 35545,
+      "training_cpu_ns": 37081,
+      "ranking_wall_ns": 161775403,
+      "model_bytes": 18271,
+      "model_sha256": "98f3c4df2ce2685a1ad476526493ee171cf6c1e1c299f378e523d695b02ff90c",
+      "strategies": [
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned"
+      ],
+      "mean_targets": [
+        0.11328125,
+        0.03733865,
+        0.04168741,
+        0.049598992,
+        0.984375,
+        0.41684413,
+        0.01171875
+      ]
+    },
+    {
+      "treatment": "no-model",
+      "selected": 256,
+      "training_wall_ns": 35286,
+      "training_cpu_ns": 37810,
+      "ranking_wall_ns": 65490069,
+      "model_bytes": 18271,
+      "model_sha256": "98f3c4df2ce2685a1ad476526493ee171cf6c1e1c299f378e523d695b02ff90c",
+      "strategies": [
+        "uniform",
+        "uniform",
+        "uniform",
+        "uniform",
+        "uniform",
+        "uniform",
+        "uniform"
+      ],
+      "mean_targets": [
+        0.0546875,
+        0.028984562,
+        0.034729782,
+        0.0033646605,
+        0.97265625,
+        0.42846885,
+        0.0234375
+      ]
+    },
+    {
+      "treatment": "no-consolidation",
+      "selected": 962,
+      "training_wall_ns": 1919128961,
+      "training_cpu_ns": 1919108510,
+      "ranking_wall_ns": 157750041,
+      "model_bytes": 35216,
+      "model_sha256": "5463f2e9942acec0662a268622fa457b28145edb83b2367d2d02895383f45a8d",
+      "strategies": [
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned"
+      ],
+      "mean_targets": [
+        0.87890625,
+        0.8468175,
+        0.947495,
+        0.0291412,
+        0.99609375,
+        0.2351771,
+        0.00390625
+      ]
+    },
+    {
+      "treatment": "immediate-only",
+      "selected": 1169,
+      "training_wall_ns": 1918927303,
+      "training_cpu_ns": 1918904570,
+      "ranking_wall_ns": 156140150,
+      "model_bytes": 35275,
+      "model_sha256": "4a31a9c1bebebed09d9ca8961678e5d8ea0a3abc132c9a943f26f9659a00b606",
+      "strategies": [
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned",
+        "learned"
+      ],
+      "mean_targets": [
+        0.87890625,
+        0.023937572,
+        0.02101542,
+        0.0291412,
+        0.921875,
+        0.2351771,
+        0.0078125
+      ]
+    }
+  ],
+  "baselines": [
+    {
+      "baseline": "uniform",
+      "selected": 256,
+      "ranking_wall_ns": 8879375,
+      "ranking_cpu_ns": 8882700,
+      "mean_targets": [
+        0.0546875,
+        0.028984562,
+        0.034729782,
+        0.0033646605,
+        0.97265625,
+        0.42846885,
+        0.0234375
+      ]
+    },
+    {
+      "baseline": "dependency-light",
+      "selected": 256,
+      "ranking_wall_ns": 5190728,
+      "ranking_cpu_ns": 5192101,
+      "mean_targets": [
+        0.42578125,
+        0.1365668,
+        0.17349306,
+        0.2650834,
+        0.9453125,
+        0.21697135,
+        0.0390625
+      ]
+    },
+    {
+      "baseline": "historical-reuse",
+      "selected": 256,
+      "ranking_wall_ns": 4805549,
+      "ranking_cpu_ns": 4806485,
+      "mean_targets": [
+        0.91015625,
+        0.8592345,
+        0.9541667,
+        0.063541666,
+        0.98828125,
+        0.31991267,
+        0.0078125
+      ]
+    }
+  ],
+  "virtual_best_mean_targets": [
+    0.91015625,
+    0.8592345,
+    0.9541667,
+    0.2650834,
+    0.98828125,
+    0.21697135,
+    0.0078125
+  ],
+  "relationships": {
+    "attempted": 48,
+    "certified": 43,
+    "rejected_or_unavailable": 5,
+    "exact": 1,
+    "definitional": 26,
+    "specialization": 8,
+    "derivation": 8,
+    "family_collapse": 5,
+    "corpus_compression": 2,
+    "proof_nodes_removed": 1448
+  },
+  "migration": {
+    "attempted": 32,
+    "migrated": 17,
+    "failed": 15,
+    "failures": [
+      "Commute.exp_right: claim is not a well-formed type",
+      "AddGroupNorm.add_apply: claim is not a well-formed type",
+      "HahnSeries.add_coeff': claim is not a well-formed type",
+      "Sigma.le_def: claim is not a well-formed type",
+      "MeasureTheory.SimpleFunc.eapprox.eq_1: claim is not a well-formed type",
+      "AlgebraicGeometry.Scheme.Pullback.gluedLiftPullbackMap_snd: candidate or proof did not kernel-check",
+      "Option.pmap_none: claim is not a well-formed type",
+      "Mathlib.Data.Finset.Image._auxLemma.21: claim is not a well-formed type",
+      "Finset.sup'_mul_le_mul_sup'_of_nonneg: claim is not a well-formed type",
+      "integralClosure.proof_3: claim is not a well-formed type",
+      "MeasureTheory.SignedMeasure.haveLebesgueDecomposition_mk: unsafe, partial, sorry, or unknown dependency",
+      "Pi.single_mono: claim is not a well-formed type",
+      "ContinuousMap.instNonAssocRingOfTopologicalRing.proof_8: claim is not a well-formed type",
+      "Equiv.Perm.decomposeFin_symm_of_refl: candidate or proof did not kernel-check",
+      "unitary.spectrum.unitary_conjugate: claim is not a well-formed type"
+    ]
+  },
+  "economics": {
+    "analysis_wall_ns": 117455446905,
+    "controller_cpu_ns": 36983954516,
+    "controller_peak_resident_bytes": 8784162816,
+    "worker_lifetime_wall_ns": 80883361102,
+    "worker_cpu_upper_bound_ns": 161766722204,
+    "combined_resident_upper_bound_bytes": 43143901184,
+    "catalog_durable_bytes": [
+      60515017,
+      63369903,
+      68141147
+    ],
+    "encoded_model_durable_bytes": 142284,
+    "report_durable_bytes": 9416,
+    "kernel_verification_calls": 49,
+    "kernel_verification_wall_ns": 12485811260,
+    "kernel_verification_cpu_upper_bound_ns": 12485811260
+  },
+  "host": {
+    "git_revision": "a1c400aa511baad5a069f59efcfdc2a26dfdb108",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 8
+  },
+  "protocol_deviations": [],
+  "content_sha256": "c6a6cdf6d74fa3bd0327336d8da6bd96fb6fa31e2b84dc9d50976f5790ed8cf0"
+}

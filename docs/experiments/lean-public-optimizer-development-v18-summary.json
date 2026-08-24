@@ -1,0 +1,235 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v18",
+  "status": "development-only; no 2026 exposure",
+  "source_report": {
+    "path": "/tmp/reflex-lean-public-optimizer-development-v18.json",
+    "content_sha256": "7e9cb9d9e9e8a2b48a3456f91e99a755de415df1f79eb744255a06c4a1e0cc24",
+    "file_sha256": "42d9978e35a3cc4a581aaf87f14ccf098d52b0557a1dce4fb77792e735b1f8f7"
+  },
+  "corpus": {
+    "training_artifacts": 16,
+    "heldout_artifacts": 4,
+    "training_verification_limit": 1024,
+    "evaluation_verification_limit": 128,
+    "september_catalog_sha256": "db84600c2bf79e6dcbf60daeb62f72b009c901d298db71aeac6e67afae6717a8",
+    "december_catalog_sha256": "8ae07fad0f6e6a028c157321752b030d90a714db35fdad69d8f21bb38977b398",
+    "heldout": [
+      {
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "proof_nodes": 401
+      },
+      {
+        "declaration": "Matrix.det_updateCol_eq_zero",
+        "proof_nodes": 599
+      },
+      {
+        "declaration": "hfdifferential_apply",
+        "proof_nodes": 8167
+      },
+      {
+        "declaration": "Matrix.fromCols_mul_fromRows",
+        "proof_nodes": 3759
+      }
+    ],
+    "donors": [
+      {
+        "declaration": "apply_hfdifferential",
+        "proof_nodes": 1
+      },
+      {
+        "declaration": "CompleteLattice.isCompactlyGenerated_of_wellFounded",
+        "proof_nodes": 1
+      },
+      {
+        "declaration": "Matrix.det_updateColumn_eq_zero",
+        "proof_nodes": 1
+      },
+      {
+        "declaration": "Matrix.fromColumns_mul_fromRows",
+        "proof_nodes": 1
+      }
+    ]
+  },
+  "training": {
+    "learning": {
+      "generation": 1,
+      "champion_present": true
+    },
+    "usage": {
+      "worker_threads": 6,
+      "resident_bytes": 18543751616,
+      "verification_requests": 671,
+      "durable_bytes": 7564857,
+      "elapsed_ns": 118746545558,
+      "cpu_ns": 119141609527
+    }
+  },
+  "phase_zero": {
+    "proof_substitution_attempts": 103,
+    "accepted_proof_substitutions": 16,
+    "reconstructed_attempts": 103,
+    "ambiguous_attempts": 0,
+    "unmatched_attempts": 0,
+    "accepted_refuted_collision_groups": 0
+  },
+  "treatments": {
+    "bootstrap": {
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 3,
+      "proof_nodes_removed": 4756,
+      "discoveries": [
+        "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "Matrix.det_updateCol_eq_zero",
+        "Matrix.fromCols_mul_fromRows"
+      ],
+      "at_16": {
+        "request_budget": 16,
+        "reached": true,
+        "observed_requests": 16,
+        "strict_discoveries": 1,
+        "cpu_ns_through_completed_batch": 1348917507
+      },
+      "final": {
+        "request_budget": 128,
+        "reached": false,
+        "observed_requests": 124,
+        "strict_discoveries": 3,
+        "cpu_ns_through_completed_batch": 7279760723
+      },
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 17905671139,
+        "verification_requests": 128,
+        "durable_bytes": 26167686,
+        "elapsed_ns": 51736406441,
+        "cpu_ns": 51816574754
+      }
+    },
+    "full": {
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "discoveries": [
+        "CompleteLattice.isCompactlyGenerated_of_wellFoundedGT",
+        "Matrix.det_updateCol_eq_zero",
+        "Matrix.fromCols_mul_fromRows",
+        "hfdifferential_apply"
+      ],
+      "at_16": {
+        "request_budget": 16,
+        "reached": true,
+        "observed_requests": 16,
+        "strict_discoveries": 4,
+        "cpu_ns_through_completed_batch": 2071896436
+      },
+      "final": {
+        "request_budget": 128,
+        "reached": false,
+        "observed_requests": 76,
+        "strict_discoveries": 4,
+        "cpu_ns_through_completed_batch": 11786072699
+      },
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19607209773,
+        "verification_requests": 128,
+        "durable_bytes": 51913848,
+        "elapsed_ns": 68471076025,
+        "cpu_ns": 68606467878
+      }
+    },
+    "no_model": {
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 2,
+      "proof_nodes_removed": 998,
+      "at_16": {
+        "request_budget": 16,
+        "reached": true,
+        "observed_requests": 16,
+        "strict_discoveries": 1,
+        "cpu_ns_through_completed_batch": 1355846792
+      },
+      "final": {
+        "request_budget": 128,
+        "reached": false,
+        "observed_requests": 76,
+        "strict_discoveries": 2,
+        "cpu_ns_through_completed_batch": 4205966140
+      },
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19607179938,
+        "verification_requests": 128,
+        "durable_bytes": 38693708,
+        "elapsed_ns": 57312788504,
+        "cpu_ns": 57379022368
+      }
+    },
+    "no_derived": {
+      "completion": "ResourceEnvelopeExhausted",
+      "strict_proof_node_improvements": 4,
+      "proof_nodes_removed": 12922,
+      "at_16": {
+        "request_budget": 16,
+        "reached": true,
+        "observed_requests": 16,
+        "strict_discoveries": 4,
+        "cpu_ns_through_completed_batch": 2070114287
+      },
+      "final": {
+        "request_budget": 128,
+        "reached": false,
+        "observed_requests": 76,
+        "strict_discoveries": 4,
+        "cpu_ns_through_completed_batch": 11875795450
+      },
+      "usage": {
+        "worker_threads": 6,
+        "resident_bytes": 19607209773,
+        "verification_requests": 128,
+        "durable_bytes": 51913850,
+        "elapsed_ns": 67647293695,
+        "cpu_ns": 67782573654
+      }
+    }
+  },
+  "gates": {
+    "full_has_more_improvements": true,
+    "full_uses_less_cpu_per_improvement": true,
+    "full_noninferior_after_16_requests": true,
+    "request_16_candidate_efficiency": {
+      "request_budget": 16,
+      "full_strict_discoveries": 4,
+      "bootstrap_strict_discoveries": 1,
+      "full_candidate_cpu_ns": 2071896436,
+      "bootstrap_candidate_cpu_ns": 1348917507,
+      "full_uses_less_candidate_cpu_per_improvement": true
+    }
+  },
+  "host": {
+    "git_revision": "68d97724654436890d0308264dacd275b5ec75b6",
+    "git_dirty": false,
+    "build_profile": "release",
+    "target_features": "neon",
+    "available_parallelism": 7
+  },
+  "host_isolation": {
+    "total_memory_bytes": 67306029056,
+    "available_memory_bytes": 62738984960,
+    "memory_limit_bytes": 42949672960,
+    "memory_reserve_bytes": 17179869184,
+    "allowed_cpu_list": "0,1,2,3,4,5,6",
+    "reserved_cpus": [
+      7
+    ]
+  },
+  "limits": [
+    "Development opportunity corpus; not confirmation sampling.",
+    "Four held-out claims are insufficient for Scientific Confirmation.",
+    "Candidate curves exclude Seed and recovery Verification; end-to-end treatment envelopes are equal.",
+    "All improvements reuse an exact-statement one-node donor; this establishes allocation value for library deduplication, not theorem invention.",
+    "No-derived matched Full, so chaining admitted Artifacts had no causal value here.",
+    "The end-to-end CPU-per-improvement advantage is setup-dominated and about 0.7%; request-16 candidate-path efficiency is the decision-relevant result.",
+    "v18 admitted two generated training declarations despite calling the stratum human-facing; v19 corrects that eligibility bug."
+  ]
+}

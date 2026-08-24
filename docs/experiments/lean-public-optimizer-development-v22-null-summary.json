@@ -1,0 +1,44 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v22-null-summary-v1",
+  "status": "development-only; activation-null; treatments not run",
+  "training_artifacts": 32,
+  "heldout_artifacts": 8,
+  "training": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 384,
+    "candidate_verification_requests": 352,
+    "candidate_fates": 789,
+    "candidates_generated": 601,
+    "candidates_selected": 360,
+    "accepted_attempts": 25,
+    "accepted_claims": 23,
+    "refuted_attempts": 327,
+    "artifacts_admitted": 25,
+    "model_generation": 0,
+    "elapsed_seconds": 109.757251455,
+    "cpu_seconds": 110.051752702,
+    "peak_resident_bytes": 19734194744,
+    "durable_bytes": 90731291,
+    "epochs": 41
+  },
+  "registered_envelope": {
+    "runtime_resident_bytes": 34359738368,
+    "durable_bytes": 1073741824,
+    "elapsed_seconds": 600,
+    "verification_requests": 1024
+  },
+  "candidate_fates": {
+    "novelty_filtered": 105,
+    "policy_deferred": 332
+  },
+  "verified_by_queue": {
+    "protected_origin": 32,
+    "protected_derived": 0,
+    "learned": 0,
+    "bootstrap": 320
+  },
+  "training_bundle_sha256": "b8a70dba48d81d68f826ea3fc92535984f0e806f18d45a57cf726282f30bf917",
+  "phase_sha256": "55c05af31b775c44efeb3713739c22a2ed4de2090ab3c532d129795b3a942295",
+  "diagnosis": "Verification admission double-counted moved deferred Artifact payloads in old and prospective search state",
+  "decision": "recompute the post-selection ownership graph before another identical breadth treatment"
+}

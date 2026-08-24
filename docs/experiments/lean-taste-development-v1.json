@@ -1,0 +1,248 @@
+{
+  "schema": "reflex-lean-taste-development-v1",
+  "status": "development",
+  "protocol_sha256": "2afbeadf0624bfc421f722afbee0e27148ed5f1c032efb5674c6ed3446f470f3",
+  "protocol": {
+    "schema": "reflex-lean-taste-development-v1",
+    "cutoff": "2025-01-01T00:00:00Z",
+    "training_pair": [
+      "2024-06-30",
+      "2024-09-30"
+    ],
+    "selection_pair": [
+      "2024-09-30",
+      "2024-12-31"
+    ],
+    "treatments": [
+      "full",
+      "bootstrap",
+      "no-model",
+      "no-consolidation",
+      "immediate-only"
+    ],
+    "baselines": [
+      "uniform",
+      "dependency-light",
+      "historical-reuse"
+    ],
+    "ranking_limit": 256,
+    "certificate_limit": 48,
+    "migration_limit": 32,
+    "audit_access": "post-cutoff declarations forbidden"
+  },
+  "catalogs": [
+    "9deacea7faeb8edcd400dd61348ec08a76fcbbd1aa85e08f349a3dfb63df4f10",
+    "9c027cede0fb0cb75a33a2afeabca1c9726df60c92c40f65fff00ee1bceb18ac",
+    "021e90ae7d642aa87f65108d5d8d5984a77a11b35ed9636b7ed6c48be3069090"
+  ],
+  "pairs": [
+    {
+      "earlier_environment_sha256": "75adeff5bb8ac9cf3a808a749548f25883e6cf21d3daede1923497b17b73fbb6",
+      "later_environment_sha256": "3f8572bad3c75080d15301771b2015a8ff827da6556dc7205b2ea738d06270bf",
+      "examples": 254225,
+      "later_new_declarations": 32955,
+      "relationship_candidates": 225513
+    },
+    {
+      "earlier_environment_sha256": "3f8572bad3c75080d15301771b2015a8ff827da6556dc7205b2ea738d06270bf",
+      "later_environment_sha256": "edcd4db2ae30dd1ac31451245bcf51b6388864e9a17c6b5d050d69d7eda35bf6",
+      "examples": 277002,
+      "later_new_declarations": 35421,
+      "relationship_candidates": 314335
+    }
+  ],
+  "selection_evaluation_examples": 168104,
+  "treatments": [
+    {
+      "treatment": "full",
+      "selected": 887,
+      "training_wall_ns": 1907425685,
+      "training_cpu_ns": 1907382550,
+      "ranking_wall_ns": 152305822,
+      "model_bytes": 35124,
+      "model_sha256": "6e225d68c4d33f3d96c03cf66b990318d31e2cbc553e1cadc326c79b148994af",
+      "mean_targets": [
+        0.9609375,
+        0.947495,
+        0.947495,
+        0.29158843,
+        0.99609375,
+        0.19875911,
+        0.00390625
+      ]
+    },
+    {
+      "treatment": "bootstrap",
+      "selected": 256,
+      "training_wall_ns": 836,
+      "training_cpu_ns": 2293,
+      "ranking_wall_ns": 140872047,
+      "model_bytes": 18186,
+      "model_sha256": "f83e8c06f308307f5ed69235fc5b065a75b3f67104a9b737e07ca0fd76f5fb79",
+      "mean_targets": [
+        0.1171875,
+        0.04168741,
+        0.04168741,
+        0.049598992,
+        0.984375,
+        0.41558924,
+        0.01171875
+      ]
+    },
+    {
+      "treatment": "nomodel",
+      "selected": 256,
+      "training_wall_ns": 1050,
+      "training_cpu_ns": 2647,
+      "ranking_wall_ns": 53669894,
+      "model_bytes": 18186,
+      "model_sha256": "f83e8c06f308307f5ed69235fc5b065a75b3f67104a9b737e07ca0fd76f5fb79",
+      "mean_targets": [
+        0.0625,
+        0.034729782,
+        0.034729782,
+        0.0033646605,
+        0.97265625,
+        0.41738972,
+        0.0234375
+      ]
+    },
+    {
+      "treatment": "noconsolidation",
+      "selected": 1012,
+      "training_wall_ns": 1908972214,
+      "training_cpu_ns": 1908933885,
+      "ranking_wall_ns": 152199309,
+      "model_bytes": 35134,
+      "model_sha256": "43f989f4e17b7c19ead2035140e7c0d16df1636a4db931688983362dbe97a88e",
+      "mean_targets": [
+        0.9609375,
+        0.947495,
+        0.947495,
+        0.0291412,
+        0.99609375,
+        0.19875911,
+        0.00390625
+      ]
+    },
+    {
+      "treatment": "immediateonly",
+      "selected": 1191,
+      "training_wall_ns": 1906415787,
+      "training_cpu_ns": 1906377943,
+      "ranking_wall_ns": 153855662,
+      "model_bytes": 35200,
+      "model_sha256": "51bcd3872260121cb7e1a21ffebe96c616f7fa9e5d06ab9509d21219ee2509db",
+      "mean_targets": [
+        0.9609375,
+        0.02101542,
+        0.02101542,
+        0.0291412,
+        0.921875,
+        0.19875911,
+        0.0078125
+      ]
+    }
+  ],
+  "baselines": [
+    {
+      "baseline": "uniform",
+      "selected": 256,
+      "mean_targets": [
+        0.0625,
+        0.034729782,
+        0.034729782,
+        0.0033646605,
+        0.97265625,
+        0.41738972,
+        0.0234375
+      ]
+    },
+    {
+      "baseline": "dependency-light",
+      "selected": 256,
+      "mean_targets": [
+        0.46484375,
+        0.17349306,
+        0.17349306,
+        0.2650834,
+        0.9453125,
+        0.19674389,
+        0.0390625
+      ]
+    },
+    {
+      "baseline": "historical-reuse",
+      "selected": 256,
+      "mean_targets": [
+        0.98828125,
+        0.9541667,
+        0.9541667,
+        0.063541666,
+        0.98828125,
+        0.32181108,
+        0.0078125
+      ]
+    }
+  ],
+  "virtual_best_mean_targets": [
+    0.98828125,
+    0.9541667,
+    0.9541667,
+    0.2650834,
+    0.98828125,
+    0.19674389,
+    0.0078125
+  ],
+  "relationships": {
+    "attempted": 48,
+    "certified": 43,
+    "rejected_or_unavailable": 5,
+    "exact": 1,
+    "definitional": 26,
+    "specialization": 8,
+    "derivation": 8,
+    "family_collapse": 5,
+    "corpus_compression": 2,
+    "proof_nodes_removed": 1448
+  },
+  "migration": {
+    "attempted": 32,
+    "migrated": 17,
+    "failed": 15,
+    "failures": [
+      "Commute.exp_right: claim is not a well-formed type",
+      "AddGroupNorm.add_apply: claim is not a well-formed type",
+      "HahnSeries.add_coeff': claim is not a well-formed type",
+      "Sigma.le_def: claim is not a well-formed type",
+      "MeasureTheory.SimpleFunc.eapprox.eq_1: claim is not a well-formed type",
+      "AlgebraicGeometry.Scheme.Pullback.gluedLiftPullbackMap_snd: candidate or proof did not kernel-check",
+      "Option.pmap_none: claim is not a well-formed type",
+      "Mathlib.Data.Finset.Image._auxLemma.21: claim is not a well-formed type",
+      "Finset.sup'_mul_le_mul_sup'_of_nonneg: claim is not a well-formed type",
+      "integralClosure.proof_3: claim is not a well-formed type",
+      "MeasureTheory.SignedMeasure.haveLebesgueDecomposition_mk: unsafe, partial, sorry, or unknown dependency",
+      "Pi.single_mono: claim is not a well-formed type",
+      "ContinuousMap.instNonAssocRingOfTopologicalRing.proof_8: claim is not a well-formed type",
+      "Equiv.Perm.decomposeFin_symm_of_refl: candidate or proof did not kernel-check",
+      "unitary.spectrum.unitary_conjugate: claim is not a well-formed type"
+    ]
+  },
+  "verifier_requests": 80,
+  "verifier_resident_upper_bound_bytes": 34359738368,
+  "host": {
+    "git_revision": "08721479b2f6be635d2e413f388fcf93655e6fa1",
+    "git_dirty": false,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-unknown-linux-gnu\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-unknown-linux-gnu\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0-DEV (sys:0.4.88+curl-8.20.0 vendored ssl:OpenSSL/3.6.2)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Debian 13.0.0 (trixie) [64-bit]",
+    "build_profile": "release",
+    "rustflags": "",
+    "target_features": "neon",
+    "target_arch": "aarch64",
+    "target_os": "linux",
+    "cpu_description": "CPU implementer=0x41; CPU architecture=8; CPU part=0xd4f; CPU variant=0x0; CPU revision=1",
+    "available_parallelism": 8
+  },
+  "protocol_deviations": [],
+  "content_sha256": "7b255c00df890f39e63e7592c16cb94f1b64731f0060de9f05133ce5fedfb877"
+}

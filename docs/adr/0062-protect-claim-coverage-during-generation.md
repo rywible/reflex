@@ -1,0 +1,11 @@
+# Protect claim coverage during generation
+
+When a bounded primitive-Operator choice window can represent every correctness claim on the Search Frontier, the Runtime gives every represented claim a deterministic share of that Operator's generation capacity before unused capacity is redistributed among claims that can use it. When the window cannot represent the complete claim set, ordinary enumeration order retains authority rather than granting an arbitrary prefix special treatment. Allocation remains a separate decision and continues to apply the protected exploration policy from ADR 0058.
+
+A retained Lean Domain Bundle made less primitive generation capacity available than a fresh Bootstrap run. Prefix-bounded Operator enumeration then filled the proof-substitution window with the first two claims and never generated the third claim's known strict Proof Collapse. Protected Allocation could not recover a Candidate that did not exist, and Full appeared worse than Bootstrap for a reason unrelated to learned ranking. Claim-complete generation makes the candidate set robust to bounded capacity without scalarizing Optimization Goals or changing the public Improvement Session and Domain Definition interfaces.
+
+## Consequences
+
+Domains keep their specialized enumeration implementation and representation. The Runtime invokes both legal-application enumeration and Candidate application through a private water-filling module, potentially repeating bounded work for claims that absorb unused capacity; deterministic domain enumeration and application are therefore required, as they already are for restart-complete Experience attribution. Before generation, the Runtime reserves a conservative minimum of eight KiB per simultaneous choice. Repeated passes drop a claim's old buffer before allocating its exact expanded capacity, and the module reports its working metadata for subsequent peak accounting. The bounded repetition trades some generation CPU for complete claim opportunity and full use of available capacity.
+
+Generation order is part of restart semantics. Runtime revision 7 rejects older bundles instead of resuming them under a different Candidate policy, and internal Lean development report schemas advance with the new treatment.

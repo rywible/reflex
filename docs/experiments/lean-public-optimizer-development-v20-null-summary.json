@@ -1,0 +1,37 @@
+{
+  "schema": "reflex-lean-public-optimizer-development-v20-null-summary-v1",
+  "status": "development-only; activation-null; treatments not run",
+  "training_artifacts": 32,
+  "heldout_artifacts": 8,
+  "training": {
+    "completion": "resource-envelope-exhausted",
+    "verification_requests": 80,
+    "candidate_verification_requests": 48,
+    "candidate_fates": 377,
+    "candidates_generated": 418,
+    "candidates_selected": 56,
+    "accepted_attempts": 3,
+    "refuted_attempts": 45,
+    "artifacts_admitted": 3,
+    "model_generation": 0,
+    "elapsed_seconds": 48.516367914,
+    "cpu_seconds": 48.15,
+    "peak_resident_bytes": 19322248104,
+    "durable_bytes": 89165570
+  },
+  "registered_envelope": {
+    "runtime_resident_bytes": 34359738368,
+    "durable_bytes": 1073741824,
+    "elapsed_seconds": 600,
+    "verification_requests": 1024
+  },
+  "candidate_fates": {
+    "novelty_filtered": 66,
+    "policy_deferred": 263
+  },
+  "training_bundle_sha256": "170dcecddfd2acc1b9bafb602a59c3a5ab48bd477aca0e0673e2786631dfc945",
+  "preflight_file_sha256": "019a327edbe9914d9112067ae492d42104a410d85067c762c6b426284f89c567",
+  "preflight_content_sha256": "ab61f7a4209720db90c34ad46b7a8d84140cd98fc706e7f7ee9672e4fbb370f7",
+  "diagnosis": "bounded primitive enumeration discarded alternatives after the first materialized page, while generation also compounded a large deferred inventory before its next Verification cohort",
+  "decision": "fix restart-complete primitive pagination and bounded inventory refill before rerunning breadth"
+}
