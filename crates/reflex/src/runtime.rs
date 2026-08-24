@@ -58,6 +58,7 @@ mod epoch;
 mod experience;
 mod generation;
 mod goals;
+mod proposal;
 mod scheduler;
 mod shadow;
 
@@ -71,6 +72,10 @@ use experience::{
     encoded_candidate_fates_len, encoded_entry_len,
 };
 use goals::GoalEvaluator;
+use proposal::{
+    DerivedOperatorEngine, DerivedOperatorRequest, ProposalEngine, ProposalParents,
+    StructuredRewriteEngine, StructuredRewriteRequest,
+};
 use scheduler::{ClaimVerificationRequest, ScheduleError, Scheduler};
 
 const OPERATOR_FEATURE_START: usize = 5;
@@ -103,6 +108,7 @@ struct RecoveredBundle<D: DomainDefinition> {
     legacy_learning: Option<LearningState>,
     legacy_runtime_policy: Option<RuntimePolicyState>,
     intelligence: Option<IntelligenceCore>,
+    authenticated_intelligence_identity: Option<[u8; 32]>,
     resident_bytes: u64,
 }
 
@@ -122,6 +128,7 @@ impl<D: DomainDefinition> Default for RecoveredBundle<D> {
             legacy_learning: None,
             legacy_runtime_policy: None,
             intelligence: None,
+            authenticated_intelligence_identity: None,
             resident_bytes: 0,
         }
     }
@@ -232,6 +239,14 @@ impl PendingParent {
     fn resident_bytes(&self) -> u64 {
         (self.primitive_offsets.capacity() as u64).saturating_mul(std::mem::size_of::<u64>() as u64)
     }
+}
+
+fn pending_parent_vector_resident_bytes(parents: &[PendingParent], vector_capacity: usize) -> u64 {
+    u64::try_from(vector_capacity.saturating_mul(std::mem::size_of::<PendingParent>()))
+        .unwrap_or(u64::MAX)
+        .saturating_add(parents.iter().fold(0_u64, |bytes, parent| {
+            bytes.saturating_add(parent.resident_bytes())
+        }))
 }
 
 #[derive(Clone, Copy)]
@@ -380,37 +395,6 @@ struct DeferredCandidate<D: DomainDefinition> {
     protected_derived: bool,
     action_decision: Option<DecisionId>,
     causal_parent_key: Option<ArtifactKey>,
-}
-
-struct GenerationParents<'a, D: DomainDefinition> {
-    artifacts: &'a [&'a D::Artifact],
-    frontier_indexes: &'a [usize],
-}
-
-impl<D: DomainDefinition> Copy for GenerationParents<'_, D> {}
-
-impl<D: DomainDefinition> Clone for GenerationParents<'_, D> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-struct PrimitiveGeneration<'a, D: DomainDefinition> {
-    parents: GenerationParents<'a, D>,
-    operator_offsets: &'a mut [u64],
-    limit: usize,
-    epoch: u64,
-    permitted_operators: Option<&'a [usize]>,
-}
-
-struct PrimitiveOperatorPage<'a, D: DomainDefinition> {
-    parents: GenerationParents<'a, D>,
-    locations: &'a [StructuralLocation],
-    descriptor:
-        &'a crate::domain::OperatorDescriptor<<D::Operators as OperatorAlgebra<D>>::Operator>,
-    offset: &'a mut u64,
-    limit: usize,
-    epoch: u64,
 }
 
 struct NovelCandidateBatch<D: DomainDefinition> {
@@ -1237,12 +1221,12 @@ where
     let recovered_stored = recovered_bundle.artifacts;
     let mut ledger = recovered_bundle.ledger;
     let legacy_knowledge = recovered_bundle.legacy_knowledge.take();
-    let migrated_standalone_knowledge = legacy_knowledge.is_some();
     let legacy_learning = recovered_bundle.legacy_learning.take();
     let migrated_legacy_learning = legacy_learning.is_some();
     let recovered_policy = recovered_bundle.legacy_runtime_policy.take();
     let migrated_standalone_policy = recovered_policy.is_some();
     let mut recovered_intelligence = recovered_bundle.intelligence.take();
+    let authenticated_intelligence_identity = recovered_bundle.authenticated_intelligence_identity;
     let mut runtime_policy = recovered_policy.as_ref().map_or_else(
         || {
             recovered_intelligence.as_ref().map_or_else(
@@ -1654,16 +1638,14 @@ where
             && revisions.runtime_policy
                 != recovered_intelligence_revisions
                     .map_or(expected.runtime_policy, |(_, policy, _)| policy);
-        // Legacy Intelligence bytes were already authenticated against the
-        // Revisions header before restore. Importing standalone Knowledge
-        // intentionally changes the canonical Core identity, so only that
-        // post-import identity comparison is inapplicable.
+        // The raw checkpoint was authenticated against the outer header before
+        // restore. Its canonical identity may change during format or
+        // standalone-state migration, so never compare the migrated identity
+        // with a header that committed the raw bytes.
         let intelligence_bad = !migrated_standalone_policy
-            && !migrated_standalone_knowledge
             && revisions.intelligence != [0; 32]
             && revisions.intelligence
-                != recovered_intelligence_revisions
-                    .map_or(expected.intelligence, |(_, _, identity)| identity);
+                != authenticated_intelligence_identity.unwrap_or(expected.intelligence);
         knowledge_bad || model_bad || policy_bad || intelligence_bad
     }) {
         return Err(SessionError::CorruptBundle);
@@ -2416,21 +2398,23 @@ where
             let before = candidates.len();
             let parent_artifacts = [*parent];
             let parent_indexes = [*source_index];
-            let primitive_bytes = append_primitive_candidates(
-                domain,
-                &mut PrimitiveGeneration {
-                    parents: GenerationParents {
-                        artifacts: &parent_artifacts,
-                        frontier_indexes: &parent_indexes,
+            let primitive_bytes = StructuredRewriteEngine
+                .propose(
+                    domain,
+                    &mut StructuredRewriteRequest {
+                        parents: ProposalParents {
+                            artifacts: &parent_artifacts,
+                            frontier_indexes: &parent_indexes,
+                        },
+                        operator_offsets: &mut progress.primitive_offsets,
+                        limit: parent_budget,
+                        epoch: candidate_epoch,
+                        permitted_operators: None,
                     },
-                    operator_offsets: &mut progress.primitive_offsets,
-                    limit: parent_budget,
-                    epoch: candidate_epoch,
-                    permitted_operators: None,
-                },
-                &mut operator_scratch,
-                &mut candidates,
-            )?;
+                    &mut operator_scratch,
+                    &mut candidates,
+                )?
+                .resident_bytes();
             remaining_primitive_budget =
                 remaining_primitive_budget.saturating_sub(candidates.len() - before);
             application_bytes = application_bytes.max(primitive_bytes);
@@ -2536,21 +2520,23 @@ where
                     );
                     let parent_artifacts = [&rejected_artifact];
                     let parent_indexes = [source_index];
-                    let primitive_bytes = append_primitive_candidates(
-                        domain,
-                        &mut PrimitiveGeneration {
-                            parents: GenerationParents {
-                                artifacts: &parent_artifacts,
-                                frontier_indexes: &parent_indexes,
+                    let primitive_bytes = StructuredRewriteEngine
+                        .propose(
+                            domain,
+                            &mut StructuredRewriteRequest {
+                                parents: ProposalParents {
+                                    artifacts: &parent_artifacts,
+                                    frontier_indexes: &parent_indexes,
+                                },
+                                operator_offsets: &mut repair_offsets,
+                                limit: remaining_action_budget.min(advisory_limit),
+                                epoch: candidate_epoch,
+                                permitted_operators: Some(&[operator_index]),
                             },
-                            operator_offsets: &mut repair_offsets,
-                            limit: remaining_action_budget.min(advisory_limit),
-                            epoch: candidate_epoch,
-                            permitted_operators: Some(&[operator_index]),
-                        },
-                        &mut operator_scratch,
-                        &mut candidates,
-                    )?;
+                            &mut operator_scratch,
+                            &mut candidates,
+                        )?
+                        .resident_bytes();
                     action_generated = candidates.len().saturating_sub(action_candidate_start);
                     action_resident = action_resident.max(primitive_bytes);
                 } else {
@@ -2575,21 +2561,23 @@ where
                         let before = candidates.len();
                         let parent_artifacts = [*parent];
                         let parent_indexes = [*source_index];
-                        let primitive_bytes = append_primitive_candidates(
-                            domain,
-                            &mut PrimitiveGeneration {
-                                parents: GenerationParents {
-                                    artifacts: &parent_artifacts,
-                                    frontier_indexes: &parent_indexes,
+                        let primitive_bytes = StructuredRewriteEngine
+                            .propose(
+                                domain,
+                                &mut StructuredRewriteRequest {
+                                    parents: ProposalParents {
+                                        artifacts: &parent_artifacts,
+                                        frontier_indexes: &parent_indexes,
+                                    },
+                                    operator_offsets: &mut progress.primitive_offsets,
+                                    limit: parent_budget,
+                                    epoch: candidate_epoch,
+                                    permitted_operators: Some(&[operator_index]),
                                 },
-                                operator_offsets: &mut progress.primitive_offsets,
-                                limit: parent_budget,
-                                epoch: candidate_epoch,
-                                permitted_operators: Some(&[operator_index]),
-                            },
-                            &mut operator_scratch,
-                            &mut candidates,
-                        )?;
+                                &mut operator_scratch,
+                                &mut candidates,
+                            )?
+                            .resident_bytes();
                         let generated = candidates.len().saturating_sub(before);
                         action_generated = action_generated.saturating_add(generated);
                         remaining_action_budget = remaining_action_budget.saturating_sub(generated);
@@ -2665,18 +2653,22 @@ where
             let source_index = generation_parent_indexes[parent_position];
             let parent_artifacts = [parent];
             let parent_indexes = [source_index];
-            let (derived_bytes, _derived_truncated) = append_derived_candidates(
+            let derived_batch = DerivedOperatorEngine.propose(
                 domain,
-                &GenerationParents {
-                    artifacts: &parent_artifacts,
-                    frontier_indexes: &parent_indexes,
+                &mut DerivedOperatorRequest {
+                    parents: ProposalParents {
+                        artifacts: &parent_artifacts,
+                        frontier_indexes: &parent_indexes,
+                    },
+                    knowledge: &pinned_knowledge,
+                    limit: parent_budget,
+                    epoch: candidate_epoch,
                 },
-                &pinned_knowledge,
                 &mut operator_scratch,
-                parent_budget,
-                candidate_epoch,
                 &mut candidates,
             )?;
+            let derived_bytes = derived_batch.resident_bytes();
+            let _derived_truncated = derived_batch.truncated();
             remaining_derived_budget =
                 remaining_derived_budget.saturating_sub(candidates.len() - before);
             application_bytes = application_bytes.max(derived_bytes);
@@ -2690,11 +2682,8 @@ where
             // recovery resumes at selection instead of rerunning an action.
             let (canonical_bytes, canonical_scratch) =
                 candidate_canonical_materialization_bound(domain, &candidates)?;
-            let published_progress_bytes = vector_bytes(&pending_parents).saturating_add(
-                pending_parents.iter().fold(0_u64, |bytes, parent| {
-                    bytes.saturating_add(parent.resident_bytes())
-                }),
-            );
+            let published_progress_bytes =
+                pending_parent_vector_resident_bytes(&pending_parents, pending_parents.capacity());
             let action_materialization_live = worker_resident_bytes
                 .saturating_add(resident_state_bytes(
                     &known,
@@ -2753,7 +2742,11 @@ where
                     domain,
                     &candidates,
                     &pending_parents,
-                ));
+                ))
+                // Publication encodes the progressed clone while the original
+                // pending-parent vector remains live until the durability
+                // barrier commits. Charge both complete nested capacities.
+                .saturating_add(published_progress_bytes);
             let published = publish_intelligence_transition(
                 action_transition,
                 &mut intelligence,
@@ -3688,9 +3681,16 @@ where
                         resident_before_epoch,
                         checkpoint.len() as u64,
                     )?;
+                    let comparison_resident_bound = standard_plan
+                        .as_ref()
+                        .into_iter()
+                        .chain(exploratory_plan.as_ref())
+                        .map(PreparedNativeEcologyPlan::comparison_resident_bytes)
+                        .max()
+                        .unwrap_or(0);
                     let comparison_resources = ResourceVector::new(
                         comparison_allowance.cpu_time_ns,
-                        training_resident,
+                        comparison_resident_bound,
                         0,
                         comparison_allowance.elapsed_time_ns,
                         0,
@@ -3718,7 +3718,7 @@ where
                     if operational_specs.is_empty()
                         || comparison_allowance.cpu_time_ns == 0
                         || comparison_allowance.elapsed_time_ns == 0
-                        || comparison_allowance.resident_bytes < training_resident
+                        || comparison_allowance.resident_bytes < comparison_resident_bound
                     {
                         return Ok(None);
                     }
@@ -3727,7 +3727,7 @@ where
                         &mut intelligence_market,
                     )
                     .map_err(map_intelligence_error)?;
-                    let comparisons = prepared
+                    let mut comparisons = prepared
                         .allocate(
                             &intelligence,
                             &intelligence_market,
@@ -3736,80 +3736,86 @@ where
                             1,
                             &mut intelligence_portfolio,
                         )
-                        .map_err(map_intelligence_error)?;
-                    let mut chosen = None;
-                    for comparison in comparisons.into_iter() {
-                        let OperationalAction::CompareRevision { challenger } = comparison.action()
-                        else {
-                            return Err(SessionError::CorruptBundle);
-                        };
-                        let selected_plan = standard_plan
-                            .as_ref()
-                            .filter(|plan| plan.identity() == challenger.identity())
-                            .or_else(|| {
-                                exploratory_plan
-                                    .as_ref()
-                                    .filter(|plan| plan.identity() == challenger.identity())
-                            })
-                            .ok_or(SessionError::CorruptBundle)?;
-                        let started = std::time::Instant::now();
-                        let cpu_before = resource_meter
-                            .current_cpu()
-                            .map_err(|()| SessionError::Resource)?;
-                        let reproduced = intelligence
-                            .reproduce_prepared_native_training(
-                                SettlementFrame::observations(
-                                    &operational_receipts[..training_receipt_prefix],
-                                    &operational_settlements[..training_settlement_prefix],
-                                    training_consequences,
-                                    &[],
-                                ),
-                                selected_plan,
-                            )
-                            .map_err(map_intelligence_error)?;
-                        let comparison_resident = selected_plan.comparison_resident_bytes();
-                        let cpu = resource_meter
-                            .current_cpu()
-                            .map_err(|()| SessionError::Resource)?
-                            .saturating_sub(cpu_before);
-                        let (receipt, settlement) = comparison
-                            .settle(
-                                &intelligence,
-                                if reproduced {
-                                    InvestmentOutcome::Completed
-                                } else {
-                                    InvestmentOutcome::Failed
-                                },
-                                ResourceVector::new(
-                                    u64::try_from(cpu.as_nanos()).unwrap_or(u64::MAX),
-                                    comparison_resident,
-                                    0,
-                                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                                    0,
-                                ),
-                            )
-                            .map_err(map_intelligence_error)?;
-                        if reproduced {
-                            chosen = Some(challenger.identity());
-                        }
-                        operational_receipts.push(receipt);
-                        operational_settlements.push(settlement);
+                        .map_err(map_intelligence_error)?
+                        .into_iter();
+                    let Some(comparison) = comparisons.next() else {
+                        return Ok(None);
+                    };
+                    if comparisons.next().is_some() {
+                        return Err(SessionError::CorruptBundle);
                     }
-                    if chosen
-                        == standard_plan
-                            .as_ref()
-                            .map(PreparedNativeEcologyPlan::identity)
+                    let OperationalAction::CompareRevision { challenger } = comparison.action()
+                    else {
+                        return Err(SessionError::CorruptBundle);
+                    };
+                    // Selection is authoritative before reproduction. Move the
+                    // selected plan out and drop every unselected output so the
+                    // reproduction peak contains exactly one retained plan,
+                    // one complete scratch arena, and one possible output.
+                    let selected_plan = if standard_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.identity() == challenger.identity())
                     {
-                        standard_plan
-                    } else if chosen
-                        == exploratory_plan
-                            .as_ref()
-                            .map(PreparedNativeEcologyPlan::identity)
+                        let selected = standard_plan.take();
+                        drop(exploratory_plan.take());
+                        selected
+                    } else if exploratory_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.identity() == challenger.identity())
                     {
-                        exploratory_plan
+                        let selected = exploratory_plan.take();
+                        drop(standard_plan.take());
+                        selected
                     } else {
-                        None
+                        return Err(SessionError::CorruptBundle);
                     }
+                    .ok_or(SessionError::CorruptBundle)?;
+                    let comparison_resident = selected_plan.comparison_resident_bytes();
+                    if !resource_meter.reserve(
+                        ResidentReservation::live(resident_before_epoch)
+                            .with_transient(comparison_resident),
+                    ) {
+                        return Ok(None);
+                    }
+                    let started = std::time::Instant::now();
+                    let cpu_before = resource_meter
+                        .current_cpu()
+                        .map_err(|()| SessionError::Resource)?;
+                    let reproduced = intelligence
+                        .reproduce_prepared_native_training(
+                            SettlementFrame::observations(
+                                &operational_receipts[..training_receipt_prefix],
+                                &operational_settlements[..training_settlement_prefix],
+                                training_consequences,
+                                &[],
+                            ),
+                            &selected_plan,
+                        )
+                        .map_err(map_intelligence_error)?;
+                    let cpu = resource_meter
+                        .current_cpu()
+                        .map_err(|()| SessionError::Resource)?
+                        .saturating_sub(cpu_before);
+                    let (receipt, settlement) = comparison
+                        .settle(
+                            &intelligence,
+                            if reproduced {
+                                InvestmentOutcome::Completed
+                            } else {
+                                InvestmentOutcome::Failed
+                            },
+                            ResourceVector::new(
+                                u64::try_from(cpu.as_nanos()).unwrap_or(u64::MAX),
+                                comparison_resident,
+                                0,
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                0,
+                            ),
+                        )
+                        .map_err(map_intelligence_error)?;
+                    operational_receipts.push(receipt);
+                    operational_settlements.push(settlement);
+                    reproduced.then_some(selected_plan)
                 } else {
                     None
                 }
@@ -5471,7 +5477,7 @@ fn run_knowledge_campaign_arm<D: DomainDefinition>(
         }
         let progress = &mut pending[pending_index];
         let parent = frontier[parent_index].0.artifact();
-        let parents = GenerationParents {
+        let parents = ProposalParents {
             artifacts: &[parent],
             frontier_indexes: &[parent_index],
         };
@@ -5484,9 +5490,9 @@ fn run_knowledge_campaign_arm<D: DomainDefinition>(
         };
         let primitive_budget = generation_limit.saturating_sub(derived_budget);
         let mut candidates = Vec::new();
-        append_primitive_candidates(
+        StructuredRewriteEngine.propose(
             domain,
-            &mut PrimitiveGeneration {
+            &mut StructuredRewriteRequest {
                 parents,
                 operator_offsets: &mut progress.primitive_offsets,
                 limit: primitive_budget,
@@ -5497,13 +5503,15 @@ fn run_knowledge_campaign_arm<D: DomainDefinition>(
             &mut candidates,
         )?;
         if derived_budget > 0 {
-            append_derived_candidates(
+            DerivedOperatorEngine.propose(
                 domain,
-                &parents,
-                installed_knowledge,
+                &mut DerivedOperatorRequest {
+                    parents,
+                    knowledge: installed_knowledge,
+                    limit: derived_budget,
+                    epoch,
+                },
                 &mut operator_scratch,
-                derived_budget,
-                epoch,
                 &mut candidates,
             )?;
             progress.derived_sampled = true;
@@ -6582,272 +6590,6 @@ fn reproduce_consolidation_witness<D: DomainDefinition>(
         }
     }
     Ok(None)
-}
-
-fn append_primitive_candidates<D: DomainDefinition>(
-    domain: &D,
-    request: &mut PrimitiveGeneration<'_, D>,
-    scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
-    output: &mut Vec<ProposedCandidate<D>>,
-) -> Result<u64, SessionError<D::Error>> {
-    let mut remaining = request.limit;
-    let catalog = domain.operators().catalog();
-    assert_eq!(
-        request.operator_offsets.len(),
-        catalog.len(),
-        "pending primitive cursor must match the installed Operator catalog"
-    );
-    let locations = root_locations(domain, request.parents.artifacts);
-    let mut application_bytes = vector_bytes(&locations);
-    for (operator_index, descriptor) in catalog.iter().enumerate() {
-        if request
-            .permitted_operators
-            .is_some_and(|permitted| !permitted.contains(&operator_index))
-        {
-            continue;
-        }
-        if remaining == 0 {
-            break;
-        }
-        let offset = request.operator_offsets[operator_index];
-        if offset == ENUMERATION_COMPLETE {
-            continue;
-        }
-        let incomplete_operators = request
-            .operator_offsets
-            .iter()
-            .enumerate()
-            .skip(operator_index)
-            .filter(|(index, offset)| {
-                **offset != ENUMERATION_COMPLETE
-                    && request
-                        .permitted_operators
-                        .is_none_or(|permitted| permitted.contains(index))
-            })
-            .count();
-        let operator_limit = remaining.div_ceil(incomplete_operators);
-        let before = output.len();
-        application_bytes = application_bytes.max(append_primitive_operator_page(
-            domain,
-            &mut PrimitiveOperatorPage {
-                parents: request.parents,
-                locations: &locations,
-                descriptor,
-                offset: &mut request.operator_offsets[operator_index],
-                limit: operator_limit,
-                epoch: request.epoch,
-            },
-            scratch,
-            output,
-        )?);
-        remaining = remaining.saturating_sub(output.len().saturating_sub(before));
-    }
-    Ok(application_bytes)
-}
-
-fn append_primitive_operator_page<D: DomainDefinition>(
-    domain: &D,
-    page: &mut PrimitiveOperatorPage<'_, D>,
-    scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
-    output: &mut Vec<ProposedCandidate<D>>,
-) -> Result<u64, SessionError<D::Error>> {
-    let skip = usize::try_from(*page.offset).map_err(|_| SessionError::CorruptBundle)?;
-    let mut applications = Vec::new();
-    let mut application_writer =
-        ApplicationWriter::with_window(&mut applications, skip, page.limit);
-    domain
-        .operators()
-        .enumerate_legal(
-            OperatorEnumerationBatch::new(
-                page.parents.artifacts,
-                page.locations,
-                std::slice::from_ref(&page.descriptor.operator()),
-            ),
-            &mut application_writer,
-            scratch,
-        )
-        .map_err(SessionError::Domain)?;
-    assert!(
-        application_writer.consumed_prefix(),
-        "OperatorAlgebra::enumerate_legal ended before the retained Primitive Enumeration Cursor"
-    );
-    *page.offset = if application_writer.overflowed() {
-        page.offset
-            .checked_add(u64::try_from(applications.len()).map_err(|_| SessionError::Resource)?)
-            .ok_or(SessionError::Resource)?
-    } else {
-        ENUMERATION_COMPLETE
-    };
-    let mut operator_candidates = Vec::new();
-    let mut candidate_writer =
-        CandidateWriter::with_limit(&mut operator_candidates, applications.len());
-    domain
-        .operators()
-        .apply_batch(&applications, &mut candidate_writer, scratch)
-        .map_err(SessionError::Domain)?;
-    assert!(
-        !candidate_writer.overflowed() && operator_candidates.len() == applications.len(),
-        "OperatorAlgebra::apply_batch must emit exactly one Candidate per legal Application"
-    );
-    let resident = vector_bytes(&applications).max(vector_bytes(&operator_candidates));
-    let operator_features = operator_feature_values(page.descriptor.symbol().as_str());
-    for mut candidate in operator_candidates {
-        let parent = page
-            .parents
-            .artifacts
-            .get(candidate.source_index)
-            .ok_or(SessionError::InvalidSeed)?;
-        candidate.source_index = *page
-            .parents
-            .frontier_indexes
-            .get(candidate.source_index)
-            .ok_or(SessionError::InvalidSeed)?;
-        let features = opportunity_features(
-            domain,
-            StructuralSummary {
-                node_count: structural_node_count(domain, parent),
-            },
-            &candidate.artifact,
-            operator_features,
-            page.epoch,
-            candidate.proposal_features,
-        );
-        output.push(ProposedCandidate::generated(
-            candidate,
-            page.descriptor.symbol().as_str().as_bytes().to_vec(),
-            features,
-            page.epoch,
-            page.limit,
-            false,
-        ));
-    }
-    Ok(resident)
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "Derived Operator expansion keeps its bounded multi-step provenance in one search transaction"
-)]
-fn append_derived_candidates<D: DomainDefinition>(
-    domain: &D,
-    parents: &GenerationParents<'_, D>,
-    knowledge: &KnowledgeRevision,
-    scratch: &mut <D::Operators as OperatorAlgebra<D>>::Scratch,
-    remaining_verifications: usize,
-    epoch: u64,
-    output: &mut Vec<ProposedCandidate<D>>,
-) -> Result<(u64, bool), SessionError<D::Error>> {
-    const MAX_DERIVED_CANDIDATES_PER_OPERATOR: usize = 1_024;
-
-    let mut application_bytes = 0_u64;
-    let mut truncated = false;
-    let limit = remaining_verifications.min(MAX_DERIVED_CANDIDATES_PER_OPERATOR);
-    if limit == 0 {
-        return Ok((0, false));
-    }
-    let mut emitted = 0_usize;
-    for derived in knowledge
-        .operators()
-        .iter()
-        .filter(|operator| operator.active())
-    {
-        let operator_limit = limit.saturating_sub(emitted);
-        if operator_limit == 0 {
-            break;
-        }
-        let mut current = Vec::<Candidate<D>>::new();
-        for (step_index, step) in derived.steps().iter().enumerate() {
-            let Some(descriptor) = domain
-                .operators()
-                .catalog()
-                .iter()
-                .find(|descriptor| descriptor.symbol().as_str().as_bytes() == step)
-            else {
-                return Err(SessionError::CorruptBundle);
-            };
-            let stage_parents = if step_index == 0 {
-                parents.artifacts[..parents.artifacts.len().min(operator_limit)].to_vec()
-            } else {
-                current
-                    .iter()
-                    .map(|candidate| &candidate.artifact)
-                    .collect()
-            };
-            let locations = root_locations(domain, &stage_parents);
-            let mut applications = Vec::new();
-            let mut application_writer =
-                ApplicationWriter::with_limit(&mut applications, operator_limit);
-            domain
-                .operators()
-                .enumerate_legal(
-                    OperatorEnumerationBatch::new(
-                        &stage_parents,
-                        &locations,
-                        std::slice::from_ref(&descriptor.operator()),
-                    ),
-                    &mut application_writer,
-                    scratch,
-                )
-                .map_err(SessionError::Domain)?;
-            truncated |= application_writer.overflowed();
-            application_bytes = application_bytes.saturating_add(vector_bytes(&applications));
-            let mut next = Vec::new();
-            let mut candidate_writer = CandidateWriter::with_limit(&mut next, operator_limit);
-            domain
-                .operators()
-                .apply_batch(&applications, &mut candidate_writer, scratch)
-                .map_err(SessionError::Domain)?;
-            assert!(
-                !candidate_writer.overflowed() && next.len() == applications.len(),
-                "OperatorAlgebra::apply_batch must emit exactly one Candidate per legal Application"
-            );
-            if step_index > 0 {
-                for candidate in &mut next {
-                    let Some(parent) = current.get(candidate.source_index) else {
-                        return Err(SessionError::CorruptBundle);
-                    };
-                    candidate.source_index = parent.source_index;
-                }
-            }
-            current = next;
-            if current.is_empty() {
-                break;
-            }
-        }
-        let symbol = std::str::from_utf8(derived.symbol())
-            .expect("canonical Derived Operator symbols are UTF-8");
-        let operator_features = operator_feature_values(symbol);
-        emitted = emitted.saturating_add(current.len());
-        for mut candidate in current {
-            let parent = parents
-                .artifacts
-                .get(candidate.source_index)
-                .ok_or(SessionError::CorruptBundle)?;
-            candidate.source_index = *parents
-                .frontier_indexes
-                .get(candidate.source_index)
-                .ok_or(SessionError::CorruptBundle)?;
-            let features = opportunity_features(
-                domain,
-                StructuralSummary {
-                    node_count: structural_node_count(domain, parent),
-                },
-                &candidate.artifact,
-                operator_features,
-                epoch,
-                candidate.proposal_features,
-            );
-            output.push(ProposedCandidate::generated(
-                candidate,
-                derived.symbol().to_vec(),
-                features,
-                epoch,
-                operator_limit,
-                derived.protected_exploration(),
-            ));
-        }
-    }
-    Ok((application_bytes, truncated))
 }
 
 #[expect(
@@ -8663,6 +8405,7 @@ fn decode_bundle<D: DomainDefinition>(
         legacy_knowledge,
         legacy_learning,
         legacy_runtime_policy,
+        authenticated_intelligence_identity: intelligence.as_ref().map(|_| revisions.intelligence),
         intelligence,
         resident_bytes: decoded_resident_bytes,
     })
@@ -10146,11 +9889,12 @@ mod tests {
         goal_preferred_eligible_index, knowledge_campaign_request_limit,
         knowledge_verification_batch_fits, merge_intelligence_allocations,
         moved_tail_transaction_peak, observation_resident_fits_bound, operational_spec_limit,
-        operator_feature_values, policy_proposal_graph_resident_bytes,
-        primitive_action_parent_eligible, proportional_budget, protected_origin_keys,
-        read_fixed_source, recovery_after_admission_bound, run_if_verification_fits,
-        runtime_policy_trial_sequence, semantic_consequence_decision, shadow_elapsed_ns,
-        sort_prefix_by, verification_kernel_usage, verification_obligation_resources,
+        operator_feature_values, pending_parent_vector_resident_bytes,
+        policy_proposal_graph_resident_bytes, primitive_action_parent_eligible,
+        proportional_budget, protected_origin_keys, read_fixed_source,
+        recovery_after_admission_bound, run_if_verification_fits, runtime_policy_trial_sequence,
+        semantic_consequence_decision, shadow_elapsed_ns, sort_prefix_by,
+        verification_kernel_usage, verification_obligation_resources,
     };
     #[cfg(feature = "internal-experiments")]
     use super::{
@@ -10160,6 +9904,7 @@ mod tests {
     use crate::intelligence::{AllocationSource, DecisionId, ResourceVector, SpecialistRevisionId};
     use crate::learning::{FEATURE_COUNT, Features};
     use crate::policy::RuntimePolicyState;
+    use crate::resource::ResidentReservation;
     use crate::{
         ExternalVerificationUsage, ProposalFeatures, VerificationBatchReport,
         VerificationWorkerRequirements,
@@ -10188,6 +9933,31 @@ mod tests {
         assert!(observation_resident_fits_bound(7, 8));
         assert!(observation_resident_fits_bound(8, 8));
         assert!(!observation_resident_fits_bound(9, 8));
+    }
+
+    #[test]
+    fn action_publication_peak_retains_original_and_large_progress_clone() {
+        let parents = (0_u8..16)
+            .map(|identity| PendingParent::new(crate::ArtifactKey([identity; 32]), 1_024, true))
+            .collect::<Vec<_>>();
+        let one_progress_vector =
+            pending_parent_vector_resident_bytes(&parents, parents.capacity());
+        let publication_overlap = one_progress_vector.saturating_mul(2);
+
+        assert!(one_progress_vector > 16 * 1_024 * std::mem::size_of::<u64>() as u64);
+        assert_eq!(
+            publication_overlap,
+            one_progress_vector.saturating_add(one_progress_vector),
+            "the original all-selected progress vector and encoded progressed clone coexist until the durability barrier"
+        );
+        assert_eq!(
+            ResidentReservation::live(one_progress_vector)
+                .with_transient(one_progress_vector)
+                .peak_bytes(),
+            publication_overlap,
+            "the exact publication reservation admits both vectors without hidden headroom"
+        );
+        assert!(publication_overlap > one_progress_vector);
     }
 
     #[test]

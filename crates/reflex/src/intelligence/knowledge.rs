@@ -1322,6 +1322,15 @@ impl<'a> KnowledgeCompilerView<'a> {
 }
 
 impl KnowledgeCompiler {
+    pub(super) fn active_revision_resident_bytes(&self) -> u64 {
+        self.active.resident_bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_active_for_test(&mut self, active: KnowledgeState) {
+        self.active = active;
+    }
+
     #[cfg(feature = "internal-experiments")]
     pub(super) fn without_derived_operators_for_experiment(&self) -> Self {
         Self {

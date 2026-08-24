@@ -2777,6 +2777,14 @@ mod tests {
             )
             .unwrap()
             .expect("the newest completed cohort creates a concrete challenger");
+        assert_eq!(
+            prepared.comparison_resident_bytes(),
+            prepared
+                .resident_bytes()
+                .saturating_add(prepared.scratch_bytes())
+                .saturating_add(NativeTrainingBudget::maximum_output_bytes()),
+            "comparison retains one selected plan beside the complete reproduction scratch and output"
+        );
         let mut mismatched = settlements.clone();
         mismatched[0] = InvestmentSettlement::new(
             receipts[0].decision(),

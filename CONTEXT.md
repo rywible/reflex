@@ -188,6 +188,10 @@ _Avoid_: Toy example, benchmark fixture, application integration
 A domain-supplied transformation that proposes Candidates from existing search state.
 _Avoid_: Derived Operator, verifier, learned policy
 
+**Proposal Engine**:
+A private Runtime search Module that turns eligible Artifacts and bounded engine-specific progress into Candidates while reporting proposal provenance and resource demand. Proposal Engines may require particular Domain capabilities, but they never perform Verification, Admission, scheduling, or publication.
+_Avoid_: Domain Definition, Verification Kernel, Candidate ranker, Runtime Controller
+
 **Primitive Enumeration Cursor**:
 The Runtime-owned, restart-complete position of one pending Artifact within each Primitive Operator's deterministic legal-Application order. It lets bounded Verification Cohorts page through a search space without losing later alternatives or requiring Domain Definitions to manage recovery state.
 _Avoid_: Candidate queue, learned rank, Domain-owned continuation token

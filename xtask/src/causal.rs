@@ -1642,7 +1642,7 @@ fn validate_treatment_bundle(path: &Path) -> Result<(), AnyError> {
     improve(
         BitVecDomain::unary_u8(),
         request(
-            vec![Expression::input()],
+            training_seeds(),
             1_000_000,
             BundlePlan::Resume {
                 source: target.clone(),

@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -35,9 +35,10 @@ use super::types::{
     IntelligenceError, IntelligenceLimits, InvestmentId, OpportunityId, ResourceVector, RoleId,
     SubjectId,
 };
-use crate::knowledge::ConsolidationChallenger;
 use crate::knowledge::{
-    ConsolidationProduct, DerivationObservation, KnowledgeRevision, KnowledgeState,
+    ConsolidationChallenger, ConsolidationObligation, ConsolidationProduct, DerivationObservation,
+    DerivedOperator, KnowledgeRevision, KnowledgeState, MAX_ACTIVE_ARTIFACTS,
+    MAX_DERIVED_OPERATORS,
 };
 use crate::learning::FtrlConversionView;
 use crate::policy::{
@@ -1759,43 +1760,91 @@ impl IntelligenceCore {
         shape: KnowledgeCompilationShape,
         root_count: usize,
     ) -> Result<u64, IntelligenceError> {
-        let observation_headers = shape
-            .observations
-            .checked_mul(std::mem::size_of::<DerivationObservation>() as u64)
-            .ok_or(IntelligenceError::ResourceOverflow)?;
-        let step_headers = shape
-            .steps
-            .checked_mul(std::mem::size_of::<Vec<u8>>() as u64)
-            .ok_or(IntelligenceError::ResourceOverflow)?;
-        let source = observation_headers
+        let observations = shape.observations;
+        let roots = u64::try_from(root_count).map_err(|_| IntelligenceError::ResourceOverflow)?;
+        let source = vector_capacity_bytes::<DerivationObservation>(observations)?
             .checked_add(shape.identity_bytes)
-            .and_then(|bytes| bytes.checked_add(step_headers))
+            .and_then(|bytes| {
+                bytes.checked_add(vector_capacity_bytes::<Vec<u8>>(shape.steps).ok()?)
+            })
             .and_then(|bytes| bytes.checked_add(shape.step_bytes))
             .ok_or(IntelligenceError::ResourceOverflow)?;
-        // `build_revision` retains accepted indexes and may clone one parent's
-        // expanded step sequence for every accepted child. Charging the full
-        // expanded step payload once per observation is conservative even
-        // when a large Derived Operator is reused by every child.
-        let discovered_sequences = step_headers
+
+        // Every accepted child may retain one independently allocated expanded
+        // operator sequence. The full observed step payload per child is a
+        // conservative bound even when one parent owns nearly every step.
+        let expanded_sequences = vector_capacity_bytes::<Vec<u8>>(shape.steps)?
             .checked_add(shape.step_bytes)
-            .and_then(|bytes| bytes.checked_mul(shape.observations.max(1)))
+            .and_then(|bytes| bytes.checked_mul(observations.max(1)))
             .ok_or(IntelligenceError::ResourceOverflow)?;
-        let ordered_indexes = shape
-            .observations
-            .checked_mul(6)
-            .and_then(|items| items.checked_mul(128))
+        let accepted_index =
+            btree_capacity_bytes::<(([u8; 32], [u8; 32]), &DerivationObservation)>(observations)?;
+        let discovered_index = btree_capacity_bytes::<(
+            Vec<Vec<u8>>,
+            (BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>),
+        )>(observations)?;
+        let discovered_support = btree_capacity_bytes::<[u8; 32]>(observations)?
+            .checked_mul(2)
             .ok_or(IntelligenceError::ResourceOverflow)?;
-        let roots = u64::try_from(root_count)
+        let root_sets = btree_capacity_bytes::<[u8; 32]>(roots)?
+            .checked_mul(2)
+            .ok_or(IntelligenceError::ResourceOverflow)?;
+        let scored_artifacts = observations
+            .checked_mul(2)
+            .ok_or(IntelligenceError::ResourceOverflow)?;
+        let score_index = btree_capacity_bytes::<([u8; 32], u64)>(scored_artifacts)?;
+        let score_order = vector_capacity_bytes::<([u8; 32], u64)>(scored_artifacts)?;
+
+        let maximum_operators = u64::try_from(MAX_DERIVED_OPERATORS)
+            .map_err(|_| IntelligenceError::ResourceOverflow)?;
+        let maximum_active =
+            u64::try_from(MAX_ACTIVE_ARTIFACTS).map_err(|_| IntelligenceError::ResourceOverflow)?;
+        let active_output = vector_capacity_bytes::<[u8; 32]>(maximum_active)?;
+        let operator_headers = vector_capacity_bytes::<DerivedOperator>(maximum_operators)?;
+        let operator_symbols = maximum_operators
+            .checked_mul(u64::try_from(b"derived:".len() + 64).unwrap_or(u64::MAX))
+            .ok_or(IntelligenceError::ResourceOverflow)?;
+        let operator_support = vector_capacity_bytes::<[u8; 32]>(observations)?;
+        let output_revision = u64::try_from(std::mem::size_of::<KnowledgeRevision>())
             .map_err(|_| IntelligenceError::ResourceOverflow)?
-            .checked_mul(96)
+            .checked_add(active_output)
+            .and_then(|bytes| bytes.checked_add(operator_headers))
+            .and_then(|bytes| bytes.checked_add(operator_symbols))
+            .and_then(|bytes| bytes.checked_add(expanded_sequences))
+            .and_then(|bytes| bytes.checked_add(operator_support))
             .ok_or(IntelligenceError::ResourceOverflow)?;
-        source
-            .checked_add(discovered_sequences)
-            .and_then(|bytes| bytes.checked_add(ordered_indexes))
-            .and_then(|bytes| bytes.checked_add(roots))
-            .and_then(|bytes| bytes.checked_add(self.limits.maximum_model_bytes as u64))
-            .and_then(|bytes| bytes.checked_add(64 * 1024))
-            .ok_or(IntelligenceError::ResourceOverflow)
+        let obligation_output =
+            vector_capacity_bytes::<ConsolidationObligation>(maximum_operators)?;
+        let challenger_output = u64::try_from(std::mem::size_of::<ConsolidationChallenger>())
+            .map_err(|_| IntelligenceError::ResourceOverflow)?
+            .checked_add(output_revision)
+            .and_then(|bytes| bytes.checked_add(obligation_output))
+            .ok_or(IntelligenceError::ResourceOverflow)?;
+        // Product construction encodes the challenger and the Core cache
+        // decodes one independently owned challenger before publication.
+        let challenger_encode_and_cache = challenger_output
+            .checked_mul(2)
+            .ok_or(IntelligenceError::ResourceOverflow)?;
+
+        [
+            source,
+            expanded_sequences,
+            accepted_index,
+            discovered_index,
+            discovered_support,
+            root_sets,
+            score_index,
+            score_order,
+            self.knowledge.active_revision_resident_bytes(),
+            challenger_output,
+            challenger_encode_and_cache,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, bytes| {
+            total
+                .checked_add(bytes)
+                .ok_or(IntelligenceError::ResourceOverflow)
+        })
     }
 
     pub(crate) fn stage_completed_knowledge_compilation(
@@ -2888,6 +2937,35 @@ impl KnowledgeCompilationShape {
     }
 }
 
+fn vector_capacity_bytes<T>(count: u64) -> Result<u64, IntelligenceError> {
+    let header = u64::try_from(std::mem::size_of::<Vec<T>>())
+        .map_err(|_| IntelligenceError::ResourceOverflow)?;
+    let element =
+        u64::try_from(std::mem::size_of::<T>()).map_err(|_| IntelligenceError::ResourceOverflow)?;
+    count
+        .checked_mul(element)
+        .and_then(|bytes| bytes.checked_add(header))
+        .ok_or(IntelligenceError::ResourceOverflow)
+}
+
+fn btree_capacity_bytes<T>(count: u64) -> Result<u64, IntelligenceError> {
+    let header = u64::try_from(std::mem::size_of::<BTreeMap<T, u8>>())
+        .map_err(|_| IntelligenceError::ResourceOverflow)?;
+    let entry = u64::try_from(std::mem::size_of::<T>())
+        .map_err(|_| IntelligenceError::ResourceOverflow)?
+        // Parent, left/right child, and allocator/padding allowance per entry
+        // conservatively dominate the amortized B-tree node metadata.
+        .checked_add(
+            u64::try_from(4 * std::mem::size_of::<usize>())
+                .map_err(|_| IntelligenceError::ResourceOverflow)?,
+        )
+        .ok_or(IntelligenceError::ResourceOverflow)?;
+    count
+        .checked_mul(entry)
+        .and_then(|bytes| bytes.checked_add(header))
+        .ok_or(IntelligenceError::ResourceOverflow)
+}
+
 pub(crate) struct ExecutedKnowledgeCompilation {
     base_revision: [u8; 32],
     producer: DecisionId,
@@ -2949,7 +3027,9 @@ impl PreparedNativeEcologyPlan {
     }
 
     pub(crate) fn comparison_resident_bytes(&self) -> u64 {
-        self.resident_bytes().saturating_add(self.scratch_bytes)
+        self.resident_bytes()
+            .saturating_add(self.scratch_bytes)
+            .saturating_add(NativeTrainingBudget::maximum_output_bytes())
     }
 
     pub(crate) const fn scratch_bytes(&self) -> u64 {
@@ -4407,7 +4487,7 @@ mod checkpoint_tests {
     #[test]
     fn compiler_reservation_covers_large_symbols_and_expanded_derived_steps() {
         let limits = IntelligenceLimits::new(16, 64, 64, 512, 8, 128 * 1024).unwrap();
-        let core = IntelligenceCore::fresh(limits);
+        let mut core = IntelligenceCore::fresh(limits);
         let mut small = KnowledgeCompilationShape::default();
         small.observe(b"p", &[b"p".to_vec()]).unwrap();
         let mut large = KnowledgeCompilationShape::default();
@@ -4423,6 +4503,17 @@ mod checkpoint_tests {
         let large_bound = core.knowledge_compilation_resident_bound(large, 2).unwrap();
         assert!(large_bound > small_bound.saturating_mul(100));
         assert!(large_bound > 64 * 1024 * 16 + 32 * 1024 * 8 * 16);
+
+        let maximum_active = KnowledgeState::maximum_resident_test_state(4 * 1024, 4 * 1024);
+        let active_resident = maximum_active.resident_bytes();
+        core.knowledge.replace_active_for_test(maximum_active);
+        let maximum_bound = core
+            .knowledge_compilation_resident_bound(large, MAX_ACTIVE_ARTIFACTS)
+            .unwrap();
+        assert!(
+            maximum_bound >= large_bound.saturating_add(active_resident),
+            "max operators, max steps, large symbols, and the complete active revision must all be resident in the declared compiler peak"
+        );
     }
 
     #[test]

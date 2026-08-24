@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::harness::{
-    AnyError, capture_child_bounded, duration_ns, hash_json, hex, parse_flag_values,
+    AnyError, capture_child_bounded_clean, duration_ns, hash_json, hex, parse_flag_values,
 };
 
-const SCHEMA: &str = "reflex-directional-receipt-v4";
-const DEFAULT_RECEIPT: &str = "target/directional/receipt.json";
+pub(super) mod namespace;
+
+const SCHEMA: &str = "reflex-directional-receipt-v5";
+const DEFAULT_RECEIPT: &str = "/tmp/reflex-directional-receipt.json";
+const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TOTAL_TIMEOUT_SECONDS: u64 = 990;
 const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 const GIBIBYTE: u64 = 1024 * 1024 * 1024;
@@ -87,6 +91,7 @@ struct GateReceipt {
 struct DirectionalReceipt {
     schema: String,
     repository: RepositoryState,
+    isolation: namespace::IsolationContract,
     execution_source_snapshot_sha256: String,
     gate_plan_sha256: String,
     started_unix_ms: u64,
@@ -129,20 +134,15 @@ struct LeanFixture {
     mathlib: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SourceSnapshot {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct SourceSnapshot {
     sha256: String,
     entries: u64,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the fixed Directional protocol remains contiguous and auditable"
-)]
 pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
     let root = repository_root()?;
     let output = parse_output(arguments, &root)?;
-    let cargo = cargo_program();
     let started_unix_ms = unix_time_ms()?;
     let started = Instant::now();
     let repository = repository_state(&root)?;
@@ -151,49 +151,29 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
         sha256: repository.source_snapshot_sha256.clone(),
         entries: repository.source_entries,
     };
-    let execution_root = materialize_source_snapshot(&root, &expected_snapshot)?;
-    let work = root.join("target/directional/work");
-    std::fs::create_dir_all(&work)?;
-
-    let planned = planned_gates(&execution_root, discover_lean_fixture());
+    let discovered_lean = discover_lean_fixture();
+    let prepared = namespace::PreparedNamespace::prepare(
+        &root,
+        source_paths,
+        expected_snapshot.clone(),
+        discovered_lean.as_ref().ok(),
+    )?;
+    let cargo = prepared.cargo_label()?;
+    let isolation = prepared.contract().clone();
+    let execution_root = prepared.source_root().to_path_buf();
+    let private_lean = match discovered_lean {
+        Ok(_) => prepared
+            .lean_fixture()
+            .ok_or_else(|| "Directional Lean fixture was not privately materialized".to_owned()),
+        Err(error) => Err(error),
+    };
+    let mut planned = planned_gates(&execution_root, private_lean);
+    let isolated_environment = prepared.environment();
+    apply_isolated_environment(&mut planned, &isolated_environment);
     validate_plan_bound(&planned)?;
-    let gate_plan_sha256 = gate_plan_sha256(&cargo, &planned)?;
-    let mut halted = false;
-    let mut gates = Vec::new();
-    for gate in planned {
-        let remaining =
-            Duration::from_secs(MAX_TOTAL_TIMEOUT_SECONDS).saturating_sub(started.elapsed());
-        let mut receipt = if let Some(detail) = gate.blocker.as_ref() {
-            blocked_receipt(&cargo, &gate, detail)
-        } else if halted {
-            not_run_receipt(&cargo, &gate)
-        } else if remaining.is_zero() {
-            global_timeout_receipt(&cargo, &gate)
-        } else {
-            execute_gate(&cargo, &gate, &work, gate.timeout.min(remaining))
-        };
-        match repository_state(&root) {
-            Ok(current) => mark_source_mutation(&mut receipt, &repository, &current),
-            Err(error) => {
-                receipt.status = GateStatus::Failed;
-                receipt.detail = Some(format!(
-                    "could not re-snapshot source state after the gate: {error}"
-                ));
-            }
-        }
-        match source_snapshot_for_paths(&execution_root, &source_paths) {
-            Ok(current) if current == expected_snapshot => {}
-            Ok(current) => mark_execution_copy_mutation(&mut receipt, &expected_snapshot, &current),
-            Err(error) => {
-                receipt.status = GateStatus::Failed;
-                receipt.detail = Some(format!(
-                    "could not verify immutable source copy after the gate: {error}"
-                ));
-            }
-        }
-        halted |= receipt.status != GateStatus::Passed;
-        gates.push(receipt);
-    }
+    let gate_plan_sha256 = gate_plan_sha256(&cargo, &planned, &isolation)?;
+    let namespace_outcome = prepared.execute(&planned)?;
+    let mut gates = namespace_outcome.gates;
 
     if let Some(last) = gates.last_mut() {
         match repository_state(&root) {
@@ -205,15 +185,12 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
                 ));
             }
         }
-        match source_snapshot_for_paths(&execution_root, &source_paths) {
-            Ok(current) if current == expected_snapshot => {}
-            Ok(current) => mark_execution_copy_mutation(last, &expected_snapshot, &current),
-            Err(error) => {
-                last.status = GateStatus::Failed;
-                last.detail = Some(format!(
-                    "could not perform the final immutable-copy snapshot: {error}"
-                ));
-            }
+        if namespace_outcome.execution_snapshot != expected_snapshot {
+            mark_execution_copy_mutation(
+                last,
+                &expected_snapshot,
+                &namespace_outcome.execution_snapshot,
+            );
         }
     }
 
@@ -226,6 +203,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
     let mut receipt = DirectionalReceipt {
         schema: SCHEMA.to_owned(),
         repository,
+        isolation,
         execution_source_snapshot_sha256: expected_snapshot.sha256,
         gate_plan_sha256,
         started_unix_ms,
@@ -236,7 +214,7 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
         content_sha256: String::new(),
     };
     receipt.content_sha256 = hash_json(&receipt)?;
-    write_receipt(&output, &receipt)?;
+    write_receipt(&root, &output, &receipt)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
 
     match status {
@@ -251,6 +229,30 @@ pub(super) fn run(arguments: &[String]) -> Result<(), AnyError> {
             output.display()
         )
         .into()),
+    }
+}
+
+fn apply_isolated_environment(
+    gates: &mut [GateSpec],
+    isolated_environment: &[(OsString, OsString)],
+) {
+    for gate in gates {
+        let lean_environment = gate
+            .environment
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.to_str(),
+                    Some("REFLEX_LEAN_LAKE" | "REFLEX_LEAN_MATHLIB")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        gate.environment = isolated_environment
+            .iter()
+            .cloned()
+            .chain(lean_environment)
+            .collect();
     }
 }
 
@@ -287,11 +289,38 @@ fn parse_output(arguments: &[String], root: &Path) -> Result<PathBuf, AnyError> 
     let requested = values
         .get("--output")
         .map_or_else(|| PathBuf::from(DEFAULT_RECEIPT), PathBuf::from);
-    Ok(if requested.is_absolute() {
+    let output = if requested.is_absolute() {
         requested
     } else {
         root.join(requested)
-    })
+    };
+    validate_external_receipt_path(root, &output)?;
+    Ok(output)
+}
+
+fn validate_external_receipt_path(root: &Path, output: &Path) -> Result<(), AnyError> {
+    if !output.is_absolute() || output.starts_with(root) {
+        return Err(
+            "Directional receipt output must be an absolute path outside the source tree".into(),
+        );
+    }
+    if output.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name == "source")
+            && ancestor.parent().is_some_and(|parent| {
+                parent
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("reflex-directional-"))
+            })
+    }) {
+        return Err(
+            "Directional receipt output cannot be inside a private execution source".into(),
+        );
+    }
+    Ok(())
 }
 
 fn repository_root() -> Result<PathBuf, AnyError> {
@@ -299,10 +328,6 @@ fn repository_root() -> Result<PathBuf, AnyError> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "xtask manifest has no repository parent".into())
-}
-
-fn cargo_program() -> OsString {
-    std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
 }
 
 fn validate_plan_bound(gates: &[GateSpec]) -> Result<(), AnyError> {
@@ -329,8 +354,12 @@ fn validate_plan_bound(gates: &[GateSpec]) -> Result<(), AnyError> {
     Ok(())
 }
 
-fn gate_plan_sha256(cargo: &OsStr, gates: &[GateSpec]) -> Result<String, AnyError> {
-    hash_json(&canonical_gate_plan(cargo, gates))
+fn gate_plan_sha256(
+    cargo: &OsStr,
+    gates: &[GateSpec],
+    isolation: &namespace::IsolationContract,
+) -> Result<String, AnyError> {
+    hash_json(&(canonical_gate_plan(cargo, gates), isolation))
 }
 
 fn canonical_gate_plan(cargo: &OsStr, gates: &[GateSpec]) -> CanonicalGatePlan {
@@ -426,6 +455,7 @@ fn source_paths(root: &Path) -> Result<Vec<Vec<u8>>, AnyError> {
 }
 
 fn source_snapshot_for_paths(root: &Path, paths: &[Vec<u8>]) -> Result<SourceSnapshot, AnyError> {
+    namespace::validate_source_paths(paths)?;
     let mut digest = Sha256::new();
     digest.update(b"reflex-directional-source-snapshot-v1\0");
     digest.update((paths.len() as u64).to_le_bytes());
@@ -469,11 +499,13 @@ fn source_snapshot_for_paths(root: &Path, paths: &[Vec<u8>]) -> Result<SourceSna
     })
 }
 
+#[cfg(test)]
 fn directional_source_root(root: &Path, snapshot_sha256: &str) -> PathBuf {
     root.join("target/directional/sources")
         .join(snapshot_sha256)
 }
 
+#[cfg(test)]
 fn materialize_source_snapshot(
     root: &Path,
     expected: &SourceSnapshot,
@@ -554,7 +586,7 @@ fn materialize_source_snapshot(
     Ok(destination)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_immutable_file_mode(path: &Path, source: &std::fs::Metadata) -> Result<(), AnyError> {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = if source.permissions().mode() & 0o111 == 0 {
@@ -566,7 +598,7 @@ fn set_immutable_file_mode(path: &Path, source: &std::fs::Metadata) -> Result<()
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_immutable_file_mode(path: &Path, _source: &std::fs::Metadata) -> Result<(), AnyError> {
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
@@ -574,7 +606,7 @@ fn set_immutable_file_mode(path: &Path, _source: &std::fs::Metadata) -> Result<(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn freeze_source_directories(root: &Path) -> Result<(), AnyError> {
     use std::os::unix::fs::PermissionsExt as _;
     fn visit(path: &Path, target: &Path) -> Result<(), AnyError> {
@@ -595,12 +627,12 @@ fn freeze_source_directories(root: &Path) -> Result<(), AnyError> {
     visit(root, &root.join("target"))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn freeze_source_directories(_root: &Path) -> Result<(), AnyError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn make_tree_writable(root: &Path) -> Result<(), AnyError> {
     use std::os::unix::fs::PermissionsExt as _;
     if !root.exists() {
@@ -616,7 +648,7 @@ fn make_tree_writable(root: &Path) -> Result<(), AnyError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn make_tree_writable(_root: &Path) -> Result<(), AnyError> {
     Ok(())
 }
@@ -978,7 +1010,7 @@ fn execute_gate(
     effective_timeout: Duration,
 ) -> GateReceipt {
     let started = Instant::now();
-    let captured = capture_child_bounded(
+    let captured = capture_child_bounded_clean(
         Path::new(cargo),
         &gate.arguments,
         &work.join(gate.name),
@@ -1163,28 +1195,104 @@ fn overall_status(gates: &[GateReceipt]) -> RunStatus {
     }
 }
 
-fn write_receipt(path: &Path, receipt: &DirectionalReceipt) -> Result<(), AnyError> {
+fn write_receipt(root: &Path, path: &Path, receipt: &DirectionalReceipt) -> Result<(), AnyError> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::fsync;
+
+    validate_external_receipt_path(root, path)?;
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
+        return Err("Directional Harness receipt exceeds its fixed output bound".into());
+    }
     let parent = path
         .parent()
         .ok_or_else(|| format!("receipt path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".directional-receipt-{}.tmp", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(receipt)?;
-    let mut file = std::fs::File::create(&temporary)?;
+    let parent_descriptor = open(
+        parent,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let opened_parent =
+        std::fs::canonicalize(format!("/proc/self/fd/{}", parent_descriptor.as_raw_fd()))?;
+    validate_external_receipt_path(
+        root,
+        &opened_parent.join(path.file_name().ok_or("receipt path has no file name")?),
+    )?;
+    let descriptor = openat(
+        &parent_descriptor,
+        path.file_name().ok_or("receipt path has no file name")?,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )?;
+    let mut file = std::fs::File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err("Directional receipt output is not a regular file".into());
+    }
     file.write_all(&bytes)?;
     file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    fsync(&parent_descriptor)?;
     Ok(())
 }
 
-pub(super) fn require_current_passed_receipt() -> Result<(), AnyError> {
+fn read_receipt_bounded(path: &Path) -> Result<Vec<u8>, AnyError> {
+    #[cfg(target_arch = "aarch64")]
+    const O_NOFOLLOW: i32 = 0x8000;
+    #[cfg(not(target_arch = "aarch64"))]
+    const O_NOFOLLOW: i32 = 0x2_0000;
+
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_RECEIPT_BYTES {
+        return Err("Directional Harness receipt is not a bounded regular file".into());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_RECEIPT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
+        return Err("Directional Harness receipt exceeds its fixed input bound".into());
+    }
+    Ok(bytes)
+}
+
+pub(super) fn prepare_current_campaign_source()
+-> Result<(namespace::CampaignSourcePlan, Vec<std::fs::File>), AnyError> {
     let root = repository_root()?;
-    let cargo = cargo_program();
-    let current = repository_state(&root)?;
-    let execution_root = directional_source_root(&root, &current.source_snapshot_sha256);
-    let gates = planned_gates(&execution_root, discover_lean_fixture());
-    verify_passed_receipt(&root, &root.join(DEFAULT_RECEIPT), &cargo, &gates)
+    let receipt = current_passed_receipt()?;
+    let source_paths = source_paths(&root)?;
+    let expected = SourceSnapshot {
+        sha256: receipt.repository.source_snapshot_sha256,
+        entries: receipt.repository.source_entries,
+    };
+    namespace::prepare_campaign_source_plan(&root, source_paths, expected)
+}
+
+fn current_passed_receipt() -> Result<DirectionalReceipt, AnyError> {
+    let root = repository_root()?;
+    let cargo = namespace::current_cargo_label()?;
+    let receipt_path = PathBuf::from(DEFAULT_RECEIPT);
+    let preliminary =
+        serde_json::from_slice::<DirectionalReceipt>(&read_receipt_bounded(&receipt_path)?)?;
+    preliminary.isolation.validate()?;
+    let mut gates = planned_gates(
+        &preliminary.isolation.paths.source,
+        preliminary.isolation.lean_fixture(),
+    );
+    let environment = preliminary
+        .isolation
+        .environment
+        .iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect::<Vec<_>>();
+    apply_isolated_environment(&mut gates, &environment);
+    verify_passed_receipt(&root, &receipt_path, &cargo, &gates)
 }
 
 fn verify_passed_receipt(
@@ -1192,9 +1300,9 @@ fn verify_passed_receipt(
     path: &Path,
     cargo: &OsStr,
     expected_gates: &[GateSpec],
-) -> Result<(), AnyError> {
+) -> Result<DirectionalReceipt, AnyError> {
     validate_plan_bound(expected_gates)?;
-    let bytes = std::fs::read(path).map_err(|error| {
+    let bytes = read_receipt_bounded(path).map_err(|error| {
         format!(
             "a passed Directional Harness receipt is required at {}: {error}",
             path.display()
@@ -1202,7 +1310,7 @@ fn verify_passed_receipt(
     })?;
     let receipt = serde_json::from_slice::<DirectionalReceipt>(&bytes).map_err(|error| {
         format!(
-            "Directional Harness receipt at {} is not canonical v4 data: {error}",
+            "Directional Harness receipt at {} is not canonical v5 data: {error}",
             path.display()
         )
     })?;
@@ -1212,6 +1320,15 @@ fn verify_passed_receipt(
             receipt.schema
         )
         .into());
+    }
+    receipt.isolation.validate()?;
+    if cargo.to_string_lossy().starts_with("sealed-cargo:") {
+        if receipt.isolation.tools
+            != namespace::TrustedTools::rediscover_identities(&receipt.isolation.tools)?
+        {
+            return Err("Directional Harness receipt tool identities are stale".into());
+        }
+        receipt.isolation.verify_external_trees()?;
     }
     if receipt.status != RunStatus::Passed {
         return Err("Directional Harness receipt did not pass".into());
@@ -1224,7 +1341,7 @@ fn verify_passed_receipt(
     {
         return Err("Directional Harness receipt violates its exact total timeout bound".into());
     }
-    let expected_plan_sha256 = gate_plan_sha256(cargo, expected_gates)?;
+    let expected_plan_sha256 = gate_plan_sha256(cargo, expected_gates, &receipt.isolation)?;
     if receipt.gate_plan_sha256 != expected_plan_sha256 {
         return Err("Directional Harness receipt gate-plan identity is stale or invalid".into());
     }
@@ -1273,7 +1390,7 @@ fn verify_passed_receipt(
         )
         .into());
     }
-    Ok(())
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -1289,6 +1406,9 @@ fn launch_with_receipt<T>(
 
 #[cfg(test)]
 fn write_passed_receipt_for_test(root: &Path, path: &Path) -> Result<(), AnyError> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
     let (cargo, planned) = test_gate_plan(root);
     let gates = planned
         .iter()
@@ -1313,11 +1433,13 @@ fn write_passed_receipt_for_test(root: &Path, path: &Path) -> Result<(), AnyErro
         })
         .collect();
     let repository = repository_state(root)?;
+    let isolation = namespace::fixture_contract("receipt-fixture");
     let mut receipt = DirectionalReceipt {
         schema: SCHEMA.to_owned(),
         execution_source_snapshot_sha256: repository.source_snapshot_sha256.clone(),
         repository,
-        gate_plan_sha256: gate_plan_sha256(&cargo, &planned)?,
+        isolation: isolation.clone(),
+        gate_plan_sha256: gate_plan_sha256(&cargo, &planned, &isolation)?,
         started_unix_ms: 1,
         total_wall_ns: 1,
         maximum_total_timeout_seconds: MAX_TOTAL_TIMEOUT_SECONDS,
@@ -1326,7 +1448,7 @@ fn write_passed_receipt_for_test(root: &Path, path: &Path) -> Result<(), AnyErro
         content_sha256: String::new(),
     };
     receipt.content_sha256 = hash_json(&receipt)?;
-    write_receipt(path, &receipt)
+    write_receipt(root, path, &receipt)
 }
 
 #[cfg(test)]
@@ -1407,17 +1529,18 @@ mod tests {
         }
 
         fn receipt(&self) -> PathBuf {
-            self.0.join("target/directional/receipt.json")
+            self.0.with_extension("receipt.json")
         }
 
         fn verify_receipt(&self, path: &Path) -> Result<(), super::AnyError> {
             let (cargo, gates) = super::test_gate_plan(&self.0);
-            super::verify_passed_receipt(&self.0, path, &cargo, &gates)
+            super::verify_passed_receipt(&self.0, path, &cargo, &gates).map(|_| ())
         }
     }
 
     impl Drop for TestRepository {
         fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.receipt());
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -1427,14 +1550,62 @@ mod tests {
         let root = Path::new("/repo");
         assert_eq!(
             parse_output(&[], root).expect("default output is valid"),
-            root.join(DEFAULT_RECEIPT)
+            PathBuf::from(DEFAULT_RECEIPT)
         );
         assert_eq!(
-            parse_output(&["--output".into(), "elsewhere.json".into()], root)
+            parse_output(&["--output".into(), "/outside/elsewhere.json".into()], root)
                 .expect("explicit output is valid"),
-            root.join("elsewhere.json")
+            PathBuf::from("/outside/elsewhere.json")
+        );
+        assert!(parse_output(&["--output".into(), "elsewhere.json".into()], root).is_err());
+        assert!(parse_output(&["--output".into(), "/repo/receipt.json".into()], root).is_err());
+        assert!(
+            parse_output(
+                &[
+                    "--output".into(),
+                    "/tmp/reflex-directional-run/source/receipt.json".into(),
+                ],
+                root,
+            )
+            .is_err()
         );
         assert!(parse_output(&["--timeout".into(), "999".into()], root).is_err());
+    }
+
+    #[test]
+    fn receipt_publication_is_create_new_nofollow_and_external() {
+        let repository = TestRepository::new("receipt-publication");
+        let receipt = repository.receipt();
+        super::write_passed_receipt_for_test(&repository.0, &receipt).unwrap();
+        let original = std::fs::read(&receipt).unwrap();
+        let state = super::repository_state(&repository.0).unwrap();
+        let isolation = super::namespace::fixture_contract("publication-fixture");
+        let rejected = super::DirectionalReceipt {
+            schema: super::SCHEMA.into(),
+            execution_source_snapshot_sha256: state.source_snapshot_sha256.clone(),
+            repository: state,
+            isolation: isolation.clone(),
+            gate_plan_sha256: String::new(),
+            started_unix_ms: 1,
+            total_wall_ns: 1,
+            maximum_total_timeout_seconds: super::MAX_TOTAL_TIMEOUT_SECONDS,
+            status: super::RunStatus::Passed,
+            gates: Vec::new(),
+            content_sha256: String::new(),
+        };
+        assert!(super::write_receipt(&repository.0, &receipt, &rejected).is_err());
+        assert_eq!(std::fs::read(&receipt).unwrap(), original);
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&receipt).unwrap();
+            symlink(repository.0.join("tracked.rs"), &receipt).unwrap();
+            assert!(super::write_receipt(&repository.0, &receipt, &rejected).is_err());
+            assert_eq!(
+                std::fs::read_to_string(repository.0.join("tracked.rs")).unwrap(),
+                "fn baseline() {}\n"
+            );
+        }
     }
 
     #[test]

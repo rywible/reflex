@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-const MAX_ACTIVE_ARTIFACTS: usize = 4_096;
-const MAX_DERIVED_OPERATORS: usize = 256;
-const MAX_DERIVED_STEPS: usize = 8;
+pub(crate) const MAX_ACTIVE_ARTIFACTS: usize = 4_096;
+pub(crate) const MAX_DERIVED_OPERATORS: usize = 256;
+pub(crate) const MAX_DERIVED_STEPS: usize = 8;
 const MIN_SEMANTIC_SUPPORT: usize = 8;
 const MIN_DEACTIVATION_TRIALS: u64 = 16;
 const MAX_KNOWLEDGE_LINEAGE: usize = 256;
@@ -531,6 +531,42 @@ pub(crate) struct KnowledgeState {
 }
 
 impl KnowledgeState {
+    #[cfg(test)]
+    pub(crate) fn maximum_resident_test_state(symbol_bytes: usize, step_bytes: usize) -> Self {
+        let operators = (0..MAX_DERIVED_OPERATORS)
+            .map(|index| {
+                let mut id = [0_u8; 32];
+                id[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                DerivedOperator {
+                    id,
+                    symbol: vec![u8::try_from(index % 251).unwrap(); symbol_bytes],
+                    steps: (0..MAX_DERIVED_STEPS)
+                        .map(|step| vec![u8::try_from(step).unwrap(); step_bytes])
+                        .collect(),
+                    support: vec![[u8::try_from(index % 251).unwrap(); 32]; MIN_SEMANTIC_SUPPORT],
+                    active: true,
+                    trials: MIN_DEACTIVATION_TRIALS,
+                    accepted: MIN_DEACTIVATION_TRIALS,
+                }
+            })
+            .collect();
+        Self {
+            generation: 1,
+            champion: Arc::new(KnowledgeRevision {
+                summarized_attempts: 0,
+                active_artifacts: (0..MAX_ACTIVE_ARTIFACTS)
+                    .map(|index| {
+                        let mut key = [0_u8; 32];
+                        key[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+                        key
+                    })
+                    .collect(),
+                operators,
+            }),
+            lineage: vec![Arc::new(KnowledgeRevision::default())],
+        }
+    }
+
     #[cfg(any(test, feature = "internal-experiments"))]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation

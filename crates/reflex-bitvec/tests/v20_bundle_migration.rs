@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,14 @@ use sha2::{Digest, Sha256};
 
 const COMPLETED_V20: &[u8] = include_bytes!("fixtures/v20-completed-rich.bundle");
 const INTERRUPTED_V20: &[u8] = include_bytes!("fixtures/v20-interrupted.bundle");
+const AUTHENTIC_COMPLETED_V22: &[u8] = include_bytes!("fixtures/v22-completed-authentic.bundle");
+const AUTHENTIC_INTERRUPTED_V22: &[u8] =
+    include_bytes!("fixtures/v22-interrupted-authentic.bundle");
+const AUTHENTIC_COMPLETED_V23: &[u8] = include_bytes!("fixtures/v23-completed-authentic.bundle");
+const AUTHENTIC_COMPLETED_V24: &[u8] = include_bytes!("fixtures/v24-completed-authentic.bundle");
+const AUTHENTIC_INTERRUPTED_V24: &[u8] =
+    include_bytes!("fixtures/v24-interrupted-authentic.bundle");
+const AUTHENTIC_COMPLETED_V25: &[u8] = include_bytes!("fixtures/v25-completed-authentic.bundle");
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 const V20_ATTEMPTS: [([u8; 32], ExperienceVerdictInspection); 4] = [
     (
@@ -51,6 +60,102 @@ const V20_ATTEMPTS: [([u8; 32], ExperienceVerdictInspection); 4] = [
         ExperienceVerdictInspection::Refuted,
     ),
 ];
+
+#[test]
+fn authentic_completed_v22_through_v24_fixtures_recover_without_source_mutation() {
+    let fixtures = [
+        (
+            "v22",
+            AUTHENTIC_COMPLETED_V22,
+            "5286f0d072acaea9ac83cef110a24acc4d5096edb99b88269bc18a0fad094280",
+        ),
+        (
+            "v23",
+            AUTHENTIC_COMPLETED_V23,
+            "d0452ce39ca79c63bf9e478452a883fc9dceda887562a724beeb0a775e97b2e4",
+        ),
+        (
+            "v24",
+            AUTHENTIC_COMPLETED_V24,
+            "8e9f441f28e657dd53005c3a7dd76ab63a86af0d6c6f09951332f8f71069adcd",
+        ),
+    ];
+    for (revision, fixture, expected_hash) in fixtures {
+        assert_eq!(sha256_hex(fixture), expected_hash);
+        assert_eq!(
+            runtime_revision(fixture),
+            revision[1..].parse::<u64>().unwrap()
+        );
+        let directory = TestDirectory::new(&format!("authentic-{revision}"));
+        let source = directory.path().join("source.bundle");
+        let target = directory.path().join("target.bundle");
+        std::fs::write(&source, fixture).unwrap();
+
+        improve(
+            BitVecDomain::unary_u8(),
+            request_with_verifications(
+                BundlePlan::Fork {
+                    source: source.clone(),
+                    target: target.clone(),
+                },
+                10_000,
+            ),
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap_or_else(|error| {
+            panic!("authentic {revision} fixture failed to recover: {error:?}")
+        });
+
+        assert_eq!(std::fs::read(&source).unwrap(), fixture);
+        assert_eq!(runtime_revision(&std::fs::read(target).unwrap()), 25);
+    }
+}
+
+#[test]
+fn authentic_current_v25_fixture_is_a_byte_exact_format_oracle() {
+    let expected_hash = "23a0d428829c66ed4d1a8dec0511fad4d5e68f0e6459b269c4fab4fabed0d69b";
+    assert_eq!(sha256_hex(AUTHENTIC_COMPLETED_V25), expected_hash);
+    assert_eq!(runtime_revision(AUTHENTIC_COMPLETED_V25), 25);
+
+    let directory = TestDirectory::new("authentic-v25");
+    let oracle = directory.path().join("oracle.bundle");
+    std::fs::write(&oracle, AUTHENTIC_COMPLETED_V25).unwrap();
+    assert_eq!(std::fs::read(oracle).unwrap(), AUTHENTIC_COMPLETED_V25);
+}
+
+#[test]
+fn authentic_interrupted_v22_and_v24_fixtures_are_rejected_byte_exactly() {
+    let fixtures = [
+        (
+            "v22",
+            AUTHENTIC_INTERRUPTED_V22,
+            "f6b32c4ec81d45b9f9bb251eb62cb2d93703817e0126fb46b06ab571d36911f2",
+        ),
+        (
+            "v24",
+            AUTHENTIC_INTERRUPTED_V24,
+            "f3535108bc6acf9b19ca9c9db7bbde19835dec84a42508035957bcbf625014c5",
+        ),
+    ];
+    for (revision, fixture, expected_hash) in fixtures {
+        assert_eq!(sha256_hex(fixture), expected_hash);
+        let directory = TestDirectory::new(&format!("authentic-interrupted-{revision}"));
+        let source = directory.path().join("source.bundle");
+        std::fs::write(&source, fixture).unwrap();
+
+        let result = improve(
+            BitVecDomain::unary_u8(),
+            interrupted_request(BundlePlan::Resume {
+                source: source.clone(),
+                target: source.clone(),
+            }),
+            |_| ControlFlow::Continue(()),
+        );
+
+        assert!(matches!(result, Err(SessionError::IncompatibleBundle)));
+        assert_eq!(std::fs::read(source).unwrap(), fixture);
+    }
+}
 
 #[test]
 fn completed_v20_resume_is_rejected_without_replacing_the_source() {
@@ -577,6 +682,14 @@ fn snapshot(bytes: &[u8]) -> BundleSnapshot {
             .map(|measurement| (measurement.environment, measurement.value_count))
             .collect(),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 fn artifact_keys(bundle: &CanonicalBundle) -> Vec<[u8; 32]> {

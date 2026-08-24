@@ -458,6 +458,12 @@ pub trait OperatorAlgebra<D: DomainDefinition>: Send + Sync + 'static {
 
 Primitive and Derived Operators produce Candidates only. A Candidate may retain Proposal Provenance identifying a verified supporting Artifact, plus bounded Proposal Features describing the support relationship. Both survive into Experience for attribution but establish neither correctness nor value.
 
+### Private Proposal Engine portfolio
+
+The Runtime reaches candidate generation through one private `ProposalEngine` interface. A Proposal Engine consumes eligible parent Artifacts, a bounded request, and engine-specific restart progress; it appends Candidates and reports peak resident demand and truncation. It cannot Verification-check, rank, admit, spend beyond the Runtime allowance, or publish state.
+
+The initial adapters are a Structured Rewrite Engine over the public Operator Algebra and a Derived Operator Engine over the active Knowledge Revision. Their cursors and grammars remain engine-specific rather than being flattened into a universal public protocol. This internal seam permits later solver, proof-state, stochastic, or retrieval engines without making those mechanisms part of the consumer interface. The public Domain Definition remains unchanged until an independent non-rewrite adapter demonstrates which semantic capabilities must actually become optional.
+
 ### Verification Kernel
 
 ```rust

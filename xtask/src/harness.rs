@@ -39,6 +39,7 @@ const TARGET_SETPRIV_IDENTITY: &str = "REFLEX_HOST_TARGET_SETPRIV_IDENTITY";
 const TARGET_EXECUTABLE_IDENTITY: &str = "REFLEX_HOST_TARGET_EXECUTABLE_IDENTITY";
 const TARGET_ARGUMENTS: &str = "REFLEX_HOST_TARGET_ARGUMENTS";
 const TARGET_ENVIRONMENT: &str = "REFLEX_HOST_TARGET_ENVIRONMENT";
+const TARGET_CAMPAIGN_SOURCE_PLAN: &str = "REFLEX_HOST_TARGET_CAMPAIGN_SOURCE_PLAN";
 const TARGET_ALLOWED_CPUS: &str = "REFLEX_HOST_TARGET_ALLOWED_CPUS";
 const PINNED_RELAY_FD: &str = "REFLEX_HOST_PINNED_RELAY_FD";
 const PINNED_UNSHARE_FD: &str = "REFLEX_HOST_PINNED_UNSHARE_FD";
@@ -71,6 +72,7 @@ const TEST_RELAY_MONITOR_COMMAND: &str = "REFLEX_HOST_TEST_RELAY_MONITOR_COMMAND
 const TEST_RELAY_REPORT_MODE: &str = "REFLEX_HOST_TEST_RELAY_REPORT_MODE";
 const CAPTURE_STREAM_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 const RELAY_REPORT_LIMIT_BYTES: usize = 4096;
+#[cfg(test)]
 const OUTPUT_READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SYSTEM_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const SYSTEM_CONTROL_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
@@ -119,6 +121,10 @@ pub(super) struct ChildCapture {
     pub(super) output_limit_exceeded: bool,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bit records independent kernel or cleanup evidence"
+)]
 pub(super) struct ChildBoundaryEvidence {
     pub(super) cgroup_oom_killed: bool,
     #[allow(
@@ -144,21 +150,21 @@ struct RelayReport {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct ExecutableIdentity {
-    canonical_path: String,
-    device: u64,
-    inode: u64,
-    mode: u32,
-    size: u64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-    content_sha256: String,
+pub(super) struct ExecutableIdentity {
+    pub(super) canonical_path: String,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) mode: u32,
+    pub(super) size: u64,
+    pub(super) changed_seconds: i64,
+    pub(super) changed_nanoseconds: i64,
+    pub(super) content_sha256: String,
 }
 
 #[cfg(target_os = "linux")]
-struct PinnedExecutable {
-    file: std::fs::File,
-    identity: ExecutableIdentity,
+pub(super) struct PinnedExecutable {
+    pub(super) file: std::fs::File,
+    pub(super) identity: ExecutableIdentity,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -230,6 +236,7 @@ pub(super) enum LargeCampaign {
 }
 
 impl LargeCampaign {
+    #[cfg(test)]
     pub(super) const COMMANDS: [&'static str; 9] = [
         "baseline",
         "causal-confirm",
@@ -440,9 +447,39 @@ fn authenticate_large_campaign_parent(
     Ok(campaign)
 }
 
-pub(super) fn enter_large_campaign(
+pub(super) fn enter_large_campaign_with_source(
     campaign: LargeCampaign,
     arguments: &[String],
+    prepare: impl FnOnce() -> Result<
+        (
+            crate::directional::namespace::CampaignSourcePlan,
+            Vec<std::fs::File>,
+        ),
+        AnyError,
+    >,
+) -> Result<Option<ChildCapture>, AnyError> {
+    if std::env::var_os(LARGE_CAMPAIGN_CAPABILITY).is_some() {
+        return enter_large_campaign_with_optional_source(campaign, arguments, None);
+    }
+    let (plan, descriptors) = prepare()?;
+    let result = enter_large_campaign_with_optional_source(campaign, arguments, Some(&plan));
+    let cleanup = crate::directional::namespace::cleanup_campaign_source(&plan);
+    drop(descriptors);
+    match (result, cleanup) {
+        (Ok(capture), Ok(())) => Ok(capture),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(format!("Campaign source cleanup failed ({cleanup})").into()),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "large-Campaign supervision failed ({error}) and source cleanup failed ({cleanup})"
+        )
+        .into()),
+    }
+}
+
+fn enter_large_campaign_with_optional_source(
+    campaign: LargeCampaign,
+    arguments: &[String],
+    source: Option<&crate::directional::namespace::CampaignSourcePlan>,
 ) -> Result<Option<ChildCapture>, AnyError> {
     if let Some(capability) = std::env::var_os(LARGE_CAMPAIGN_CAPABILITY) {
         if capability != campaign.command() {
@@ -462,6 +499,8 @@ pub(super) fn enter_large_campaign(
         require_monitor_handshake(campaign)?;
         return Ok(None);
     }
+    let source =
+        source.ok_or("large-Campaign launch requires a receipt-bound immutable source plan")?;
 
     let executable = std::env::current_exe()?;
     let handshake = monitor_handshake()?;
@@ -474,29 +513,40 @@ pub(super) fn enter_large_campaign(
         campaign.command(),
         std::process::id()
     ));
+    let mut environment = vec![
+        (
+            OsString::from(LARGE_CAMPAIGN_CAPABILITY),
+            OsString::from(campaign.command()),
+        ),
+        (OsString::from(LARGE_CAMPAIGN_NONCE), OsString::from(nonce)),
+        (
+            OsString::from(LARGE_CAMPAIGN_MONITOR_PID),
+            OsString::from(std::process::id().to_string()),
+        ),
+    ];
+    source.validate()?;
+    environment.extend(source.build_environment());
+    environment.push((
+        OsString::from(TARGET_CAMPAIGN_SOURCE_PLAN),
+        OsString::from(serde_json::to_string(source)?),
+    ));
     let (capture, _) = capture_child_host_isolated_with_handshake(
         &executable,
         &child_arguments,
         &evidence_prefix,
         campaign.wall_limit(),
         campaign.isolation_policy(),
-        &[
-            (
-                OsString::from(LARGE_CAMPAIGN_CAPABILITY),
-                OsString::from(campaign.command()),
-            ),
-            (OsString::from(LARGE_CAMPAIGN_NONCE), OsString::from(nonce)),
-            (
-                OsString::from(LARGE_CAMPAIGN_MONITOR_PID),
-                OsString::from(std::process::id().to_string()),
-            ),
-        ],
+        &environment,
         &handshake,
     )?;
     Ok(Some(capture))
 }
 
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the relay keeps one linear attestation and execution protocol"
+)]
 pub(super) fn run_host_isolation_relay() -> Result<(), AnyError> {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -537,12 +587,8 @@ pub(super) fn run_host_isolation_relay() -> Result<(), AnyError> {
     require_pinned_fd_identity(PINNED_UNSHARE_FD, &launcher_identity)?;
     require_pinned_fd_identity(PINNED_TASKSET_FD, &taskset_identity)?;
     require_pinned_fd_identity(PINNED_SETPRIV_FD, &setpriv_identity)?;
-    if executable
-        != PathBuf::from(format!(
-            "/proc/self/fd/{}",
-            std::env::var(PINNED_UNSHARE_FD)?
-        ))
-    {
+    let expected_launcher = format!("/proc/self/fd/{}", std::env::var(PINNED_UNSHARE_FD)?);
+    if executable != Path::new(&expected_launcher) {
         return Err("relay launcher does not use its pinned descriptor".into());
     }
     let arguments = serde_json::from_str::<Vec<String>>(&std::env::var(RELAY_TARGET_ARGUMENTS)?)?;
@@ -632,16 +678,22 @@ fn inject_test_relay_frame(
         "forged-live" | "forged-then-exit" | "forged-then-signal" => {
             write_relay_frame(std::io::stderr().lock(), &forged)?;
         }
-        "oversize" => write_relay_frame(
-            std::io::stderr().lock(),
-            &vec![0_u8; RELAY_REPORT_LIMIT_BYTES + 1],
-        )?,
+        "oversize" => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(RELAY_REPORT_FRAME)?;
+            stderr.write_all(&u32::try_from(RELAY_REPORT_LIMIT_BYTES + 1)?.to_be_bytes())?;
+            stderr.write_all(&vec![0_u8; RELAY_REPORT_LIMIT_BYTES + 1])?;
+            stderr.flush()?;
+        }
         _ => return Err(format!("unknown test relay report mode {mode}").into()),
     }
     Ok(())
 }
 
 fn write_relay_frame(mut writer: impl std::io::Write, payload: &[u8]) -> Result<(), AnyError> {
+    if payload.len() > RELAY_REPORT_LIMIT_BYTES {
+        return Err("host-isolation relay terminal report exceeds its byte limit".into());
+    }
     writer.write_all(RELAY_REPORT_FRAME)?;
     writer.write_all(&u32::try_from(payload.len())?.to_be_bytes())?;
     writer.write_all(payload)?;
@@ -695,6 +747,18 @@ pub(super) fn run_host_isolation_target() -> Result<(), AnyError> {
     std::fs::remove_file(&ready)?;
     std::fs::remove_file(&ack)?;
     require_target_user_namespace(&trusted_namespace, host_uid)?;
+    protect_cgroup_filesystem()?;
+    if let Some(serialized) = std::env::var_os(TARGET_CAMPAIGN_SOURCE_PLAN) {
+        let serialized = serialized
+            .to_str()
+            .ok_or("Campaign source plan is not UTF-8")?;
+        let plan =
+            serde_json::from_str::<crate::directional::namespace::CampaignSourcePlan>(serialized)?;
+        let source = crate::directional::namespace::materialize_campaign_source(&plan)?;
+        std::env::set_current_dir(source)?;
+    } else if std::env::var_os(LARGE_CAMPAIGN_CAPABILITY).is_some() {
+        return Err("large-Campaign target omits its immutable source plan".into());
+    }
     let taskset =
         serde_json::from_str::<ExecutableIdentity>(&std::env::var(TARGET_TASKSET_IDENTITY)?)?;
     let setpriv =
@@ -749,6 +813,8 @@ pub(super) fn run_host_isolation_exec() -> Result<(), AnyError> {
     let relay = serde_json::from_str::<ExecutableIdentity>(&std::env::var(TARGET_RELAY_IDENTITY)?)?;
     require_running_executable_identity(&relay)?;
     require_seccomp_affinity_boundary()?;
+    require_cgroup_filesystem_read_only()?;
+    require_campaign_source_directory()?;
     inherited_host_isolation()?;
     let target =
         serde_json::from_str::<ExecutableIdentity>(&std::env::var(TARGET_EXECUTABLE_IDENTITY)?)?;
@@ -758,6 +824,26 @@ pub(super) fn run_host_isolation_exec() -> Result<(), AnyError> {
     let environment =
         serde_json::from_str::<Vec<(String, String)>>(&std::env::var(TARGET_ENVIRONMENT)?)?;
     exec_pinned_target(&target, &arguments, &environment)
+}
+
+#[cfg(target_os = "linux")]
+fn require_campaign_source_directory() -> Result<(), AnyError> {
+    let Some(serialized) = std::env::var_os(TARGET_CAMPAIGN_SOURCE_PLAN) else {
+        if std::env::var_os(LARGE_CAMPAIGN_CAPABILITY).is_some() {
+            return Err("large-Campaign exec omits its immutable source plan".into());
+        }
+        return Ok(());
+    };
+    let serialized = serialized
+        .to_str()
+        .ok_or("Campaign source plan is not UTF-8")?;
+    let plan =
+        serde_json::from_str::<crate::directional::namespace::CampaignSourcePlan>(serialized)?;
+    plan.validate()?;
+    if std::env::current_dir()? != plan.source_root() {
+        return Err("large-Campaign exec is outside its immutable source root".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1109,6 +1195,7 @@ fn verify_live_monitor_process(expected_command: &[u8]) -> Result<u32, AnyError>
         if !error.to_string().contains("same xtask executable")
             || relay.as_ref().is_none_or(|identity| {
                 require_running_executable_identity(identity).is_err()
+                    || monitor_executable != Path::new(&identity.canonical_path)
                     || !matches!(
                         hash_file(&monitor_executable_path),
                         Ok(digest) if digest == identity.content_sha256
@@ -1393,6 +1480,7 @@ pub(super) fn capture_child_with_environment(
     )
 }
 
+#[cfg(test)]
 pub(super) fn capture_child_bounded(
     executable: &Path,
     arguments: &[OsString],
@@ -1408,6 +1496,32 @@ pub(super) fn capture_child_bounded(
         Some(timeout),
         Some(resident_bytes),
         environment,
+    )
+}
+
+#[allow(
+    dead_code,
+    reason = "the Directional namespace runner consumes this seam"
+)]
+pub(super) fn capture_child_bounded_clean(
+    executable: &Path,
+    arguments: &[OsString],
+    evidence_prefix: &Path,
+    timeout: Duration,
+    resident_bytes: u64,
+    environment: &[(OsString, OsString)],
+) -> Result<ChildCapture, AnyError> {
+    capture_child_with_limits_and_boundary(
+        executable,
+        arguments,
+        evidence_prefix,
+        Some(timeout),
+        Some(resident_bytes),
+        environment,
+        &TerminationBoundary::ProcessTree,
+        None,
+        None,
+        true,
     )
 }
 
@@ -1566,6 +1680,10 @@ fn capture_child_host_isolated_with_optional_handshake(
         let mut relay_target_arguments = vec![
             "--user".to_owned(),
             "--map-root-user".to_owned(),
+            "--mount".to_owned(),
+            "--cgroup".to_owned(),
+            "--propagation".to_owned(),
+            "private".to_owned(),
             "--".to_owned(),
             pinned_fd_path(&relay.file)
                 .to_str()
@@ -1737,6 +1855,7 @@ fn capture_child_host_isolated_with_optional_handshake(
             &TerminationBoundary::SystemdUnit(format!("{unit}.scope")),
             handshake,
             Some(&relay_expectation),
+            true,
         )?;
         Ok((capture, isolation))
     }
@@ -1804,7 +1923,7 @@ pub(super) fn inherited_host_isolation() -> Result<HostIsolation, AnyError> {
         validate_cpu_boundary(
             &allowed_cpus,
             &reserved_cpus,
-            &effective_cpus,
+            effective_cpus,
             &host_cpus,
             policy.cpu_reserve,
         )?;
@@ -2073,6 +2192,7 @@ fn capture_child_with_limits(
         &TerminationBoundary::ProcessTree,
         None,
         None,
+        false,
     )
 }
 
@@ -2084,6 +2204,7 @@ enum TerminationBoundary {
 struct BoundaryCleanupGuard<'a> {
     boundary: &'a TerminationBoundary,
     root: u32,
+    campaign_deadline: Option<Instant>,
     armed: bool,
 }
 
@@ -2114,10 +2235,15 @@ fn reserve_outer_monitor(cpus: &[usize]) -> Result<AffinityGuard, AnyError> {
 }
 
 impl<'a> BoundaryCleanupGuard<'a> {
-    fn new(boundary: &'a TerminationBoundary, root: u32) -> Self {
+    fn new(
+        boundary: &'a TerminationBoundary,
+        root: u32,
+        campaign_deadline: Option<Instant>,
+    ) -> Self {
         Self {
             boundary,
             root,
+            campaign_deadline,
             armed: true,
         }
     }
@@ -2130,7 +2256,8 @@ impl<'a> BoundaryCleanupGuard<'a> {
 impl Drop for BoundaryCleanupGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = terminate_boundary(self.boundary, self.root);
+            let deadline = terminal_control_deadline(self.campaign_deadline);
+            let _ = terminate_boundary_before(self.boundary, self.root, deadline, None);
         }
     }
 }
@@ -2145,6 +2272,8 @@ struct CgroupMemoryEvents {
 struct CgroupMemoryObserver {
     #[cfg(target_os = "linux")]
     file: Option<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    cgroup_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2156,17 +2285,21 @@ struct CgroupPidsEvents {
 struct CgroupPidsObserver {
     #[cfg(target_os = "linux")]
     file: Option<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    cgroup_path: Option<PathBuf>,
 }
 
 impl CgroupPidsObserver {
     #[cfg(target_os = "linux")]
-    fn read(&mut self, unit: &str) -> Result<CgroupPidsEvents, AnyError> {
+    fn read(&mut self, _unit: &str) -> Result<CgroupPidsEvents, AnyError> {
         use std::io::Seek as _;
 
         if self.file.is_none() {
-            self.file = Some(std::fs::File::open(
-                systemd_cgroup_path(unit)?.join("pids.events"),
-            )?);
+            let cgroup = self
+                .cgroup_path
+                .as_ref()
+                .ok_or("the experimental cgroup path was not resolved")?;
+            self.file = Some(std::fs::File::open(cgroup.join("pids.events"))?);
         }
         let file = self
             .file
@@ -2183,17 +2316,28 @@ impl CgroupPidsObserver {
     fn read(&mut self, _unit: &str) -> Result<CgroupPidsEvents, AnyError> {
         Err("systemd cgroup evidence requires Linux".into())
     }
+
+    fn at(cgroup_path: Option<&Path>) -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            file: None,
+            #[cfg(target_os = "linux")]
+            cgroup_path: cgroup_path.map(Path::to_path_buf),
+        }
+    }
 }
 
 impl CgroupMemoryObserver {
     #[cfg(target_os = "linux")]
-    fn read(&mut self, unit: &str) -> Result<CgroupMemoryEvents, AnyError> {
+    fn read(&mut self, _unit: &str) -> Result<CgroupMemoryEvents, AnyError> {
         use std::io::Seek as _;
 
         if self.file.is_none() {
-            self.file = Some(std::fs::File::open(
-                systemd_cgroup_path(unit)?.join("memory.events"),
-            )?);
+            let cgroup = self
+                .cgroup_path
+                .as_ref()
+                .ok_or("the experimental cgroup path was not resolved")?;
+            self.file = Some(std::fs::File::open(cgroup.join("memory.events"))?);
         }
         let file = self
             .file
@@ -2209,6 +2353,15 @@ impl CgroupMemoryObserver {
     #[cfg(not(target_os = "linux"))]
     fn read(&mut self, _unit: &str) -> Result<CgroupMemoryEvents, AnyError> {
         Err("systemd cgroup evidence requires Linux".into())
+    }
+
+    fn at(cgroup_path: Option<&Path>) -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            file: None,
+            #[cfg(target_os = "linux")]
+            cgroup_path: cgroup_path.map(Path::to_path_buf),
+        }
     }
 }
 
@@ -2227,11 +2380,14 @@ fn capture_child_with_limits_and_boundary(
     boundary: &TerminationBoundary,
     monitor_challenge: Option<&[u8; MONITOR_HANDSHAKE_BYTES]>,
     relay: Option<&RelayExpectation>,
+    clear_environment: bool,
 ) -> Result<ChildCapture, AnyError> {
+    let started = Instant::now();
+    let supervisor_deadline = timeout.and_then(|limit| started.checked_add(limit));
     let clock_ticks_per_second = clock_ticks_per_second().ok();
     let child_cpu_before = completed_child_cpu_ticks().ok();
     let mut command = Command::new(executable);
-    if relay.is_some() {
+    if relay.is_some() || clear_environment {
         command.env_clear();
     }
     command
@@ -2248,6 +2404,7 @@ fn capture_child_with_limits_and_boundary(
         command.stdin(Stdio::piped());
     }
     let mut child = command.spawn()?;
+    let mut boundary_guard = BoundaryCleanupGuard::new(boundary, child.id(), supervisor_deadline);
     #[cfg(target_os = "linux")]
     let _outer_affinity = if relay.is_some() {
         let reserved = environment
@@ -2261,9 +2418,17 @@ fn capture_child_with_limits_and_boundary(
     } else {
         None
     };
-    let mut boundary_guard = BoundaryCleanupGuard::new(boundary, child.id());
     let output_limit_exceeded = Arc::new(AtomicBool::new(false));
-    let readers = (|| -> Result<(_, _, _, _), AnyError> {
+    let setup_control_deadline = terminal_boundary_deadline(boundary, supervisor_deadline);
+    let readers = (|| -> Result<(_, _, _, _, _), AnyError> {
+        let cgroup_path = if let TerminationBoundary::SystemdUnit(unit) = boundary {
+            Some(wait_for_systemd_cgroup_path_before(
+                unit,
+                setup_control_deadline,
+            )?)
+        } else {
+            None
+        };
         let stdout = child
             .stdout
             .take()
@@ -2317,31 +2482,34 @@ fn capture_child_with_limits_and_boundary(
             stderr_reader,
             relay_authentication,
             terminal_report,
+            cgroup_path,
         ))
     })();
-    let (stdout_reader, stderr_reader, relay_authentication, terminal_report) = match readers {
-        Ok(readers) => readers,
-        Err(error) => {
-            let cleanup = cleanup_spawned_child(boundary, &mut child);
-            if cleanup.is_ok() {
+    let (stdout_reader, stderr_reader, relay_authentication, terminal_report, cgroup_path) =
+        match readers {
+            Ok(readers) => readers,
+            Err(error) => {
+                let cleanup = cleanup_spawned_child_before(
+                    boundary,
+                    &mut child,
+                    setup_control_deadline,
+                    None,
+                );
                 boundary_guard.disarm();
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!(
+                        "capture setup failed ({error}) and boundary cleanup failed ({cleanup})"
+                    )
+                    .into()),
+                };
             }
-            return match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(format!(
-                    "capture setup failed ({error}) and boundary cleanup failed ({cleanup})"
-                )
-                .into()),
-            };
-        }
-    };
-    let started = Instant::now();
-    let supervisor_deadline = timeout.and_then(|limit| started.checked_add(limit));
+        };
     let mut peak_process_tree_resident_bytes = 0;
     let mut memory_events = CgroupMemoryEvents::default();
-    let mut memory_observer = CgroupMemoryObserver::default();
+    let mut memory_observer = CgroupMemoryObserver::at(cgroup_path.as_deref());
     let mut pids_events = CgroupPidsEvents::default();
-    let mut pids_observer = CgroupPidsObserver::default();
+    let mut pids_observer = CgroupPidsObserver::at(cgroup_path.as_deref());
     let mut memory_evidence_seen = false;
     let mut memory_evidence_lost = false;
     let mut pids_evidence_seen = false;
@@ -2352,6 +2520,7 @@ fn capture_child_with_limits_and_boundary(
     let mut relay_termination = None;
     let mut relay_authentication_key = None;
     let mut authenticated_terminal_report = None;
+    let mut terminal_deadline = None;
     let supervision = (|| -> Result<(ExitStatus, bool, bool, bool), AnyError> {
         let (timed_out, resident_limit_exceeded, output_limit_exceeded) = loop {
             if let TerminationBoundary::SystemdUnit(unit) = boundary {
@@ -2419,7 +2588,16 @@ fn capture_child_with_limits_and_boundary(
                     );
                     terminal_memory_observed = true;
                 }
-                boundary_cleanup_failed = terminate_boundary(boundary, child.id()).is_err();
+                let deadline = *terminal_deadline.get_or_insert_with(|| {
+                    terminal_boundary_deadline(boundary, supervisor_deadline)
+                });
+                boundary_cleanup_failed = terminate_boundary_before(
+                    boundary,
+                    child.id(),
+                    deadline,
+                    cgroup_path.as_deref(),
+                )
+                .is_err();
                 let _ = child.kill();
                 break (false, false, true);
             }
@@ -2441,7 +2619,16 @@ fn capture_child_with_limits_and_boundary(
                     );
                     terminal_memory_observed = true;
                 }
-                boundary_cleanup_failed = terminate_boundary(boundary, child.id()).is_err();
+                let deadline = *terminal_deadline.get_or_insert_with(|| {
+                    terminal_boundary_deadline(boundary, supervisor_deadline)
+                });
+                boundary_cleanup_failed = terminate_boundary_before(
+                    boundary,
+                    child.id(),
+                    deadline,
+                    cgroup_path.as_deref(),
+                )
+                .is_err();
                 let _ = child.kill();
                 break (false, true, false);
             }
@@ -2463,25 +2650,42 @@ fn capture_child_with_limits_and_boundary(
                     );
                     terminal_memory_observed = true;
                 }
-                boundary_cleanup_failed = terminate_boundary(boundary, child.id()).is_err();
+                let deadline = *terminal_deadline.get_or_insert_with(|| {
+                    terminal_boundary_deadline(boundary, supervisor_deadline)
+                });
+                boundary_cleanup_failed = terminate_boundary_before(
+                    boundary,
+                    child.id(),
+                    deadline,
+                    cgroup_path.as_deref(),
+                )
+                .is_err();
                 let _ = child.kill();
                 break (true, false, false);
             }
-            let control_deadline = terminal_control_deadline(supervisor_deadline);
-            let completed_relay = relay
-                .zip(relay_authentication_key.as_ref())
-                .zip(authenticated_terminal_report.take())
-                .map(|((expectation, authentication), report)| {
-                    validate_relay_report(
+            let completed_relay = match (
+                relay,
+                relay_authentication_key.as_ref(),
+                authenticated_terminal_report.as_ref(),
+            ) {
+                (Some(expectation), Some(authentication), Some(report)) => {
+                    let control_deadline = *terminal_deadline.get_or_insert_with(|| {
+                        terminal_boundary_deadline(boundary, supervisor_deadline)
+                    });
+                    let termination = validate_relay_report(
                         report,
                         expectation,
                         boundary,
                         authentication,
                         control_deadline,
-                    )
-                })
-                .transpose()?;
-            if let Some(termination) = completed_relay {
+                        cgroup_path.as_deref(),
+                    )?;
+                    authenticated_terminal_report = None;
+                    Some((termination, control_deadline))
+                }
+                _ => None,
+            };
+            if let Some((termination, control_deadline)) = completed_relay {
                 if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                     if let TerminationBoundary::SystemdUnit(unit) = boundary {
                         observe_memory_events(
@@ -2493,7 +2697,13 @@ fn capture_child_with_limits_and_boundary(
                         );
                         terminal_memory_observed = true;
                     }
-                    boundary_cleanup_failed = terminate_boundary(boundary, child.id()).is_err();
+                    boundary_cleanup_failed = terminate_boundary_before(
+                        boundary,
+                        child.id(),
+                        control_deadline,
+                        cgroup_path.as_deref(),
+                    )
+                    .is_err();
                     let _ = child.kill();
                     break (true, false, false);
                 }
@@ -2513,7 +2723,11 @@ fn capture_child_with_limits_and_boundary(
                         &mut pids_evidence_lost,
                     );
                     terminal_memory_observed = true;
-                    let deactivation = deactivate_systemd_unit_before(unit, control_deadline);
+                    let deactivation = deactivate_systemd_unit_before(
+                        unit,
+                        cgroup_path.as_deref(),
+                        control_deadline,
+                    );
                     boundary_quiescence_proven = deactivation.is_ok();
                     boundary_cleanup_failed = deactivation.is_err();
                 }
@@ -2521,8 +2735,17 @@ fn capture_child_with_limits_and_boundary(
                 break (false, false, false);
             }
             if completed.is_some() {
+                let deadline = *terminal_deadline.get_or_insert_with(|| {
+                    terminal_boundary_deadline(boundary, supervisor_deadline)
+                });
                 if matches!(boundary, TerminationBoundary::ProcessTree)
-                    && terminate_boundary(boundary, child.id()).is_err()
+                    && terminate_boundary_before(
+                        boundary,
+                        child.id(),
+                        deadline,
+                        cgroup_path.as_deref(),
+                    )
+                    .is_err()
                 {
                     boundary_cleanup_failed = true;
                 }
@@ -2530,7 +2753,9 @@ fn capture_child_with_limits_and_boundary(
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        let mut status = wait_child_before(&mut child, Instant::now() + Duration::from_secs(1))?;
+        let deadline = *terminal_deadline
+            .get_or_insert_with(|| terminal_boundary_deadline(boundary, supervisor_deadline));
+        let mut status = wait_child_before(&mut child, deadline)?;
         if let Some(termination) = relay_termination {
             status = relay_exit_status(termination)?;
         }
@@ -2551,9 +2776,21 @@ fn capture_child_with_limits_and_boundary(
                     &mut pids_evidence_lost,
                 );
             }
-            if !boundary_quiescence_proven && !matches!(boundary_is_quiescent(unit), Ok(true)) {
+            let deadline = *terminal_deadline
+                .get_or_insert_with(|| terminal_boundary_deadline(boundary, supervisor_deadline));
+            if !boundary_quiescence_proven
+                && !matches!(
+                    boundary_is_quiescent_before(unit, cgroup_path.as_deref(), deadline),
+                    Ok(true)
+                )
+            {
                 boundary_cleanup_failed = true;
-                let _ = terminate_boundary(boundary, child.id());
+                let _ = terminate_boundary_before(
+                    boundary,
+                    child.id(),
+                    deadline,
+                    cgroup_path.as_deref(),
+                );
             }
         }
         Ok((
@@ -2567,12 +2804,25 @@ fn capture_child_with_limits_and_boundary(
     {
         Ok(result) => result,
         Err(error) => {
-            let cleanup = cleanup_spawned_child(boundary, &mut child);
-            if cleanup.is_ok() {
-                boundary_guard.disarm();
-            }
-            let stdout = join_bounded_reader(stdout_reader, "stdout after supervision failure");
-            let stderr = join_bounded_reader(stderr_reader, "stderr after supervision failure");
+            let deadline = *terminal_deadline
+                .get_or_insert_with(|| terminal_boundary_deadline(boundary, supervisor_deadline));
+            let cleanup = cleanup_spawned_child_before(
+                boundary,
+                &mut child,
+                deadline,
+                cgroup_path.as_deref(),
+            );
+            boundary_guard.disarm();
+            let stdout = join_bounded_reader_before(
+                stdout_reader,
+                "stdout after supervision failure",
+                deadline,
+            );
+            let stderr = join_bounded_reader_before(
+                stderr_reader,
+                "stderr after supervision failure",
+                deadline,
+            );
             let mut failures = vec![format!("child supervision failed ({error})")];
             if let Err(cleanup) = cleanup {
                 failures.push(format!("boundary cleanup failed ({cleanup})"));
@@ -2593,14 +2843,14 @@ fn capture_child_with_limits_and_boundary(
         .map_or(0, |((before, after), frequency)| {
             ticks_to_nanoseconds(after.saturating_sub(before), frequency)
         });
-    let stdout = join_bounded_reader(stdout_reader, "stdout");
-    let stderr = join_bounded_reader(stderr_reader, "stderr");
+    let deadline = *terminal_deadline
+        .get_or_insert_with(|| terminal_boundary_deadline(boundary, supervisor_deadline));
+    let stdout = join_bounded_reader_before(stdout_reader, "stdout", deadline);
+    let stderr = join_bounded_reader_before(stderr_reader, "stderr", deadline);
+    boundary_guard.disarm();
     let (stdout, stdout_truncated) = stdout?;
     let (stderr, stderr_truncated) = stderr?;
     output_limit_exceeded |= stdout_truncated || stderr_truncated;
-    if !boundary_cleanup_failed {
-        boundary_guard.disarm();
-    }
     Ok(ChildCapture {
         status,
         stdout,
@@ -2837,7 +3087,7 @@ fn extract_authenticated_relay_frames(
         let length = u32::from_be_bytes(pending[header..header + 4].try_into().unwrap_or([0; 4]));
         let length = usize::try_from(length).unwrap_or(usize::MAX);
         if length > RELAY_REPORT_LIMIT_BYTES {
-            pending.drain(..position + 1);
+            pending.drain(..=position);
             continue;
         }
         let end = header + 4 + length;
@@ -2931,11 +3181,19 @@ where
         })
 }
 
+#[cfg(test)]
 fn join_bounded_reader(
     reader: std::thread::JoinHandle<std::io::Result<(String, bool)>>,
     name: &str,
 ) -> Result<(String, bool), AnyError> {
-    let deadline = Instant::now() + OUTPUT_READER_JOIN_TIMEOUT;
+    join_bounded_reader_before(reader, name, Instant::now() + OUTPUT_READER_JOIN_TIMEOUT)
+}
+
+fn join_bounded_reader_before(
+    reader: std::thread::JoinHandle<std::io::Result<(String, bool)>>,
+    name: &str,
+    deadline: Instant,
+) -> Result<(String, bool), AnyError> {
     while !reader.is_finished() {
         if Instant::now() >= deadline {
             return Err(format!("the bounded {name} reader did not terminate").into());
@@ -2948,18 +3206,20 @@ fn join_bounded_reader(
         .map_err(Into::into)
 }
 
-fn cleanup_spawned_child(
+fn cleanup_spawned_child_before(
     boundary: &TerminationBoundary,
     child: &mut std::process::Child,
+    deadline: Instant,
+    cgroup_path: Option<&Path>,
 ) -> Result<(), AnyError> {
     if let TerminationBoundary::SystemdUnit(unit) = boundary
-        && boundary_is_quiescent(unit).unwrap_or(false)
+        && boundary_is_quiescent_before(unit, cgroup_path, deadline).unwrap_or(false)
     {
-        return wait_child_before(child, Instant::now() + Duration::from_secs(1)).map(|_| ());
+        return wait_child_before(child, deadline).map(|_| ());
     }
-    let cleanup = terminate_boundary(boundary, child.id());
+    let cleanup = terminate_boundary_before(boundary, child.id(), deadline, cgroup_path);
     let _ = child.kill();
-    let reaped = wait_child_before(child, Instant::now() + Duration::from_secs(1));
+    let reaped = wait_child_before(child, deadline);
     match (cleanup, reaped) {
         (Ok(()), Ok(_)) => Ok(()),
         (Err(cleanup), Ok(_)) => Err(cleanup),
@@ -3016,16 +3276,17 @@ const fn pids_resource_exhausted(events: CgroupPidsEvents) -> bool {
 
 #[cfg(target_os = "linux")]
 fn validate_relay_report(
-    report: RelayReport,
+    report: &RelayReport,
     expectation: &RelayExpectation,
     boundary: &TerminationBoundary,
     authentication: &[u8; MONITOR_HANDSHAKE_BYTES],
     deadline: Instant,
+    cgroup_path: Option<&Path>,
 ) -> Result<RelayTermination, AnyError> {
     let TerminationBoundary::SystemdUnit(unit) = boundary else {
         return Err("relay report is not bound to a systemd unit".into());
     };
-    let bytes = serde_json::to_vec(&report)?;
+    let bytes = serde_json::to_vec(report)?;
     let report = decode_relay_report(
         &bytes,
         &expectation.nonce,
@@ -3034,16 +3295,17 @@ fn validate_relay_report(
         &expectation.target_identity,
         &expectation.target_arguments_sha256,
     )?;
+    let cgroup_path = cgroup_path.ok_or("host-isolation cgroup path was not retained")?;
     let relay_executable = PathBuf::from(format!("/proc/{}/exe", report.relay_pid));
     let relay_file = std::fs::File::open(&relay_executable)?;
     if require_sealed_executable(&relay_file).is_err()
         || executable_metadata(&relay_executable)?
             != executable_metadata_from_identity(&expectation.relay_identity)
-        || !process_belongs_to_systemd_unit_before(report.relay_pid, unit, deadline)?
+        || !process_belongs_to_cgroup(report.relay_pid, cgroup_path)?
     {
         return Err("host-isolation relay report identity is invalid".into());
     }
-    require_stable_relay_only_state(unit, report.relay_pid, deadline)?;
+    require_stable_relay_only_state(cgroup_path, report.relay_pid, deadline)?;
     Ok(report.termination)
 }
 
@@ -3122,11 +3384,10 @@ fn read_bounded_regular_file(_path: &Path) -> Result<Vec<u8>, AnyError> {
 
 #[cfg(target_os = "linux")]
 fn require_stable_relay_only_state(
-    unit: &str,
+    cgroup: &Path,
     relay_pid: u32,
     deadline: Instant,
 ) -> Result<(), AnyError> {
-    let cgroup = systemd_cgroup_path_before(unit, deadline)?;
     for sample in 0..2 {
         if Instant::now() >= deadline {
             return Err("host-isolation relay terminal-state deadline elapsed".into());
@@ -3183,13 +3444,24 @@ fn process_belongs_to_systemd_unit_before(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn process_belongs_to_cgroup(process: u32, expected: &Path) -> Result<bool, AnyError> {
+    let process_cgroups = std::fs::read_to_string(format!("/proc/{process}/cgroup"))?;
+    let cgroup = process_cgroups
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or("process omits its unified cgroup")?;
+    Ok(Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')) == expected)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn validate_relay_report(
-    _report: RelayReport,
+    _report: &RelayReport,
     _expectation: &RelayExpectation,
     _boundary: &TerminationBoundary,
     _authentication: &[u8; MONITOR_HANDSHAKE_BYTES],
     _deadline: Instant,
+    _cgroup_path: Option<&Path>,
 ) -> Result<RelayTermination, AnyError> {
     Err("host-isolation relay evidence requires Linux".into())
 }
@@ -3215,11 +3487,6 @@ fn relay_exit_status(_termination: RelayTermination) -> Result<ExitStatus, AnyEr
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_cgroup_path(unit: &str) -> Result<std::path::PathBuf, AnyError> {
-    systemd_cgroup_path_before(unit, Instant::now() + SYSTEM_CONTROL_TIMEOUT)
-}
-
-#[cfg(target_os = "linux")]
 fn systemd_cgroup_path_before(
     unit: &str,
     deadline: Instant,
@@ -3241,12 +3508,36 @@ fn systemd_cgroup_path_before(
 }
 
 #[cfg(target_os = "linux")]
-fn deactivate_systemd_unit_before(unit: &str, deadline: Instant) -> Result<(), AnyError> {
+fn wait_for_systemd_cgroup_path_before(unit: &str, deadline: Instant) -> Result<PathBuf, AnyError> {
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match systemd_cgroup_path_before(unit, deadline) {
+            Ok(path) => return Ok(path),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!(
+        "systemd scope {unit} cgroup resolution deadline elapsed ({})",
+        last_error.map_or_else(|| "no observation".into(), |error| error.to_string())
+    )
+    .into())
+}
+
+#[cfg(target_os = "linux")]
+fn deactivate_systemd_unit_before(
+    unit: &str,
+    cgroup_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<(), AnyError> {
     let output = run_control_command_before("systemctl", &["--user", "stop", unit], deadline)?;
     if !output.status.success() {
         return Err(format!("cannot stop retained systemd unit {unit}").into());
     }
     for _ in 0..100 {
+        if boundary_is_quiescent_before(unit, cgroup_path, deadline)? {
+            return Ok(());
+        }
         let output = run_control_command_before(
             "systemctl",
             &["--user", "show", "--property=ActiveState", "--value", unit],
@@ -3268,6 +3559,16 @@ fn deactivate_systemd_unit_before(unit: &str, deadline: Instant) -> Result<(), A
 fn terminal_control_deadline(campaign_deadline: Option<Instant>) -> Instant {
     let control_deadline = Instant::now() + SYSTEM_CONTROL_TIMEOUT;
     campaign_deadline.map_or(control_deadline, |deadline| deadline.min(control_deadline))
+}
+
+fn terminal_boundary_deadline(
+    boundary: &TerminationBoundary,
+    campaign_deadline: Option<Instant>,
+) -> Instant {
+    terminal_control_deadline(match boundary {
+        TerminationBoundary::SystemdUnit(_) => campaign_deadline,
+        TerminationBoundary::ProcessTree => None,
+    })
 }
 
 fn parse_memory_events(contents: &str) -> Option<CgroupMemoryEvents> {
@@ -3304,14 +3605,19 @@ fn parse_cgroup_populated(contents: &str) -> Option<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn boundary_is_quiescent(unit: &str) -> Result<bool, AnyError> {
-    boundary_is_quiescent_before(unit, Instant::now() + SYSTEM_CONTROL_TIMEOUT)
-}
-
-#[cfg(target_os = "linux")]
-fn boundary_is_quiescent_before(unit: &str, deadline: Instant) -> Result<bool, AnyError> {
-    if let Ok(path) = systemd_cgroup_path_before(unit, deadline)
-        && let Ok(events) = std::fs::read_to_string(path.join("cgroup.events"))
+fn boundary_is_quiescent_before(
+    unit: &str,
+    cgroup_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<bool, AnyError> {
+    let resolved;
+    let path = if let Some(path) = cgroup_path {
+        path
+    } else {
+        resolved = systemd_cgroup_path_before(unit, deadline)?;
+        &resolved
+    };
+    if let Ok(events) = std::fs::read_to_string(path.join("cgroup.events"))
         && parse_cgroup_populated(&events) == Some(false)
     {
         return Ok(true);
@@ -3331,57 +3637,97 @@ fn boundary_is_quiescent_before(unit: &str, deadline: Instant) -> Result<bool, A
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_boundary_quiescence_before(unit: &str, deadline: Instant) -> Result<(), AnyError> {
+fn wait_for_boundary_quiescence_at_before(
+    unit: &str,
+    cgroup_path: Option<&Path>,
+    deadline: Instant,
+) -> Result<(), AnyError> {
     for _ in 0..100 {
-        if boundary_is_quiescent_before(unit, deadline)? {
+        if boundary_is_quiescent_before(unit, cgroup_path, deadline)? {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("systemd scope {unit} cleanup deadline elapsed").into());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     Err(format!("systemd scope {unit} remained populated after termination").into())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn boundary_is_quiescent(_unit: &str) -> Result<bool, AnyError> {
-    Err("systemd cgroup cleanup evidence requires Linux".into())
-}
-
 #[cfg(target_os = "linux")]
-fn terminate_boundary(boundary: &TerminationBoundary, root: u32) -> Result<(), AnyError> {
+fn terminate_boundary_before(
+    boundary: &TerminationBoundary,
+    root: u32,
+    deadline: Instant,
+    cgroup_path: Option<&Path>,
+) -> Result<(), AnyError> {
     match boundary {
         TerminationBoundary::ProcessTree => {
-            if terminate_process_tree(root) {
+            if terminate_process_tree_before(root, deadline) {
                 Ok(())
             } else {
                 Err("bounded child process group did not become quiescent".into())
             }
         }
         TerminationBoundary::SystemdUnit(unit) => {
-            let deadline = Instant::now() + SYSTEM_CONTROL_TIMEOUT;
             let killed = run_control_command_before(
                 "systemctl",
                 &["--user", "kill", "--kill-whom=all", "--signal=KILL", unit],
                 deadline,
             )
             .is_ok_and(|output| output.status.success());
-            if killed && wait_for_boundary_quiescence_before(unit, deadline).is_ok() {
+            if killed && wait_for_boundary_quiescence_at_before(unit, cgroup_path, deadline).is_ok()
+            {
                 return Ok(());
             }
-            let fallback_deadline = Instant::now() + SYSTEM_CONTROL_TIMEOUT;
-            std::fs::write(
-                systemd_cgroup_path_before(unit, fallback_deadline)?.join("cgroup.kill"),
-                "1",
-            )?;
-            wait_for_boundary_quiescence_before(unit, fallback_deadline)
+            cgroup_kill_fallback_before(
+                unit,
+                deadline,
+                || {
+                    cgroup_path.map_or_else(
+                        || systemd_cgroup_path_before(unit, deadline),
+                        |path| Ok(path.to_path_buf()),
+                    )
+                },
+                |path| std::fs::write(path.join("cgroup.kill"), "1").map_err(Into::into),
+                |path| wait_for_boundary_quiescence_at_before(unit, Some(path), deadline),
+            )
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+fn cgroup_kill_fallback_before(
+    unit: &str,
+    deadline: Instant,
+    resolve: impl FnOnce() -> Result<PathBuf, AnyError>,
+    kill: impl FnOnce(&Path) -> Result<(), AnyError>,
+    quiescence: impl FnOnce(&Path) -> Result<(), AnyError>,
+) -> Result<(), AnyError> {
+    if Instant::now() >= deadline {
+        return Err(format!("systemd scope {unit} cleanup deadline elapsed").into());
+    }
+    let cgroup = resolve()?;
+    if Instant::now() >= deadline {
+        return Err(format!("systemd scope {unit} cleanup deadline elapsed").into());
+    }
+    kill(&cgroup)?;
+    if Instant::now() >= deadline {
+        return Err(format!("systemd scope {unit} cleanup deadline elapsed").into());
+    }
+    quiescence(&cgroup)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn terminate_boundary(boundary: &TerminationBoundary, root: u32) -> Result<(), AnyError> {
+fn terminate_boundary_before(
+    boundary: &TerminationBoundary,
+    root: u32,
+    deadline: Instant,
+    _cgroup_path: Option<&Path>,
+) -> Result<(), AnyError> {
     match boundary {
         TerminationBoundary::ProcessTree => {
-            if terminate_process_tree(root) {
+            if terminate_process_tree_before(root, deadline) {
                 Ok(())
             } else {
                 Err("bounded child process group did not become quiescent".into())
@@ -3394,11 +3740,10 @@ fn terminate_boundary(boundary: &TerminationBoundary, root: u32) -> Result<(), A
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_process_tree(root: u32) -> bool {
+fn terminate_process_tree_before(root: u32, deadline: Instant) -> bool {
     use nix::sys::signal::{Signal, kill, killpg};
     use nix::unistd::Pid;
 
-    let deadline = Instant::now() + SYSTEM_CONTROL_TIMEOUT;
     if let Ok(root) = i32::try_from(root) {
         let _ = killpg(Pid::from_raw(root), Signal::SIGKILL);
     }
@@ -3421,7 +3766,7 @@ fn terminate_process_tree(root: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminate_process_tree(_root: u32) -> bool {
+fn terminate_process_tree_before(_root: u32, _deadline: Instant) -> bool {
     true
 }
 
@@ -3592,7 +3937,7 @@ fn executable_metadata(path: &Path) -> Result<ExecutableMetadata, AnyError> {
 }
 
 #[cfg(target_os = "linux")]
-fn pinned_fd_path(file: &std::fs::File) -> PathBuf {
+pub(super) fn pinned_fd_path(file: &std::fs::File) -> PathBuf {
     use std::os::fd::AsRawFd as _;
 
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
@@ -3606,7 +3951,7 @@ fn pinned_fd_number(file: &std::fs::File) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn pin_executable(path: &Path) -> Result<PinnedExecutable, AnyError> {
+pub(super) fn pin_executable(path: &Path) -> Result<PinnedExecutable, AnyError> {
     use nix::fcntl::{FcntlArg, SealFlag, fcntl};
     use nix::sys::memfd::{MFdFlags, memfd_create};
     use nix::sys::stat::{Mode, fchmod};
@@ -3664,36 +4009,160 @@ fn require_sealed_executable(file: &std::fs::File) -> Result<(), AnyError> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn require_sealed_memfd(file: &std::fs::File) -> Result<(), AnyError> {
+    require_sealed_executable(file)
+}
+
+#[cfg(target_os = "linux")]
+fn protect_cgroup_filesystem() -> Result<(), AnyError> {
+    use nix::mount::{MsFlags, mount};
+
+    let cgroup = Path::new("/sys/fs/cgroup");
+    mount(
+        Some("cgroup2"),
+        cgroup,
+        Some("cgroup2"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|error| format!("cannot mount the private cgroup namespace root: {error}"))?;
+    mount(
+        Some(cgroup),
+        cgroup,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|error| format!("cannot create the private cgroup bind mount: {error}"))?;
+    mount(
+        None::<&Path>,
+        cgroup,
+        None::<&str>,
+        MsFlags::MS_BIND
+            | MsFlags::MS_REMOUNT
+            | MsFlags::MS_RDONLY
+            | MsFlags::MS_NOSUID
+            | MsFlags::MS_NODEV
+            | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|error| format!("cannot remount the private cgroup view read-only: {error}"))?;
+    require_cgroup_filesystem_read_only()
+}
+
+#[cfg(target_os = "linux")]
+fn require_cgroup_filesystem_read_only() -> Result<(), AnyError> {
+    let protected = std::fs::read_to_string("/proc/self/mountinfo")?
+        .lines()
+        .filter_map(|line| line.split_once(" - ").map(|(mount, _)| mount))
+        .filter_map(|mount| {
+            let mut fields = mount.split_whitespace();
+            let root = fields.nth(3)?;
+            let mountpoint = fields.next()?;
+            let options = fields.next()?;
+            (mountpoint == "/sys/fs/cgroup").then_some((root, options))
+        })
+        .any(|(root, options)| root == "/" && options.split(',').any(|option| option == "ro"));
+    if !protected {
+        return Err("the target cgroup filesystem is not a read-only namespace root".into());
+    }
+    if std::fs::read_to_string("/proc/self/cgroup")?.trim() != "0::/" {
+        return Err("the target is not rooted in its private cgroup namespace".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn sched_setaffinity_seccomp_filter() -> Result<std::fs::File, AnyError> {
-    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
-    use nix::sys::memfd::{MFdFlags, memfd_create};
-    use std::ffi::CStr;
+    namespace_seccomp_filter("reflex-host-boundary", true)
+}
 
+#[cfg(target_os = "linux")]
+pub(super) fn directional_namespace_seccomp_filter() -> Result<std::fs::File, AnyError> {
+    namespace_seccomp_filter("reflex-directional-namespace-boundary", false)
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_seccomp_filter(
+    name: &str,
+    deny_sched_setaffinity: bool,
+) -> Result<std::fs::File, AnyError> {
     #[cfg(target_arch = "aarch64")]
-    const SCHED_SETAFFINITY_SYSCALL: u32 = 122;
+    const AUDIT_ARCH: u32 = 0xc000_00b7;
     #[cfg(target_arch = "x86_64")]
-    const SCHED_SETAFFINITY_SYSCALL: u32 = 203;
+    const AUDIT_ARCH: u32 = 0xc000_003e;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    return Err("the CPU reserve seccomp filter does not support this architecture".into());
+    return Err(
+        "the Directional namespace seccomp filter does not support this architecture".into(),
+    );
 
-    // Classic BPF over seccomp_data.nr: deny sched_setaffinity with EPERM and
-    // allow every other syscall. The trusted shim installs this after setting
-    // the experimental affinity, and no_new_privs makes it hereditary.
     const BPF_LD_W_ABS: u16 = 0x20;
     const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JSET_K: u16 = 0x45;
     const BPF_RET_K: u16 = 0x06;
     const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    let instructions = [
-        (BPF_LD_W_ABS, 0_u8, 0_u8, 0_u32),
-        (BPF_JMP_JEQ_K, 0, 1, SCHED_SETAFFINITY_SYSCALL),
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_DATA_NR: u32 = 0;
+    const SECCOMP_DATA_ARCH: u32 = 4;
+    const SECCOMP_DATA_ARG0_LOW: u32 = 16;
+
+    let mut denied = vec![
+        nix::libc::SYS_unshare,
+        nix::libc::SYS_setns,
+        nix::libc::SYS_mount,
+        nix::libc::SYS_umount2,
+        nix::libc::SYS_pivot_root,
+        nix::libc::SYS_fsopen,
+        nix::libc::SYS_fsconfig,
+        nix::libc::SYS_fsmount,
+        nix::libc::SYS_move_mount,
+        nix::libc::SYS_open_tree,
+        nix::libc::SYS_mount_setattr,
+    ];
+    if deny_sched_setaffinity {
+        denied.push(nix::libc::SYS_sched_setaffinity);
+    }
+    let mut instructions = vec![
+        (BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARCH),
+        (BPF_JMP_JEQ_K, 1, 0, AUDIT_ARCH),
+        (BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        (BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_NR),
+    ];
+    for syscall in denied {
+        instructions.push((BPF_JMP_JEQ_K, 0, 1, u32::try_from(syscall)?));
+        instructions.push((BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM));
+    }
+    instructions.extend([
+        (BPF_JMP_JEQ_K, 0, 1, u32::try_from(nix::libc::SYS_clone3)?),
+        // ENOSYS preserves libc/Rust's ordinary legacy-clone fallback while
+        // preventing clone3 from carrying namespace flags we cannot inspect.
+        (BPF_RET_K, 0, 0, 0x0005_0026),
+        (BPF_JMP_JEQ_K, 0, 3, u32::try_from(nix::libc::SYS_clone)?),
+        (BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARG0_LOW),
+        (
+            BPF_JMP_JSET_K,
+            0,
+            1,
+            u32::try_from(nix::libc::CLONE_NEWUSER | nix::libc::CLONE_NEWNS)?,
+        ),
         (BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM),
         (BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
-    ];
-    let name = CStr::from_bytes_with_nul(b"reflex-affinity-boundary\0")?;
+    ]);
+    sealed_seccomp_filter(name, &instructions)
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_seccomp_filter(
+    name: &str,
+    instructions: &[(u16, u8, u8, u32)],
+) -> Result<std::fs::File, AnyError> {
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+    use nix::sys::memfd::{MFdFlags, memfd_create};
+
     let descriptor = memfd_create(name, MFdFlags::MFD_ALLOW_SEALING)?;
     let mut file = std::fs::File::from(descriptor);
-    for (code, jump_true, jump_false, value) in instructions {
+    for &(code, jump_true, jump_false, value) in instructions {
         file.write_all(&code.to_ne_bytes())?;
         file.write_all(&[jump_true, jump_false])?;
         file.write_all(&value.to_ne_bytes())?;
@@ -3708,6 +4177,7 @@ fn sched_setaffinity_seccomp_filter() -> Result<std::fs::File, AnyError> {
                 | SealFlag::F_SEAL_SEAL,
         ),
     )?;
+    require_sealed_memfd(&file)?;
     Ok(file)
 }
 
@@ -3720,7 +4190,12 @@ fn require_seccomp_affinity_boundary() -> Result<(), AnyError> {
             .find_map(|line| line.strip_prefix(name))
             .map(str::trim)
     };
-    if field("NoNewPrivs:") != Some("1") || field("Seccomp:") != Some("2") {
+    if field("NoNewPrivs:") != Some("1")
+        || field("Seccomp:") != Some("2")
+        || ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"]
+            .into_iter()
+            .any(|name| field(name) != Some("0000000000000000"))
+    {
         return Err("the inherited CPU reserve seccomp boundary is absent".into());
     }
     Ok(())
@@ -3740,7 +4215,7 @@ fn executable_identity_from_file(
     }
     file.seek(SeekFrom::Start(0))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -3979,6 +4454,7 @@ fn merged_target_environment(
         TARGET_EXECUTABLE_IDENTITY,
         TARGET_ARGUMENTS,
         TARGET_ENVIRONMENT,
+        TARGET_CAMPAIGN_SOURCE_PLAN,
         TARGET_ALLOWED_CPUS,
         PINNED_RELAY_FD,
         PINNED_UNSHARE_FD,
@@ -3997,6 +4473,13 @@ fn merged_target_environment(
 }
 
 fn trusted_supervisor_environment() -> Vec<(OsString, OsString)> {
+    trusted_supervisor_environment_from(std::env::vars_os())
+}
+
+fn trusted_supervisor_environment_from(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let source = environment.into_iter().collect::<BTreeMap<_, _>>();
     let mut environment = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
     for name in [
         "DBUS_SESSION_BUS_ADDRESS",
@@ -4004,8 +4487,8 @@ fn trusted_supervisor_environment() -> Vec<(OsString, OsString)> {
         "HOME",
         "LANG",
     ] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.push((OsString::from(name), value));
+        if let Some(value) = source.get(&OsString::from(name)) {
+            environment.push((OsString::from(name), value.clone()));
         }
     }
     environment
@@ -4047,6 +4530,24 @@ fn run_control_command_before(
     arguments: &[&str],
     deadline: Instant,
 ) -> Result<std::process::Output, AnyError> {
+    run_control_command_with_environment_before(
+        program,
+        arguments,
+        deadline,
+        &trusted_supervisor_environment(),
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "control capture keeps deadline, output, reap, and process-group cleanup failures together"
+)]
+fn run_control_command_with_environment_before(
+    program: &str,
+    arguments: &[&str],
+    deadline: Instant,
+    environment: &[(OsString, OsString)],
+) -> Result<std::process::Output, AnyError> {
     if Instant::now() >= deadline {
         return Err(format!("{program} control deadline elapsed before launch").into());
     }
@@ -4056,49 +4557,165 @@ fn run_control_command_before(
     let executable = pinned_fd_path(&pinned.file);
     #[cfg(not(target_os = "linux"))]
     let executable = PathBuf::from(program);
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(arguments)
+        .env_clear()
+        .envs(environment.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let control_process_group = child.id();
     let exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_control_reader(
-        child.stdout.take().ok_or("control command omits stdout")?,
-        "stdout",
-        Arc::clone(&exceeded),
-    )?;
-    let stderr_reader = spawn_control_reader(
-        child.stderr.take().ok_or("control command omits stderr")?,
-        "stderr",
-        Arc::clone(&exceeded),
-    )?;
+    let Some(stdout) = child.stdout.take() else {
+        return abort_control_setup(
+            &mut child,
+            Vec::new(),
+            "control command omits stdout",
+            deadline,
+        );
+    };
+    let stdout_reader = match spawn_control_reader(stdout, "stdout", Arc::clone(&exceeded)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return abort_control_setup(&mut child, Vec::new(), &error.to_string(), deadline);
+        }
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return abort_control_setup(
+            &mut child,
+            vec![stdout_reader],
+            "control command omits stderr",
+            deadline,
+        );
+    };
+    let stderr_reader = match spawn_control_reader(stderr, "stderr", Arc::clone(&exceeded)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            return abort_control_setup(
+                &mut child,
+                vec![stdout_reader],
+                &error.to_string(),
+                deadline,
+            );
+        }
+    };
+    let mut terminal_error = None;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminal_error = Some(format!("{program} control observation failed: {error}"));
+                let (status, quiescent) = stop_control_child(&mut child, deadline);
+                if !quiescent {
+                    terminal_error
+                        .as_mut()
+                        .expect("control failure exists")
+                        .push_str("; process group remained live");
+                }
+                break status;
+            }
         }
         if exceeded.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = wait_child_before(&mut child, deadline);
-            return Err(format!("{program} control output exceeded its byte limit").into());
+            terminal_error = Some(format!("{program} control output exceeded its byte limit"));
+            let (status, quiescent) = stop_control_child(&mut child, deadline);
+            if !quiescent {
+                terminal_error
+                    .as_mut()
+                    .expect("control failure exists")
+                    .push_str("; process group remained live");
+            }
+            break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("{program} control command exceeded its deadline").into());
+            terminal_error = Some(format!("{program} control command exceeded its deadline"));
+            let (status, quiescent) = stop_control_child(&mut child, deadline);
+            if !quiescent {
+                terminal_error
+                    .as_mut()
+                    .expect("control failure exists")
+                    .push_str("; process group remained live");
+            }
+            break status;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    let (stdout, stdout_truncated) = join_bounded_reader(stdout_reader, "control stdout")?;
-    let (stderr, stderr_truncated) = join_bounded_reader(stderr_reader, "control stderr")?;
+    let mut failures = terminal_error.into_iter().collect::<Vec<_>>();
+    if !terminate_process_tree_before(control_process_group, deadline) {
+        failures.push(format!("{program} control process group remained live"));
+    }
+    let stdout = join_bounded_reader_before(stdout_reader, "control stdout", deadline);
+    let stderr = join_bounded_reader_before(stderr_reader, "control stderr", deadline);
+    if status.is_none() {
+        failures.push(format!("{program} control child could not be reaped"));
+    }
+    let (stdout, stdout_truncated) = match stdout {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            failures.push(error.to_string());
+            (String::new(), false)
+        }
+    };
+    let (stderr, stderr_truncated) = match stderr {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            failures.push(error.to_string());
+            (String::new(), false)
+        }
+    };
     if stdout_truncated || stderr_truncated || exceeded.load(Ordering::Acquire) {
-        return Err(format!("{program} control output exceeded its byte limit").into());
+        failures.push(format!("{program} control output exceeded its byte limit"));
+    }
+    if !failures.is_empty() {
+        failures.sort();
+        failures.dedup();
+        return Err(failures.join("; ").into());
     }
     Ok(std::process::Output {
-        status,
+        status: status.ok_or("control command lost its exit status")?,
         stdout: stdout.into_bytes(),
         stderr: stderr.into_bytes(),
     })
+}
+
+fn abort_control_setup(
+    child: &mut std::process::Child,
+    readers: Vec<std::thread::JoinHandle<std::io::Result<(String, bool)>>>,
+    error: &str,
+    deadline: Instant,
+) -> Result<std::process::Output, AnyError> {
+    let (status, quiescent) = stop_control_child(child, deadline);
+    let mut failures = vec![format!("control capture setup failed ({error})")];
+    if status.is_none() {
+        failures.push("control child reap failed".into());
+    }
+    if !quiescent {
+        failures.push("control child process group remained live".into());
+    }
+    for reader in readers {
+        if let Err(error) = join_bounded_reader_before(reader, "control setup failure", deadline) {
+            failures.push(format!("control reader shutdown failed ({error})"));
+        }
+    }
+    Err(failures.join("; ").into())
+}
+
+fn stop_control_child(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> (Option<ExitStatus>, bool) {
+    let process_group = child.id();
+    let _ = child.kill();
+    let status = wait_child_before(child, deadline).ok();
+    let quiescent = terminate_process_tree_before(process_group, deadline);
+    (status, quiescent)
 }
 
 fn cpu_description() -> String {
@@ -4204,7 +4821,11 @@ mod tests {
         .expect("a sixteen-CPU host supports the fixed scaling treatment");
         assert_eq!(isolation.allowed_cpu_list, "0,1,2,3,4,5,6");
         assert_eq!(isolation.reserved_cpus, vec![7]);
-        assert_eq!(isolation_boundary_cpu_list(&isolation), "0,1,2,3,4,5,6,7");
+        assert_eq!(isolation_boundary_cpu_list(&isolation), "0,1,2,3,4,5,6");
+        assert_eq!(
+            super::isolation_host_cpu_list(&isolation),
+            "0,1,2,3,4,5,6,7"
+        );
     }
 
     #[test]
@@ -4517,6 +5138,17 @@ mod tests {
         assert!(decode(&bytes, "nonce", "other.scope", &authentication).is_err());
         assert!(decode(&bytes, "nonce", "unit.scope", &[0x7d; 32]).is_err());
 
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut framed = Vec::new();
+        let mut forged_report = report.clone();
+        forged_report.authentication_sha256 = "00".repeat(32);
+        super::write_relay_frame(&mut framed, &serde_json::to_vec(&forged_report).unwrap())
+            .unwrap();
+        super::write_relay_frame(&mut framed, &bytes).unwrap();
+        super::extract_authenticated_relay_frames(&mut framed, &authentication, &sender);
+        assert_eq!(receiver.try_recv().unwrap().child_pid, report.child_pid);
+        assert!(receiver.try_recv().is_err());
+
         let mut substituted = serde_json::from_slice::<super::RelayReport>(&bytes).unwrap();
         substituted.target_identity.inode += 1;
         substituted.authentication_sha256 =
@@ -4628,7 +5260,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_report_reads_are_bounded_regular_files() {
+    fn target_rendezvous_reads_are_bounded_regular_files() {
         use std::io::Write as _;
 
         let directory = std::env::temp_dir().join(format!(
@@ -4710,6 +5342,99 @@ mod tests {
     }
 
     #[test]
+    fn non_campaign_process_tree_retains_one_terminal_cleanup_window() {
+        let now = std::time::Instant::now();
+        let execution = now + Duration::from_millis(20);
+        let deadline = super::terminal_boundary_deadline(
+            &super::TerminationBoundary::ProcessTree,
+            Some(execution),
+        );
+        let after = std::time::Instant::now();
+        assert!(deadline > execution);
+        assert!(deadline >= now + super::SYSTEM_CONTROL_TIMEOUT);
+        assert!(deadline <= after + super::SYSTEM_CONTROL_TIMEOUT);
+    }
+
+    #[test]
+    fn cgroup_kill_fallback_cannot_reset_the_aggregate_deadline() {
+        use std::cell::Cell;
+
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(60);
+        std::thread::sleep(Duration::from_millis(45));
+        let resolved = Cell::new(false);
+        let killed = Cell::new(false);
+        let result = super::cgroup_kill_fallback_before(
+            "test.scope",
+            deadline,
+            || {
+                resolved.set(true);
+                std::thread::sleep(Duration::from_millis(25));
+                Ok(std::path::PathBuf::from("/unused"))
+            },
+            |_| {
+                killed.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(resolved.get());
+        assert!(!killed.get(), "fallback write received a fresh time window");
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn trusted_control_environment_excludes_loader_poison() {
+        let trusted = super::trusted_supervisor_environment_from([
+            (OsString::from("PATH"), OsString::from("/tmp/hostile")),
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from("unix:path=/tmp/test-bus"),
+            ),
+            (OsString::from("LD_PRELOAD"), OsString::from("/tmp/a.so")),
+            (
+                OsString::from("LD_LIBRARY_PATH"),
+                OsString::from("/tmp/lib"),
+            ),
+            (OsString::from("LD_AUDIT"), OsString::from("/tmp/audit.so")),
+            (
+                OsString::from("GLIBC_TUNABLES"),
+                OsString::from("glibc.malloc.check=3"),
+            ),
+            (OsString::from("UNREGISTERED"), OsString::from("leak")),
+        ]);
+        let output = super::run_control_command_with_environment_before(
+            "env",
+            &[],
+            std::time::Instant::now() + Duration::from_secs(2),
+            &trusted,
+        )
+        .expect("sealed env control command runs");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let observed = stdout
+            .lines()
+            .map(|line| line.split_once('=').unwrap())
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(observed.get("PATH"), Some(&"/usr/bin:/bin"));
+        assert_eq!(
+            observed.get("DBUS_SESSION_BUS_ADDRESS"),
+            Some(&"unix:path=/tmp/test-bus")
+        );
+        assert_eq!(observed.len(), 2);
+        for forbidden in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "GLIBC_TUNABLES",
+            "UNREGISTERED",
+        ] {
+            assert!(!observed.contains_key(forbidden));
+        }
+    }
+
+    #[test]
     fn self_consistent_challenge_without_a_live_round_trip_fails() {
         const CHILD_MARKER: &str = "REFLEX_INCOMPLETE_MONITOR_ROUND_TRIP_CHILD";
         let challenge = [0x6d; super::MONITOR_HANDSHAKE_BYTES];
@@ -4775,7 +5500,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_executable_is_sealed_and_ignores_source_replacement() {
+    fn pinned_executable_is_sealed_across_in_place_swap_and_restore() {
         use nix::errno::Errno;
 
         let directory =
@@ -4795,6 +5520,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        std::fs::copy("/usr/bin/true", &source).unwrap();
         let script = directory.join("script");
         std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -4881,6 +5607,36 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(!descendant.success());
+            super::require_cgroup_filesystem_read_only()
+                .expect("the target sees a read-only cgroup filesystem");
+            let scope = super::current_cgroup_path().unwrap();
+            let self_escape =
+                std::fs::write(scope.join("cgroup.procs"), std::process::id().to_string())
+                    .expect_err("the target cannot rewrite its scope membership");
+            assert!(matches!(
+                self_escape.raw_os_error(),
+                Some(nix::libc::EROFS | nix::libc::EPERM)
+            ));
+            assert!(super::process_belongs_to_cgroup(std::process::id(), &scope).unwrap());
+            let mut descendant = std::process::Command::new("/usr/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let descendant_escape =
+                std::fs::write(scope.join("cgroup.procs"), descendant.id().to_string())
+                    .expect_err("a descendant cannot rewrite its scope membership");
+            assert!(matches!(
+                descendant_escape.raw_os_error(),
+                Some(nix::libc::EROFS | nix::libc::EPERM)
+            ));
+            assert!(super::process_belongs_to_cgroup(descendant.id(), &scope).unwrap());
+            descendant.kill().unwrap();
+            descendant.wait().unwrap();
+            let namespace_escape = std::process::Command::new("/usr/bin/unshare")
+                .args(["--mount", "/usr/bin/true"])
+                .status()
+                .unwrap();
+            assert!(!namespace_escape.success());
             return;
         }
 
@@ -5092,7 +5848,7 @@ for raw_pid in sys.argv[1:]:
 
     #[test]
     #[ignore = "requires a Linux user systemd scope and user namespaces"]
-    fn scoped_target_executable_substitution_fails_closed() {
+    fn scoped_target_exec_uses_sealed_image_after_source_substitution() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = std::env::current_dir()
@@ -5115,7 +5871,7 @@ for raw_pid in sys.argv[1:]:
             target.display()
         );
         let prefix = directory.join("evidence");
-        let result = capture_child_host_isolated(
+        let (capture, _) = capture_child_host_isolated(
             &target,
             &[OsString::from("-c"), OsString::from(command)],
             &prefix,
@@ -5127,25 +5883,10 @@ for raw_pid in sys.argv[1:]:
                 experiment_cpu_limit: None,
             },
             &[],
-        );
-        match result {
-            Err(error) => assert!(
-                error.to_string().contains("executable identity changed")
-                    || error.to_string().contains("without evidence"),
-                "unexpected substitution error: {error}"
-            ),
-            Ok((capture, _)) => assert!(
-                !capture.status.success()
-                    && (capture.stderr.contains("executable identity changed")
-                        || capture.boundary.evidence_failed),
-                "a changed target executable unexpectedly published success: status={:?} stdout={} stderr={}",
-                capture.status,
-                capture.stdout,
-                capture.stderr
-            ),
-        }
-        assert!(!prefix.with_extension("relay.json").exists());
-        assert!(!prefix.with_extension("relay.tmp").exists());
+        )
+        .expect("sealed target remains the exact launched object");
+        assert!(capture.status.success(), "{}", capture.stderr);
+        assert!(std::fs::read(&target).unwrap().starts_with(b"#!/bin/sh"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -5319,8 +6060,6 @@ for raw_pid in sys.argv[1:]:
                 || error.to_string().contains("evidence"),
             "unexpected channel-ownership failure: {error}"
         );
-        assert!(!prefix.with_extension("relay.json").exists());
-        assert!(!prefix.with_extension("relay.tmp").exists());
     }
 
     #[test]
@@ -5455,16 +6194,10 @@ for raw_pid in sys.argv[1:]:
         };
         assert!(error.to_string().contains("only terminal scope process"));
         assert!(started.elapsed() < Duration::from_secs(8));
-        assert!(!prefix.with_extension("relay.json").exists());
-        assert!(!prefix.with_extension("relay.tmp").exists());
     }
 
     #[test]
     #[ignore = "requires a Linux user systemd scope and taskset"]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one live-systemd matrix keeps every untrusted report form under the same public seam"
-    )]
     fn untrusted_relay_report_inputs_fail_promptly_and_clean_up_the_scope() {
         const CHILD_MARKER: &str = "REFLEX_INVALID_RELAY_REPORT_CHILD";
         const TEST_NAME: &str =
@@ -5551,8 +6284,6 @@ for raw_pid in sys.argv[1:]:
                 "{mode}: {}",
                 capture.stderr
             );
-            assert!(!prefix.with_extension("relay.json").exists());
-            assert!(!prefix.with_extension("relay.tmp").exists());
         }
     }
 
@@ -5616,8 +6347,6 @@ for raw_pid in sys.argv[1:]:
                 capture.stderr
             ),
         }
-        assert!(!prefix.with_extension("relay.json").exists());
-        assert!(!prefix.with_extension("relay.tmp").exists());
     }
 
     #[test]

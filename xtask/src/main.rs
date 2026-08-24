@@ -31,7 +31,7 @@ mod scaling;
 use harness::{
     AnyError, HOST_ISOLATION_EXEC_COMMAND, HOST_ISOLATION_RELAY_COMMAND,
     HOST_ISOLATION_TARGET_COMMAND, HostEnvironment, LargeCampaign, capture_large_campaign_child,
-    completion_name, duration_ns, enter_large_campaign, environment, hash_json, hex,
+    completion_name, duration_ns, enter_large_campaign_with_source, environment, hash_json, hex,
     require_absent, require_clean, require_release, run_host_isolation_exec,
     run_host_isolation_relay, run_host_isolation_target,
 };
@@ -46,6 +46,7 @@ const RESIDENT_BYTES: u64 = 1024 * 1024 * 1024;
 const DURABLE_BYTES: u64 = 256 * 1024 * 1024;
 const TIME_SECONDS: u64 = 120;
 const VERIFICATION_REQUESTS: u64 = 100_000;
+#[cfg(test)]
 const DIRECTIONAL_RECEIPT_REQUIRED_COMMANDS: [&str; 9] = LargeCampaign::COMMANDS;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -159,9 +160,12 @@ fn run() -> Result<(), AnyError> {
     if command == Some(HOST_ISOLATION_EXEC_COMMAND) {
         return run_host_isolation_exec();
     }
-    require_directional_receipt_for(command)?;
     if let Some(campaign) = command.and_then(LargeCampaign::for_command) {
-        match enter_large_campaign(campaign, arguments) {
+        match enter_large_campaign_with_source(
+            campaign,
+            arguments,
+            directional::prepare_current_campaign_source,
+        ) {
             Ok(Some(capture)) => {
                 if !capture.stdout.is_empty() {
                     print!("{}", capture.stdout);
@@ -239,6 +243,10 @@ fn dispatch(command: Option<&str>, arguments: &[String]) -> Result<(), AnyError>
         Some("causal-child") => causal::run_child(arguments),
         Some("causal-development-performance") => causal::run_development_performance(arguments),
         Some("directional") => directional::run(arguments),
+        Some(directional::namespace::SETUP_COMMAND) => directional::namespace::run_setup(arguments),
+        Some(directional::namespace::GATES_COMMAND) => directional::namespace::run_gates(arguments),
+        Some(directional::namespace::PROBE_COMMAND) => directional::namespace::run_probe(arguments),
+        Some(directional::namespace::SMOKE_COMMAND) => directional::namespace::run_smoke(arguments),
         Some("build-native") => build::build_native(arguments),
         Some("perf-smoke") => performance::run(arguments),
         Some("instrumentation-overhead") => performance::run_instrumentation_overhead(arguments),
@@ -264,15 +272,9 @@ fn dispatch(command: Option<&str>, arguments: &[String]) -> Result<(), AnyError>
     }
 }
 
+#[cfg(test)]
 fn requires_directional_receipt(command: &str) -> bool {
     DIRECTIONAL_RECEIPT_REQUIRED_COMMANDS.contains(&command)
-}
-
-fn require_directional_receipt_for(command: Option<&str>) -> Result<(), AnyError> {
-    if command.is_some_and(requires_directional_receipt) {
-        directional::require_current_passed_receipt()?;
-    }
-    Ok(())
 }
 
 fn usage_error() -> AnyError {

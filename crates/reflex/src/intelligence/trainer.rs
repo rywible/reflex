@@ -363,6 +363,8 @@ struct TrainingScratch<'a> {
     order: Vec<u16>,
     #[cfg(test)]
     operations: TrainingOperations,
+    #[cfg(test)]
+    peak_build_bytes: u64,
 }
 
 struct TrainingContext {
@@ -373,6 +375,28 @@ struct TrainingContext {
 }
 
 impl TrainingContext {
+    #[cfg(test)]
+    fn resident_bytes(&self) -> u64 {
+        let hash_entry_allowance = std::mem::size_of::<usize>();
+        u64::try_from(
+            self.effects
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(DecisionId, TrainingEffects)>())
+                .saturating_add(
+                    self.selection_uses
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<([u8; 32], u8)>()),
+                )
+                .saturating_add(
+                    self.corpus_assignments.capacity().saturating_mul(
+                        std::mem::size_of::<((NicheKey, [u8; 32]), bool)>()
+                            .saturating_add(hash_entry_allowance),
+                    ),
+                ),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one causal-frame scan binds settlements, mechanically induced consequences, terminal contrasts, and corpus roles without recomputation"
@@ -545,6 +569,19 @@ impl<'a> TrainingScratch<'a> {
             .map_err(|_| IntelligenceError::CapacityExceeded)?;
         retained.extend(aligned.take(scan_limit));
         let context = TrainingContext::build(&retained, assignment_history, evidence)?;
+        #[cfg(test)]
+        {
+            scratch.peak_build_bytes = scratch
+                .resident_bytes()
+                .saturating_add(context.resident_bytes())
+                .saturating_add(
+                    u64::try_from(retained.capacity().saturating_mul(std::mem::size_of::<(
+                        &'a InvestmentReceipt,
+                        InvestmentSettlement,
+                    )>()))
+                    .unwrap_or(u64::MAX),
+                );
+        }
         for (receipt, settlement) in retained {
             #[cfg(test)]
             {
@@ -624,7 +661,29 @@ impl<'a> TrainingScratch<'a> {
             order,
             #[cfg(test)]
             operations: TrainingOperations::default(),
+            #[cfg(test)]
+            peak_build_bytes: 0,
         })
+    }
+
+    #[cfg(test)]
+    fn resident_bytes(&self) -> u64 {
+        u64::try_from(
+            self.examples
+                .capacity()
+                .saturating_mul(std::mem::size_of::<AlignedExample<'a>>())
+                .saturating_add(
+                    self.niches
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NicheSlot>()),
+                )
+                .saturating_add(
+                    self.order
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<u16>()),
+                ),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn find_or_insert_niche(&mut self, key: NicheKey) -> Result<usize, IntelligenceError> {
@@ -1424,6 +1483,26 @@ mod tests {
                 (128, 128, 128),
                 (192, 128, 128),
             ]
+        );
+    }
+
+    #[test]
+    fn large_history_role_indexes_fit_the_declared_training_peak() {
+        let budget = NativeTrainingBudget::new(32, 1, 0.25).unwrap();
+        let retained = 240;
+        let ledger = ledger_with_examples(retained);
+        let scratch = TrainingScratch::build(&ledger, budget).unwrap();
+        let declared = budget.scratch_bytes_for_history(retained);
+
+        assert_eq!(scratch.operations.aligned_pairs, budget.scan_limit());
+        assert!(
+            scratch.peak_build_bytes <= declared,
+            "observed build peak={} declared={declared}",
+            scratch.peak_build_bytes
+        );
+        assert!(
+            declared > budget.scratch_bytes_for_history(budget.scan_limit()),
+            "persistent corpus-role indexes must scale explicitly with retained history"
         );
     }
 
